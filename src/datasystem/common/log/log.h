@@ -20,7 +20,9 @@
 #ifndef DATASYSTEM_COMMON_LOG_LOG_H
 #define DATASYSTEM_COMMON_LOG_LOG_H
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 
 #include "datasystem/common/flags/flags.h"
@@ -37,6 +39,12 @@ namespace datasystem {
 #define DS_LOGS_LEVEL_FATAL datasystem::LogSeverity::FATAL
 
 static constexpr int32_t HEARTBEAT_LEVEL = 3;  // Heartbeat log level
+
+inline bool ShouldLogFirstAndEveryN(uint32_t n, std::atomic<uint64_t> &counter)
+{
+    const uint64_t current = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    return (current == 1) || (n > 0 && (current % n == 0));
+}
 
 // Basic Logging Macros Impl
 #define LOG_IMPL(severity) datasystem::LogMessage(DS_LOGS_LEVEL_##severity, __FILE__, __LINE__).Stream()
@@ -74,6 +82,11 @@ static constexpr int32_t HEARTBEAT_LEVEL = 3;  // Heartbeat log level
     static int LOG_IF_EVERY_N_COUNTER_##__LINE__ = 0;       \
     if (condition)                                          \
         if (++LOG_IF_EVERY_N_COUNTER_##__LINE__ % (n) == 0) \
+    LOG(severity)
+
+#define LOG_FIRST_AND_EVERY_N(severity, n)                                               \
+    static std::atomic<uint64_t> LOG_FIRST_AND_EVERY_N_COUNTER_##__LINE__(0);            \
+    if (datasystem::ShouldLogFirstAndEveryN((n), LOG_FIRST_AND_EVERY_N_COUNTER_##__LINE__)) \
     LOG(severity)
 
 // Verbose Logging Macros

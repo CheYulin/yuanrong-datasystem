@@ -67,7 +67,8 @@ public:
     {
         std::unique_lock<std::mutex> lock(mtx_);
         if (!cv_.wait_for(lock, timeout, [&] { return !ready_.empty(); })) {
-            RETURN_STATUS_LOG_ERROR(K_RPC_DEADLINE_EXCEEDED, FormatString("Timed out waiting for any event"));
+            RETURN_STATUS_LOG_ERROR(K_URMA_WAIT_TIMEOUT,
+                                    FormatString("[URMA_WAIT_TIMEOUT] Timed out waiting for any event"));
         }
         event = ready_.front();
         ready_.pop();
@@ -93,8 +94,10 @@ public:
         std::unique_lock<std::mutex> lock(eventMutex_);
         bool gotNotification = cv_.wait_for(lock, timeout, [this] { return ready_; });
         if (!gotNotification && !ready_) {
-            RETURN_STATUS_LOG_ERROR(K_RPC_DEADLINE_EXCEEDED,
-                                    FormatString("Timed out waiting for request: %d", requestId_));
+            const auto requestIdStr = std::to_string(static_cast<uint64_t>(requestId_));
+            RETURN_STATUS_LOG_ERROR(K_URMA_WAIT_TIMEOUT,
+                                    FormatString("[URMA_WAIT_TIMEOUT] Timed out waiting for request: %s",
+                                                 requestIdStr.c_str()));
         }
         return Status::OK();
     }
