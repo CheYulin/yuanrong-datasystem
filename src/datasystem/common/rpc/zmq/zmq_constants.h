@@ -39,6 +39,17 @@ static constexpr uint32_t K_LIVENESS = 120;              // Peer liveness check 
 #define ZMQ_NO_FILE_FD RPC_NO_FILE_FD
 #define ZMQ_EIGHT RPC_EIGHT
 #define ZMQ_SOCKET_BACKLOG RPC_SOCKET_BACKLOG
+
+// ==================== RPC Tracing Ticks ====================
+inline constexpr const char* TICK_CLIENT_ENQUEUE = "CLIENT_ENQUEUE";
+inline constexpr const char* TICK_CLIENT_TO_STUB = "CLIENT_TO_STUB";
+inline constexpr const char* TICK_CLIENT_SEND = "CLIENT_SEND";
+inline constexpr const char* TICK_CLIENT_RECV = "CLIENT_RECV";
+inline constexpr const char* TICK_SERVER_RECV = "SERVER_RECV";
+inline constexpr const char* TICK_SERVER_DEQUEUE = "SERVER_DEQUEUE";
+inline constexpr const char* TICK_SERVER_EXEC_END = "SERVER_EXEC_END";
+inline constexpr const char* TICK_SERVER_SEND = "SERVER_SEND";
+
 }  // namespace datasystem
 
 #endif  // DATASYSTEM_COMMON_RPC_ZMQ_CONSTANTS_H
