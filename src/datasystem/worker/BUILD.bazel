@@ -92,6 +92,7 @@ ds_cc_library(
     hdrs = [
         "worker_oc_server.h",
     ],
+    includes = ["../../tests/st"],
     deps = [
         "//src/datasystem/common:common_constants",
         "//src/datasystem/common/ak_sk:ak_sk_manager",
