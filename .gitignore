@@ -93,3 +93,6 @@ plan.md
 bazel-*
 .clwb/
 MODULE.bazel.lock
+
+# local git worktrees
+.worktrees/
