@@ -20,7 +20,7 @@ include(${BASE_DIR}/cmake/options.cmake)
 
 if(NOT EXISTS "${INSTALL_DIR}/datasystem/sdk/cpp")
     file(ARCHIVE_EXTRACT
-        INPUT ${INSTALL_DIR}/yr-datasystem-v${version}.tar.gz
+        INPUT ${INSTALL_DIR}/yr-datasystem-v${DS_VERSION}.tar.gz
         DESTINATION ${INSTALL_DIR}
     )
 endif()
