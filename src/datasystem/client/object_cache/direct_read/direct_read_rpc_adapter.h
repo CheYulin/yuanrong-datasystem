@@ -15,39 +15,37 @@
  */
 
 /**
- * Description: Client direct read flow skeleton.
+ * Description: Minimal RPC adapter for client direct read.
  */
-#ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_FLOW_H
-#define DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_FLOW_H
+#ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_RPC_ADAPTER_H
+#define DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_RPC_ADAPTER_H
 
 #include <memory>
 #include <vector>
 
 #include "datasystem/client/object_cache/client_worker_api/iclient_worker_api.h"
-#include "datasystem/client/object_cache/direct_read/direct_read_route_provider.h"
-#include "datasystem/client/object_cache/direct_read/direct_read_rpc_adapter.h"
 #include "datasystem/common/ak_sk/signature.h"
 #include "datasystem/common/rpc/rpc_credential.h"
-#include "datasystem/object/buffer.h"
+#include "datasystem/common/rpc/rpc_message.h"
+#include "datasystem/common/util/net_util.h"
+#include "datasystem/protos/master_object.pb.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem {
 namespace object_cache {
-class DirectReadFlow {
+class DirectReadRpcAdapter {
 public:
-    static constexpr const char *kNotImplementedFallbackReason = "direct_flow_not_implemented";
+    DirectReadRpcAdapter(RpcCredential cred, Signature *signature, int32_t requestTimeoutMs);
 
-    DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
-                   int32_t requestTimeoutMs);
-
-    Status Get(const GetParam &getParam, std::vector<std::shared_ptr<Buffer>> &buffers);
+    Status QueryMeta(const HostPort &metaAddress, const HostPort &clientWorkerAddress, const GetParam &getParam,
+                     master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads) const;
 
 private:
-    std::shared_ptr<IClientWorkerApi> workerApi_;
-    DirectReadRouteProvider routeProvider_;
-    DirectReadRpcAdapter rpcAdapter_;
+    RpcCredential cred_;
+    Signature *signature_;
+    int32_t requestTimeoutMs_;
 };
 }  // namespace object_cache
 }  // namespace datasystem
 
-#endif  // DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_FLOW_H
+#endif  // DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_RPC_ADAPTER_H

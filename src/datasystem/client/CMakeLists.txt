@@ -15,6 +15,8 @@ list(APPEND CLIENT_SRCS
         object_cache/client_worker_api/client_worker_local_api.cpp
         object_cache/client_worker_api/client_worker_remote_api.cpp
         object_cache/direct_read/direct_read_flow.cpp
+        object_cache/direct_read/direct_read_route_provider.cpp
+        object_cache/direct_read/direct_read_rpc_adapter.cpp
         object_cache/direct_read/direct_read_test_hook.cpp
         object_cache/object_client.cpp
         object_cache/object_client_impl.cpp
@@ -58,6 +60,7 @@ list(APPEND CLIENT_DEPEND_LIBS
         nlohmann_json::nlohmann_json
         posix_protos_client
         share_memory_protos_client
+        master_object_protos_client
         common_log_proto
         worker_object_protos_client
         worker_stream_protos_client

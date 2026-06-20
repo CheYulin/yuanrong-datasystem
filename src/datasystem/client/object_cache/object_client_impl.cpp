@@ -2640,7 +2640,7 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
                        .isRH2DSupported = isRH2DSupported };
     if (ShouldTryDirectRead(workerApi)) {
         DirectReadTestHook::RecordDirectAttempt();
-        DirectReadFlow directReadFlow;
+        DirectReadFlow directReadFlow(workerApi, cred_, signature_.get(), requestTimeoutMs_);
         Status directRc = directReadFlow.Get(getParam, objectBuffers);
         if (directRc.IsOk()) {
             buffers.clear();

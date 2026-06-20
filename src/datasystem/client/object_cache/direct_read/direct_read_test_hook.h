@@ -41,6 +41,8 @@ public:
     static void SetForceDirectRead(bool enabled);
     static bool ForceDirectRead();
     static void RecordDirectAttempt();
+    static void RecordRouteQuery();
+    static void RecordMetaQuery();
     static void RecordPathFallback(const std::string &reason);
 };
 }  // namespace object_cache

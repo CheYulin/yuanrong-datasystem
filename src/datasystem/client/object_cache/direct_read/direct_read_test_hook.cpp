@@ -67,6 +67,18 @@ void DirectReadTestHook::RecordDirectAttempt()
     ++g_directReadStats.directAttemptCount;
 }
 
+void DirectReadTestHook::RecordRouteQuery()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.routeQueryCount;
+}
+
+void DirectReadTestHook::RecordMetaQuery()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.metaQueryCount;
+}
+
 void DirectReadTestHook::RecordPathFallback(const std::string &reason)
 {
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);

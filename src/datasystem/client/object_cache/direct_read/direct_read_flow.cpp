@@ -19,12 +19,28 @@
  */
 #include "datasystem/client/object_cache/direct_read/direct_read_flow.h"
 
+#include <utility>
+
+#include "datasystem/common/util/status_helper.h"
+
 namespace datasystem {
 namespace object_cache {
+DirectReadFlow::DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
+                               int32_t requestTimeoutMs)
+    : workerApi_(std::move(workerApi)),
+      routeProvider_(workerApi_),
+      rpcAdapter_(std::move(cred), signature, requestTimeoutMs)
+{
+}
+
 Status DirectReadFlow::Get(const GetParam &getParam, std::vector<std::shared_ptr<Buffer>> &buffers)
 {
-    (void)getParam;
     (void)buffers;
+    HostPort metaAddress;
+    RETURN_IF_NOT_OK(routeProvider_.GetMetaAddress(getParam, metaAddress));
+    master::QueryMetaRspPb rsp;
+    std::vector<RpcMessage> payloads;
+    RETURN_IF_NOT_OK(rpcAdapter_.QueryMeta(metaAddress, workerApi_->hostPort_, getParam, rsp, payloads));
     return Status(K_NOT_SUPPORTED, kNotImplementedFallbackReason);
 }
 }  // namespace object_cache

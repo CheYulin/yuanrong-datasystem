@@ -130,8 +130,27 @@ TEST_F(ClientDirectReadTest, DirectUnsupportedFallsBackOnce)
 
     auto stats = object_cache::DirectReadTestHook::Snapshot();
     EXPECT_EQ(stats.directAttemptCount, 1ul);
-    EXPECT_EQ(stats.routeQueryCount, 0ul);
-    EXPECT_EQ(stats.metaQueryCount, 0ul);
+    EXPECT_EQ(stats.routeQueryCount, 1ul);
+    EXPECT_EQ(stats.metaQueryCount, 1ul);
+    EXPECT_EQ(stats.dataQueryCount, 0ul);
+    EXPECT_EQ(stats.pathFallbackCount, 1ul);
+    EXPECT_EQ(stats.lastFallbackReason, "direct_flow_not_implemented");
+}
+
+TEST_F(ClientDirectReadTest, DirectQueriesMetaBeforeFallback)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
+
+    PutAndGetOnClient(client);
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.directAttemptCount, 1ul);
+    EXPECT_EQ(stats.routeQueryCount, 1ul);
+    EXPECT_EQ(stats.metaQueryCount, 1ul);
     EXPECT_EQ(stats.dataQueryCount, 0ul);
     EXPECT_EQ(stats.pathFallbackCount, 1ul);
     EXPECT_EQ(stats.lastFallbackReason, "direct_flow_not_implemented");
