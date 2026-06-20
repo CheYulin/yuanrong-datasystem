@@ -1476,6 +1476,8 @@ private:
      */
     Status PostPipelineRH2D(std::promise<AsyncResult> &promise, PiplnRh2dParam &piplnRh2dParam, GetRspPb &rsp);
 
+    bool ShouldTryDirectRead(const std::shared_ptr<IClientWorkerApi> &workerApi) const;
+
     HostPort ipAddress_;
     RpcAuthKeys authKeys_;
     RpcCredential cred_;

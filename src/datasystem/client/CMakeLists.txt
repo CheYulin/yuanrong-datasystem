@@ -14,6 +14,7 @@ list(APPEND CLIENT_SRCS
         object_cache/client_worker_api/client_worker_base_api.cpp
         object_cache/client_worker_api/client_worker_local_api.cpp
         object_cache/client_worker_api/client_worker_remote_api.cpp
+        object_cache/direct_read/direct_read_test_hook.cpp
         object_cache/object_client.cpp
         object_cache/object_client_impl.cpp
         object_cache/client_memory_ref_table.cpp

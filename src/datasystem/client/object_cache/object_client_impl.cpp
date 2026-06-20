@@ -87,6 +87,7 @@
 #include "datasystem/utils/string_view.h"
 #include "datasystem/object/buffer.h"
 
+DS_DECLARE_bool(enable_client_direct_read);
 DS_DECLARE_bool(log_monitor);
 
 const size_t MSET_MAX_KEY_COUNT = 8;
@@ -1387,6 +1388,11 @@ Status ObjectClientImpl::GetAvailableWorkerApi(std::shared_ptr<IClientWorkerApi>
     return Status::OK();
 }
 
+bool ObjectClientImpl::ShouldTryDirectRead(const std::shared_ptr<IClientWorkerApi> &workerApi) const
+{
+    return FLAGS_enable_client_direct_read && workerApi != nullptr && !workerApi->IsShmEnable();
+}
+
 Status ObjectClientImpl::MGetH2D(const std::vector<std::string> &objectKeys,
                                  const std::vector<DeviceBlobList> &devBlobList, std::vector<std::string> &failedKeys,
                                  uint64_t timeoutMs)
@@ -2617,6 +2623,7 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
     RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
+    (void)ShouldTryDirectRead(workerApi);
     std::vector<std::shared_ptr<Buffer>> objectBuffers(objectKeys.size());
     GetParam getParam{ .objectKeys = objectKeys,
                        .subTimeoutMs = subTimeoutMs,

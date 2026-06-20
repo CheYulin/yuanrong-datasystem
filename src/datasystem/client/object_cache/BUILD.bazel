@@ -4,8 +4,8 @@ package(default_visibility = ["//src/datasystem:__subpackages__"])
 
 ds_cc_library(
     name = "object_client",
-    srcs = glob(["*.cpp"]),
-    hdrs = glob(["*.h"]),
+    srcs = glob(["*.cpp", "direct_read/*.cpp"]),
+    hdrs = glob(["*.h", "direct_read/*.h"]),
     visibility = ["//visibility:public"],
     alwayslink = True,
     deps = [
