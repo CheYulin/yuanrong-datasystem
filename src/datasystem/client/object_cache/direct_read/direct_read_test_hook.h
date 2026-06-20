@@ -38,6 +38,10 @@ class DirectReadTestHook {
 public:
     static void Reset();
     static DirectReadStats Snapshot();
+    static void SetForceDirectRead(bool enabled);
+    static bool ForceDirectRead();
+    static void RecordDirectAttempt();
+    static void RecordPathFallback(const std::string &reason);
 };
 }  // namespace object_cache
 }  // namespace datasystem

@@ -33,18 +33,45 @@ namespace object_cache {
 namespace {
 std::mutex g_directReadStatsMutex;
 DirectReadStats g_directReadStats;
+bool g_forceDirectRead = false;
 }  // namespace
 
 void DirectReadTestHook::Reset()
 {
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
     g_directReadStats = DirectReadStats{};
+    g_forceDirectRead = false;
 }
 
 DirectReadStats DirectReadTestHook::Snapshot()
 {
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
     return g_directReadStats;
+}
+
+void DirectReadTestHook::SetForceDirectRead(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    g_forceDirectRead = enabled;
+}
+
+bool DirectReadTestHook::ForceDirectRead()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    return g_forceDirectRead;
+}
+
+void DirectReadTestHook::RecordDirectAttempt()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.directAttemptCount;
+}
+
+void DirectReadTestHook::RecordPathFallback(const std::string &reason)
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.pathFallbackCount;
+    g_directReadStats.lastFallbackReason = reason;
 }
 }  // namespace object_cache
 }  // namespace datasystem

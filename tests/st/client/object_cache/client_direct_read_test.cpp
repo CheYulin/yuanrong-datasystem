@@ -29,6 +29,7 @@
 #include "oc_client_common.h"
 
 DS_DECLARE_bool(enable_client_direct_read);
+DS_DECLARE_bool(enable_client_direct_read_fallback);
 
 namespace datasystem {
 namespace st {
@@ -61,6 +62,7 @@ public:
     {
         object_cache::DirectReadTestHook::Reset();
         FLAGS_enable_client_direct_read = false;
+        FLAGS_enable_client_direct_read_fallback = true;
         ExternalClusterTest::TearDown();
     }
 
@@ -114,6 +116,25 @@ TEST_F(ClientDirectReadTest, SameNodeUsesWorkerPathWhenEnabled)
     EXPECT_EQ(stats.dataQueryCount, 0ul);
     EXPECT_EQ(stats.pathFallbackCount, 0ul);
     EXPECT_TRUE(stats.lastFallbackReason.empty());
+}
+
+TEST_F(ClientDirectReadTest, DirectUnsupportedFallsBackOnce)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
+
+    PutAndGetOnClient(client);
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.directAttemptCount, 1ul);
+    EXPECT_EQ(stats.routeQueryCount, 0ul);
+    EXPECT_EQ(stats.metaQueryCount, 0ul);
+    EXPECT_EQ(stats.dataQueryCount, 0ul);
+    EXPECT_EQ(stats.pathFallbackCount, 1ul);
+    EXPECT_EQ(stats.lastFallbackReason, "direct_flow_not_implemented");
 }
 }  // namespace st
 }  // namespace datasystem

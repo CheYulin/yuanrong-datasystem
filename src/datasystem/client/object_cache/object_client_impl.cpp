@@ -41,6 +41,8 @@
 
 #include "datasystem/client/client_flags_monitor.h"
 #include "datasystem/client/mmap/immap_table_entry.h"
+#include "datasystem/client/object_cache/direct_read/direct_read_flow.h"
+#include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
 #include "datasystem/client/object_cache/client_worker_api/iclient_worker_api.h"
 #include "datasystem/common/device/device_manager_factory.h"
 #include "datasystem/common/device/device_helper.h"
@@ -88,6 +90,7 @@
 #include "datasystem/object/buffer.h"
 
 DS_DECLARE_bool(enable_client_direct_read);
+DS_DECLARE_bool(enable_client_direct_read_fallback);
 DS_DECLARE_bool(log_monitor);
 
 const size_t MSET_MAX_KEY_COUNT = 8;
@@ -1390,7 +1393,13 @@ Status ObjectClientImpl::GetAvailableWorkerApi(std::shared_ptr<IClientWorkerApi>
 
 bool ObjectClientImpl::ShouldTryDirectRead(const std::shared_ptr<IClientWorkerApi> &workerApi) const
 {
-    return FLAGS_enable_client_direct_read && workerApi != nullptr && !workerApi->IsShmEnable();
+    if (!FLAGS_enable_client_direct_read || workerApi == nullptr) {
+        return false;
+    }
+    if (DirectReadTestHook::ForceDirectRead()) {
+        return true;
+    }
+    return !workerApi->IsShmEnable();
 }
 
 Status ObjectClientImpl::MGetH2D(const std::vector<std::string> &objectKeys,
@@ -2623,13 +2632,32 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
     RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
-    (void)ShouldTryDirectRead(workerApi);
     std::vector<std::shared_ptr<Buffer>> objectBuffers(objectKeys.size());
     GetParam getParam{ .objectKeys = objectKeys,
                        .subTimeoutMs = subTimeoutMs,
                        .readParams = {},
                        .queryL2Cache = queryL2Cache,
                        .isRH2DSupported = isRH2DSupported };
+    if (ShouldTryDirectRead(workerApi)) {
+        DirectReadTestHook::RecordDirectAttempt();
+        DirectReadFlow directReadFlow;
+        Status directRc = directReadFlow.Get(getParam, objectBuffers);
+        if (directRc.IsOk()) {
+            buffers.clear();
+            for (auto &objectBuffer : objectBuffers) {
+                if (objectBuffer == nullptr) {
+                    buffers.emplace_back();
+                } else {
+                    buffers.emplace_back(std::move(*objectBuffer));
+                }
+            }
+            return Status::OK();
+        }
+        if (!FLAGS_enable_client_direct_read_fallback) {
+            return directRc;
+        }
+        DirectReadTestHook::RecordPathFallback(DirectReadFlow::kNotImplementedFallbackReason);
+    }
     Status rc = GetBuffersFromWorker(workerApi, getParam, objectBuffers);
     buffers.clear();
     for (auto &objectBuffer : objectBuffers) {
