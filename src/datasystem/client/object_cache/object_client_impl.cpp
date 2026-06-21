@@ -1400,6 +1400,7 @@ bool ObjectClientImpl::ShouldTryDirectRead(const std::shared_ptr<IClientWorkerAp
     if (DirectReadTestHook::ForceDirectRead()) {
         return true;
     }
+    // Direct read applies only to cross-node reads where the client uses the remote worker API.
     return !workerApi->IsShmEnable();
 }
 

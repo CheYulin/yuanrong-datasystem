@@ -344,6 +344,122 @@ TEST_F(ClientDirectReadTest, FailedKeysPreservedAfterFallback)
     EXPECT_NE(stats.lastFallbackReason.find(object_cache::DirectReadFlow::kStaleRouteFallbackReason), std::string::npos);
 }
 
+TEST_F(ClientDirectReadTest, SameNodeGetDoesNotUseDirectRead)
+{
+    FLAGS_enable_client_direct_read = true;
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
+
+    PutAndGetOnClient(client);
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.directAttemptCount, 0ul);
+    EXPECT_EQ(stats.routeQueryCount, 0ul);
+    EXPECT_EQ(stats.metaQueryCount, 0ul);
+    EXPECT_EQ(stats.dataQueryCount, 0ul);
+}
+
+TEST_F(ClientDirectReadTest, SameNodeWriteDoesNotUseDirectRead)
+{
+    FLAGS_enable_client_direct_read = true;
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
+
+    auto objectKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(client->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.directAttemptCount, 0ul);
+    EXPECT_EQ(stats.routeQueryCount, 0ul);
+    EXPECT_EQ(stats.metaQueryCount, 0ul);
+    EXPECT_EQ(stats.dataQueryCount, 0ul);
+}
+
+class ClientDirectReadCrossNodeTest : public OCClientCommon {
+public:
+    void SetClusterSetupOptions(ExternalClusterOptions &opts) override
+    {
+        opts.numWorkers = 2;
+        opts.numEtcd = 1;
+        opts.enableDistributedMaster = "false";
+    }
+
+    void SetUp() override
+    {
+        ExternalClusterTest::SetUp();
+        object_cache::DirectReadTestHook::Reset();
+        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        FLAGS_enable_distributed_master = false;
+        HostPort workerAddress;
+        DS_ASSERT_OK(cluster_->GetWorkerAddr(0, workerAddress));
+        FLAGS_master_address = workerAddress.ToString();
+    }
+
+    void TearDown() override
+    {
+        object_cache::DirectReadTestHook::Reset();
+        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        FLAGS_enable_client_direct_read = false;
+        FLAGS_enable_client_direct_read_fallback = true;
+        ExternalClusterTest::TearDown();
+    }
+};
+
+TEST_F(ClientDirectReadCrossNodeTest, CrossNodeWriteDoesNotUseDirectRead)
+{
+    FLAGS_enable_client_direct_read = true;
+    std::shared_ptr<ObjectClient> writer;
+    InitTestClient(0, writer);
+
+    auto objectKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(writer->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.directAttemptCount, 0ul);
+    EXPECT_EQ(stats.routeQueryCount, 0ul);
+    EXPECT_EQ(stats.metaQueryCount, 0ul);
+    EXPECT_EQ(stats.dataQueryCount, 0ul);
+}
+
+TEST_F(ClientDirectReadCrossNodeTest, CrossNodeWriteVisibleToDirectRead)
+{
+    std::shared_ptr<ObjectClient> writer;
+    InitTestClient(0, writer);
+    std::shared_ptr<ObjectClient> reader;
+    InitTestClient(1, reader);
+
+    auto objectKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(writer->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    FLAGS_enable_client_direct_read = false;
+    object_cache::DirectReadTestHook::Reset();
+    std::vector<Optional<Buffer>> gatewayBuffers;
+    DS_ASSERT_OK(reader->Get({ objectKey }, 0, gatewayBuffers));
+    ASSERT_EQ(gatewayBuffers.size(), 1ul);
+    ASSERT_TRUE(gatewayBuffers[0]);
+    gatewayBuffers[0]->RLatch();
+    AssertBufferEqual(*gatewayBuffers[0], payload);
+
+    FLAGS_enable_client_direct_read = true;
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    std::vector<Optional<Buffer>> directBuffers;
+    DS_ASSERT_OK(reader->Get({ objectKey }, 0, directBuffers));
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.directAttemptCount, 1ul);
+    EXPECT_EQ(stats.pathFallbackCount, 0ul);
+
+    ASSERT_EQ(directBuffers.size(), 1ul);
+    ASSERT_TRUE(directBuffers[0]);
+    directBuffers[0]->RLatch();
+    AssertBufferEqual(*directBuffers[0], payload);
+    gatewayBuffers[0]->UnRLatch();
+    directBuffers[0]->UnRLatch();
+}
+
 class ClientDirectReadHashRingTest : public OCClientCommon {
 public:
     void SetClusterSetupOptions(ExternalClusterOptions &opts) override
