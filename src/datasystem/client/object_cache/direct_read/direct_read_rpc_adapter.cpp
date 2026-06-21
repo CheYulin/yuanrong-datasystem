@@ -28,6 +28,7 @@
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/uuid_generator.h"
 #include "datasystem/protos/master_object.stub.rpc.pb.h"
+#include "datasystem/protos/worker_object.stub.rpc.pb.h"
 
 namespace datasystem {
 namespace object_cache {

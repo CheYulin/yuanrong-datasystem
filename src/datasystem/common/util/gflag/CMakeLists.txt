@@ -1,5 +1,6 @@
 set(GFLAG_SRCS
         common_gflags_validate.cpp
+        cluster_master_flags.cpp
         flags.cpp)
  	 
 set(GFLAG_LIBS

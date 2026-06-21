@@ -111,9 +111,6 @@ Status ObjectReadAccessFlow::ExecuteMetaPhase(const ObjectReadAccessRequest &req
                 merged->set_payload_indexs(i, merged->payload_indexs(i) + static_cast<int32_t>(payloadOffset));
             }
         }
-        if (groupRsp.has_last_rc()) {
-            result.metaRsp.mutable_last_rc()->CopyFrom(groupRsp.last_rc());
-        }
         result.metaRsp.set_meta_is_moving(groupRsp.meta_is_moving());
     }
     return Status::OK();

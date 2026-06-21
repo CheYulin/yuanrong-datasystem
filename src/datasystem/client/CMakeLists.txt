@@ -18,6 +18,11 @@ list(APPEND CLIENT_SRCS
         object_cache/direct_read/direct_read_route_provider.cpp
         object_cache/direct_read/direct_read_rpc_adapter.cpp
         object_cache/direct_read/direct_read_test_hook.cpp
+        object_cache/direct_read/client_hash_ring_source.cpp
+        object_cache/direct_read/direct_read_access_adapters.cpp
+        ../worker/hash_ring/hash_ring_tools.cpp
+        ../common/object_cache/read_only_hash_ring_view.cpp
+        ../common/object_cache/read_access/object_read_access_flow.cpp
         object_cache/object_client.cpp
         object_cache/object_client_impl.cpp
         object_cache/client_memory_ref_table.cpp
@@ -74,7 +79,9 @@ list(APPEND CLIENT_DEPEND_LIBS
         client_mmap_static
         gRPC::grpc++
         common_etcd_client
-        worker_transport_api)
+        worker_transport_api
+        hash_ring_protos_client
+        )
 
 if (BUILD_HETERO_GPU)
     list(APPEND CLIENT_DEPEND_LIBS common_cuda_device)

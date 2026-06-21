@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include "ut/common.h"
 #include <map>
 #include <memory>
 #include <string>

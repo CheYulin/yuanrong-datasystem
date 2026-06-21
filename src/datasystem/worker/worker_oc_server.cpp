@@ -84,8 +84,8 @@
 #include "datasystem/worker/cluster_manager/worker_health_check.h"
 #include "datasystem/worker/worker_liveness_check.h"
 
-DS_DEFINE_string(master_address, "", "Address of ds master and the value cannot be empty.");
-DS_DEFINE_bool(enable_distributed_master, true, "Whether to support distributed master, default is true.");
+DS_DECLARE_string(master_address);
+DS_DECLARE_bool(enable_distributed_master);
 DS_DEFINE_uint32(add_node_wait_time_s, 60, "Time to wait for the first node that wants to join a working hash ring.");
 DS_DECLARE_bool(auto_del_dead_node);
 DS_DEFINE_bool(enable_p2p_transfer, false, "Heterogeneous object transfer protocol Enables p2ptransfer");

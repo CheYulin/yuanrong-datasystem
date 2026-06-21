@@ -31,6 +31,8 @@
 
 DS_DECLARE_bool(enable_client_direct_read);
 DS_DECLARE_bool(enable_client_direct_read_fallback);
+DS_DECLARE_bool(enable_distributed_master);
+DS_DECLARE_string(master_address);
 
 namespace datasystem {
 namespace st {
@@ -58,6 +60,10 @@ public:
         ExternalClusterTest::SetUp();
         object_cache::DirectReadTestHook::Reset();
         object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        FLAGS_enable_distributed_master = false;
+        HostPort workerAddress;
+        DS_ASSERT_OK(cluster_->GetWorkerAddr(0, workerAddress));
+        FLAGS_master_address = workerAddress.ToString();
     }
 
     void TearDown() override
@@ -175,6 +181,10 @@ public:
         ExternalClusterTest::SetUp();
         object_cache::DirectReadTestHook::Reset();
         object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        FLAGS_enable_distributed_master = true;
+        HostPort workerAddress;
+        DS_ASSERT_OK(cluster_->GetWorkerAddr(0, workerAddress));
+        FLAGS_master_address = workerAddress.ToString();
     }
 
     void TearDown() override

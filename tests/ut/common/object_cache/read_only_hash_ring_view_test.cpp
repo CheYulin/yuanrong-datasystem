@@ -18,6 +18,7 @@
 
 #include <string>
 
+#include "ut/common.h"
 #include "datasystem/common/object_cache/read_only_hash_ring_view.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/protos/hash_ring.pb.h"
@@ -40,7 +41,7 @@ HashRingPb BuildSingleWorkerRing(const std::string &workerAddr, uint32_t token)
 TEST(ReadOnlyHashRingViewTest, ResolvesMetaAddressFromHashToken)
 {
     const std::string workerAddr = "127.0.0.1:9000";
-    ReadOnlyHashRingView view;
+    object_cache::ReadOnlyHashRingView view;
     DS_ASSERT_OK(view.UpdateFromPb(BuildSingleWorkerRing(workerAddr, 100), 1));
 
     HostPort metaAddress;
