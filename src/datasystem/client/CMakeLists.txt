@@ -79,7 +79,8 @@ list(APPEND CLIENT_DEPEND_LIBS
         client_mmap_static
         gRPC::grpc++
         common_etcd_client
-        worker_transport_api)
+        worker_transport_api
+        worker_hash_ring)
 
 if (BUILD_HETERO_GPU)
     list(APPEND CLIENT_DEPEND_LIBS common_cuda_device)
