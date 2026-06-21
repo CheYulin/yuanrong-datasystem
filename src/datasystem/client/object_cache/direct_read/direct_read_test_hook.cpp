@@ -36,6 +36,9 @@ DirectReadStats g_directReadStats;
 bool g_forceDirectRead = false;
 bool g_forceHashRingRefresh = false;
 bool g_preferRemoteDataGet = false;
+bool g_simulateStaleRoute = false;
+bool g_simulateRedirectLoop = false;
+int g_simulateMetaMovingResponses = 0;
 }  // namespace
 
 void DirectReadTestHook::Reset()
@@ -45,6 +48,9 @@ void DirectReadTestHook::Reset()
     g_forceDirectRead = false;
     g_forceHashRingRefresh = false;
     g_preferRemoteDataGet = false;
+    g_simulateStaleRoute = false;
+    g_simulateRedirectLoop = false;
+    g_simulateMetaMovingResponses = 0;
 }
 
 DirectReadStats DirectReadTestHook::Snapshot()
@@ -113,6 +119,24 @@ void DirectReadTestHook::RecordHashRingWorkerRefresh()
     ++g_directReadStats.hashRingWorkerRefreshCount;
 }
 
+void DirectReadTestHook::RecordMovingRetry()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.movingRetryCount;
+}
+
+void DirectReadTestHook::RecordRedirectRetry()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.redirectRetryCount;
+}
+
+void DirectReadTestHook::RecordStaleRouteRetry()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.staleRouteRetryCount;
+}
+
 void DirectReadTestHook::SetForceHashRingRefresh(bool enabled)
 {
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
@@ -123,6 +147,46 @@ bool DirectReadTestHook::ForceHashRingRefresh()
 {
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
     return g_forceHashRingRefresh;
+}
+
+void DirectReadTestHook::SetSimulateStaleRoute(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    g_simulateStaleRoute = enabled;
+}
+
+bool DirectReadTestHook::SimulateStaleRoute()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    return g_simulateStaleRoute;
+}
+
+void DirectReadTestHook::SetSimulateRedirectLoop(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    g_simulateRedirectLoop = enabled;
+}
+
+bool DirectReadTestHook::SimulateRedirectLoop()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    return g_simulateRedirectLoop;
+}
+
+void DirectReadTestHook::SetSimulateMetaMovingResponses(int count)
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    g_simulateMetaMovingResponses = count;
+}
+
+bool DirectReadTestHook::ConsumeSimulateMetaMovingResponse()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    if (g_simulateMetaMovingResponses <= 0) {
+        return false;
+    }
+    --g_simulateMetaMovingResponses;
+    return true;
 }
 
 void DirectReadTestHook::RecordPathFallback(const std::string &reason)

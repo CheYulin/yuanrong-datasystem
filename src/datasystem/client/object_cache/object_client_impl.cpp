@@ -42,6 +42,7 @@
 #include "datasystem/client/client_flags_monitor.h"
 #include "datasystem/client/mmap/immap_table_entry.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_flow.h"
+#include "datasystem/client/object_cache/direct_read/direct_read_fallback.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
 #include "datasystem/client/object_cache/client_worker_api/iclient_worker_api.h"
 #include "datasystem/common/device/device_manager_factory.h"
@@ -2660,8 +2661,8 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
         if (!FLAGS_enable_client_direct_read_fallback) {
             return directRc;
         }
-        DirectReadTestHook::RecordPathFallback(
-            directRc.GetMsg().empty() ? DirectReadFlow::kNotImplementedFallbackReason : directRc.GetMsg());
+        DirectReadTestHook::RecordPathFallback(DirectReadFallback::NormalizeReason(
+            directRc.GetMsg().empty() ? DirectReadFlow::kNotImplementedFallbackReason : directRc.GetMsg()));
     }
     Status rc = GetBuffersFromWorker(workerApi, getParam, objectBuffers);
     buffers.clear();

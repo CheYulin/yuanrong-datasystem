@@ -19,12 +19,17 @@
  */
 #include "datasystem/client/object_cache/direct_read/direct_read_flow.h"
 
+#include <algorithm>
 #include <utility>
 
+#include "datasystem/client/object_cache/direct_read/direct_read_fallback.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
+#include "datasystem/common/flags/flags.h"
 #include "datasystem/common/object_cache/object_bitmap.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/protos/object_posix.pb.h"
+
+DS_DECLARE_int32(client_direct_read_retry_count);
 
 namespace datasystem {
 namespace object_cache {
@@ -97,6 +102,11 @@ const master::QueryMetaInfoPb *FindQueryMeta(const master::QueryMetaRspPb &metaR
     }
     return nullptr;
 }
+
+int32_t MaxControlPlaneRetries()
+{
+    return std::max(0, FLAGS_client_direct_read_retry_count);
+}
 }  // namespace
 
 DirectReadFlow::DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
@@ -111,27 +121,32 @@ DirectReadFlow::DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcC
 {
 }
 
-Status DirectReadFlow::Get(const GetParam &getParam, std::vector<std::shared_ptr<Buffer>> &buffers,
-                           const DirectReadFinishGetFn &finishGet)
+Status DirectReadFlow::ExecuteMetaPhaseWithRetry(const ObjectReadAccessRequest &request,
+                                                 ObjectReadAccessMetaResult &result)
 {
-    CHECK_FAIL_RETURN_STATUS(finishGet != nullptr, K_INVALID, "Direct read finish handler is null");
-    CHECK_FAIL_RETURN_STATUS(buffers.size() == getParam.objectKeys.size(), K_INVALID,
-                             "Direct read buffer size does not match object key count");
+    Status lastRc = Status::OK();
+    const int32_t maxRetries = MaxControlPlaneRetries();
+    for (int32_t attempt = 0; attempt <= maxRetries; ++attempt) {
+        lastRc = accessFlow_.ExecuteMetaPhase(request, result);
+        if (lastRc.IsOk()) {
+            return Status::OK();
+        }
+        if (!DirectReadFallback::IsRetriableControlPlaneFailure(lastRc) || attempt == maxRetries) {
+            return DirectReadFallback::ToPathFallbackStatus(lastRc);
+        }
+        if (lastRc.GetCode() == K_NOT_READY) {
+            DirectReadTestHook::RecordStaleRouteRetry();
+        } else if (lastRc.GetCode() == K_TRY_AGAIN) {
+            DirectReadTestHook::RecordMovingRetry();
+        }
+        RETURN_IF_NOT_OK(routeProvider_.RefreshRouteIfNeeded());
+    }
+    return DirectReadFallback::ToPathFallbackStatus(lastRc);
+}
 
-    dataAdapter_->SetGetParam(&getParam);
-
-    ObjectReadAccessRequest request;
-    request.objectKeys.assign(getParam.objectKeys.begin(), getParam.objectKeys.end());
-    request.subTimeoutMs = getParam.subTimeoutMs;
-    request.clientWorkerAddress = workerApi_->hostPort_;
-
-    ObjectReadAccessMetaResult metaResult;
-    RETURN_IF_NOT_OK(accessFlow_.ExecuteMetaPhase(request, metaResult));
-
-    GetRspPb getRsp;
-    std::vector<RpcMessage> outPayloads;
-    outPayloads.reserve(metaResult.metaPayloads.size());
-
+Status DirectReadFlow::ExecuteDataPhase(const GetParam &getParam, ObjectReadAccessMetaResult &metaResult,
+                                       GetRspPb &getRsp, std::vector<RpcMessage> &outPayloads)
+{
     for (size_t objectIndex = 0; objectIndex < getParam.objectKeys.size(); ++objectIndex) {
         const auto &objectKey = getParam.objectKeys[objectIndex];
         bool notExist = false;
@@ -152,7 +167,7 @@ Status DirectReadFlow::Get(const GetParam &getParam, std::vector<std::shared_ptr
 
         const master::QueryMetaInfoPb *queryMeta = FindQueryMeta(metaResult.metaRsp, objectKey);
         if (queryMeta == nullptr) {
-            return Status(K_NOT_FOUND, FormatString("Direct meta query missing object %s", objectKey));
+            return Status(K_RUNTIME_ERROR, FormatString("Direct meta query missing object %s", objectKey));
         }
 
         auto *payloadInfo = getRsp.add_payload_info();
@@ -172,6 +187,30 @@ Status DirectReadFlow::Get(const GetParam &getParam, std::vector<std::shared_ptr
             dataAdapter_->ReadData(*queryMeta, getParam.subTimeoutMs, objectIndex, remoteRsp, remotePayloads));
         RETURN_IF_NOT_OK(AppendRemotePayloads(remoteRsp, remotePayloads, outPayloads, *payloadInfo));
     }
+    return Status::OK();
+}
+
+Status DirectReadFlow::Get(const GetParam &getParam, std::vector<std::shared_ptr<Buffer>> &buffers,
+                           const DirectReadFinishGetFn &finishGet)
+{
+    CHECK_FAIL_RETURN_STATUS(finishGet != nullptr, K_INVALID, "Direct read finish handler is null");
+    CHECK_FAIL_RETURN_STATUS(buffers.size() == getParam.objectKeys.size(), K_INVALID,
+                             "Direct read buffer size does not match object key count");
+
+    dataAdapter_->SetGetParam(&getParam);
+
+    ObjectReadAccessRequest request;
+    request.objectKeys.assign(getParam.objectKeys.begin(), getParam.objectKeys.end());
+    request.subTimeoutMs = getParam.subTimeoutMs;
+    request.clientWorkerAddress = workerApi_->hostPort_;
+
+    ObjectReadAccessMetaResult metaResult;
+    RETURN_IF_NOT_OK(ExecuteMetaPhaseWithRetry(request, metaResult));
+
+    GetRspPb getRsp;
+    std::vector<RpcMessage> outPayloads;
+    outPayloads.reserve(metaResult.metaPayloads.size());
+    RETURN_IF_NOT_OK(ExecuteDataPhase(getParam, metaResult, getRsp, outPayloads));
 
     getRsp.mutable_last_rc()->set_error_code(K_OK);
     return finishGet(getParam, getRsp, outPayloads, buffers);

@@ -26,13 +26,14 @@
 
 #include "datasystem/client/object_cache/direct_read/direct_read_flow.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
-#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
 #include "datasystem/common/flags/flags.h"
+#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
 #include "oc_client_common.h"
 
 DS_DECLARE_bool(enable_client_direct_read);
 DS_DECLARE_bool(enable_client_direct_read_fallback);
 DS_DECLARE_bool(enable_distributed_master);
+DS_DECLARE_int32(client_direct_read_retry_count);
 DS_DECLARE_string(master_address);
 
 namespace datasystem {
@@ -220,6 +221,127 @@ TEST_F(ClientDirectReadTest, DirectQueriesMetaBeforeFallback)
     EXPECT_EQ(stats.pathFallbackCount, 0ul);
     EXPECT_TRUE(stats.lastFallbackReason.empty());
     EXPECT_GE(object_cache::ObjectReadAccessFlow::MetaPhaseCountForTest(), 1ul);
+}
+
+TEST_F(ClientDirectReadTest, StaleRouteRecordsFallbackReason)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    FLAGS_client_direct_read_retry_count = 1;
+
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    object_cache::DirectReadTestHook::SetSimulateStaleRoute(true);
+
+    auto objectKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(client->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    std::vector<Optional<Buffer>> buffers;
+    DS_ASSERT_OK(client->Get({ objectKey }, 0, buffers));
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.pathFallbackCount, 1ul);
+    EXPECT_GE(stats.staleRouteRetryCount, 1ul);
+    EXPECT_NE(stats.lastFallbackReason.find(object_cache::DirectReadFlow::kStaleRouteFallbackReason), std::string::npos);
+    ASSERT_EQ(buffers.size(), 1ul);
+    ASSERT_TRUE(buffers[0]);
+}
+
+TEST_F(ClientDirectReadTest, RedirectLoopFallsBackOnce)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    FLAGS_client_direct_read_retry_count = 1;
+
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    object_cache::DirectReadTestHook::SetSimulateRedirectLoop(true);
+
+    auto objectKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(client->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    std::vector<Optional<Buffer>> buffers;
+    DS_ASSERT_OK(client->Get({ objectKey }, 0, buffers));
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.pathFallbackCount, 1ul);
+    EXPECT_GE(stats.redirectRetryCount, 1ul);
+    EXPECT_NE(stats.lastFallbackReason.find(object_cache::DirectReadFlow::kRedirectLoopFallbackReason), std::string::npos);
+    ASSERT_EQ(buffers.size(), 1ul);
+    ASSERT_TRUE(buffers[0]);
+}
+
+TEST_F(ClientDirectReadTest, MetaTimeoutFallsBackOnce)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    DS_ASSERT_OK(cluster_->SetInjectAction(ClusterNodeType::WORKER, 0, "master.slow_query_meta", "100*sleep(3000)"));
+
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client, 60000, 500);
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+
+    auto objectKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(client->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    std::vector<Optional<Buffer>> buffers;
+    DS_ASSERT_OK(client->Get({ objectKey }, 0, buffers));
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.pathFallbackCount, 1ul);
+    EXPECT_NE(stats.lastFallbackReason.find(object_cache::DirectReadFlow::kMetaTimeoutFallbackReason), std::string::npos);
+    ASSERT_EQ(buffers.size(), 1ul);
+    ASSERT_TRUE(buffers[0]);
+}
+
+TEST_F(ClientDirectReadTest, FailedKeysPreservedAfterFallback)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    object_cache::DirectReadTestHook::SetSimulateStaleRoute(true);
+
+    auto existingKey = ObjectKey();
+    auto missingKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(
+        client->Put(existingKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    FLAGS_enable_client_direct_read = false;
+    object_cache::DirectReadTestHook::Reset();
+    std::vector<Optional<Buffer>> gatewayBuffers;
+    DS_ASSERT_OK(client->Get({ existingKey, missingKey }, 0, gatewayBuffers));
+
+    FLAGS_enable_client_direct_read = true;
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    object_cache::DirectReadTestHook::SetSimulateStaleRoute(true);
+    std::vector<Optional<Buffer>> directBuffers;
+    DS_ASSERT_OK(client->Get({ existingKey, missingKey }, 0, directBuffers));
+
+    ASSERT_EQ(gatewayBuffers.size(), 2ul);
+    ASSERT_EQ(directBuffers.size(), 2ul);
+    EXPECT_EQ(static_cast<bool>(gatewayBuffers[0]), static_cast<bool>(directBuffers[0]));
+    EXPECT_EQ(static_cast<bool>(gatewayBuffers[1]), static_cast<bool>(directBuffers[1]));
+    if (gatewayBuffers[0] && directBuffers[0]) {
+        gatewayBuffers[0]->RLatch();
+        directBuffers[0]->RLatch();
+        AssertBufferEqual(*gatewayBuffers[0], payload);
+        AssertBufferEqual(*directBuffers[0], payload);
+        gatewayBuffers[0]->UnRLatch();
+        directBuffers[0]->UnRLatch();
+    }
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.pathFallbackCount, 1ul);
+    EXPECT_NE(stats.lastFallbackReason.find(object_cache::DirectReadFlow::kStaleRouteFallbackReason), std::string::npos);
 }
 
 class ClientDirectReadHashRingTest : public OCClientCommon {

@@ -44,6 +44,11 @@ class DirectReadFlow {
 public:
     static constexpr const char *kNotImplementedFallbackReason = "direct_flow_not_implemented";
     static constexpr const char *kDataWorkerUnavailableFallbackReason = "data_worker_unavailable";
+    static constexpr const char *kStaleRouteFallbackReason = "stale_route";
+    static constexpr const char *kRedirectLoopFallbackReason = "redirect_loop";
+    static constexpr const char *kMetaTimeoutFallbackReason = "meta_timeout";
+    static constexpr const char *kMetaMovingFallbackReason = "meta_is_moving";
+    static constexpr const char *kRouteUnavailableFallbackReason = "route_unavailable";
 
     DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
                    int32_t requestTimeoutMs);
@@ -52,6 +57,10 @@ public:
                const DirectReadFinishGetFn &finishGet);
 
 private:
+    Status ExecuteMetaPhaseWithRetry(const ObjectReadAccessRequest &request, ObjectReadAccessMetaResult &result);
+
+    Status ExecuteDataPhase(const GetParam &getParam, ObjectReadAccessMetaResult &metaResult, GetRspPb &getRsp,
+                            std::vector<RpcMessage> &outPayloads);
     std::shared_ptr<IClientWorkerApi> workerApi_;
     DirectReadRpcAdapter rpcAdapter_;
     DirectReadRouteProvider routeProvider_;

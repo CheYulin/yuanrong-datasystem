@@ -19,6 +19,7 @@
  */
 #include "datasystem/client/object_cache/direct_read/client_hash_ring_source.h"
 
+#include "datasystem/client/object_cache/direct_read/direct_read_flow.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
 #include "datasystem/common/flags/flags.h"
 #include "datasystem/common/kvstore/etcd/etcd_constants.h"
@@ -51,6 +52,9 @@ ClientHashRingSource::ClientHashRingSource(std::shared_ptr<IClientWorkerApi> wor
 Status ClientHashRingSource::GetMetaAddress(const std::string &objectKey, HostPort &metaAddress)
 {
     RETURN_IF_NOT_OK(RefreshForRouteLookup());
+    if (DirectReadTestHook::SimulateStaleRoute()) {
+        return Status(K_NOT_READY, DirectReadFlow::kStaleRouteFallbackReason);
+    }
     return view_.GetMetaAddress(objectKey, metaAddress);
 }
 

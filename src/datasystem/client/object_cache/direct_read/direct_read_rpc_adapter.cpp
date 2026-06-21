@@ -21,9 +21,11 @@
 
 #include <algorithm>
 #include <memory>
+#include <vector>
 
 #include "datasystem/client/object_cache/direct_read/direct_read_flow.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
+#include "datasystem/common/flags/flags.h"
 #include "datasystem/common/rpc/rpc_channel.h"
 #include "datasystem/common/rpc/rpc_options.h"
 #include "datasystem/common/util/status_helper.h"
@@ -31,8 +33,39 @@
 #include "datasystem/protos/master_object.stub.rpc.pb.h"
 #include "datasystem/protos/worker_object.stub.rpc.pb.h"
 
+DS_DECLARE_int32(client_direct_read_retry_count);
+
 namespace datasystem {
 namespace object_cache {
+namespace {
+Status QueryMetaOnce(Signature *signature, RpcCredential cred, int32_t requestTimeoutMs, const HostPort &metaAddress,
+                     const HostPort &clientWorkerAddress, const std::vector<std::string> &objectKeys,
+                     int64_t subTimeoutMs, master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads)
+{
+    RETURN_RUNTIME_ERROR_IF_NULL(signature);
+    DirectReadTestHook::RecordMetaQuery();
+    master::QueryMetaReqPb req;
+    *req.mutable_ids() = { objectKeys.begin(), objectKeys.end() };
+    req.set_address(clientWorkerAddress.ToString());
+    req.set_sub_timeout(std::min<int64_t>(subTimeoutMs, requestTimeoutMs));
+    req.set_request_id(GetStringUuid());
+    req.set_timeout(requestTimeoutMs);
+    req.set_redirect(true);
+    RETURN_IF_NOT_OK(signature->GenerateSignature(req));
+
+    auto channel = std::make_shared<RpcChannel>(metaAddress, cred);
+    master::MasterOCService_Stub stub(channel, requestTimeoutMs);
+    RpcOptions opts;
+    opts.SetTimeout(requestTimeoutMs);
+    return stub.QueryMeta(opts, req, rsp, payloads);
+}
+
+int32_t MaxControlPlaneRetries()
+{
+    return std::max(0, FLAGS_client_direct_read_retry_count);
+}
+}  // namespace
+
 DirectReadRpcAdapter::DirectReadRpcAdapter(RpcCredential cred, Signature *signature, int32_t requestTimeoutMs)
     : cred_(std::move(cred)), signature_(signature), requestTimeoutMs_(requestTimeoutMs)
 {
@@ -42,22 +75,63 @@ Status DirectReadRpcAdapter::QueryMeta(const HostPort &metaAddress, const HostPo
                                        const GetParam &getParam, master::QueryMetaRspPb &rsp,
                                        std::vector<RpcMessage> &payloads) const
 {
-    RETURN_RUNTIME_ERROR_IF_NULL(signature_);
-    DirectReadTestHook::RecordMetaQuery();
-    master::QueryMetaReqPb req;
-    *req.mutable_ids() = { getParam.objectKeys.begin(), getParam.objectKeys.end() };
-    req.set_address(clientWorkerAddress.ToString());
-    req.set_sub_timeout(std::min<int64_t>(getParam.subTimeoutMs, requestTimeoutMs_));
-    req.set_request_id(GetStringUuid());
-    req.set_timeout(requestTimeoutMs_);
-    req.set_redirect(true);
-    RETURN_IF_NOT_OK(signature_->GenerateSignature(req));
+    if (DirectReadTestHook::ConsumeSimulateMetaMovingResponse()) {
+        return Status(K_TRY_AGAIN, "meta_is_moving");
+    }
 
-    auto channel = std::make_shared<RpcChannel>(metaAddress, cred_);
-    master::MasterOCService_Stub stub(channel, requestTimeoutMs_);
-    RpcOptions opts;
-    opts.SetTimeout(requestTimeoutMs_);
-    return stub.QueryMeta(opts, req, rsp, payloads);
+    HostPort currentMetaAddress = metaAddress;
+    std::vector<std::string> objectKeys(getParam.objectKeys.begin(), getParam.objectKeys.end());
+    int32_t redirectAttempts = 0;
+    int32_t movingAttempts = 0;
+    const int32_t maxRetries = MaxControlPlaneRetries();
+
+    while (true) {
+        if (DirectReadTestHook::SimulateRedirectLoop()) {
+            DirectReadTestHook::RecordRedirectRetry();
+            if (++redirectAttempts > maxRetries) {
+                return Status(K_RUNTIME_ERROR, DirectReadFlow::kRedirectLoopFallbackReason);
+            }
+            continue;
+        }
+
+        rsp.Clear();
+        payloads.clear();
+        Status rc = QueryMetaOnce(signature_, cred_, requestTimeoutMs_, currentMetaAddress, clientWorkerAddress,
+                                  objectKeys, getParam.subTimeoutMs, rsp, payloads);
+        if (rc.IsError()) {
+            if (rc.GetCode() == K_RPC_DEADLINE_EXCEEDED || rc.GetCode() == K_WORKER_TIMEOUT
+                || rc.GetCode() == K_RPC_UNAVAILABLE) {
+                return Status(rc.GetCode(), DirectReadFlow::kMetaTimeoutFallbackReason);
+            }
+            return rc;
+        }
+
+        if (rsp.meta_is_moving()) {
+            DirectReadTestHook::RecordMovingRetry();
+            if (++movingAttempts > maxRetries) {
+                return Status(K_TRY_AGAIN, DirectReadFlow::kMetaMovingFallbackReason);
+            }
+            continue;
+        }
+
+        if (rsp.info_size() > 0) {
+            DirectReadTestHook::RecordRedirectRetry();
+            if (++redirectAttempts > maxRetries) {
+                return Status(K_RUNTIME_ERROR, DirectReadFlow::kRedirectLoopFallbackReason);
+            }
+            const auto &redirectInfo = rsp.info(0);
+            if (redirectInfo.redirect_meta_address().empty()) {
+                return Status(K_RUNTIME_ERROR, DirectReadFlow::kRedirectLoopFallbackReason);
+            }
+            RETURN_IF_NOT_OK(currentMetaAddress.ParseString(redirectInfo.redirect_meta_address()));
+            if (!redirectInfo.change_meta_ids().empty()) {
+                objectKeys.assign(redirectInfo.change_meta_ids().begin(), redirectInfo.change_meta_ids().end());
+            }
+            continue;
+        }
+
+        return Status::OK();
+    }
 }
 
 Status DirectReadRpcAdapter::GetClusterState(const HostPort &workerAddress, HashRingPb &ring, int64_t &version) const

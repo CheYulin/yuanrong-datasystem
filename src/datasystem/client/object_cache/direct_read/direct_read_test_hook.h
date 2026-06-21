@@ -32,6 +32,9 @@ struct DirectReadStats {
     uint64_t dataQueryCount = 0;
     uint64_t hashRingEtcdRefreshCount = 0;
     uint64_t hashRingWorkerRefreshCount = 0;
+    uint64_t movingRetryCount = 0;
+    uint64_t redirectRetryCount = 0;
+    uint64_t staleRouteRetryCount = 0;
     uint64_t pathFallbackCount = 0;
     std::string lastFallbackReason;
 };
@@ -50,9 +53,18 @@ public:
     static bool PreferRemoteDataGet();
     static void RecordHashRingEtcdRefresh();
     static void RecordHashRingWorkerRefresh();
+    static void RecordMovingRetry();
+    static void RecordRedirectRetry();
+    static void RecordStaleRouteRetry();
     static void RecordPathFallback(const std::string &reason);
     static void SetForceHashRingRefresh(bool enabled);
     static bool ForceHashRingRefresh();
+    static void SetSimulateStaleRoute(bool enabled);
+    static bool SimulateStaleRoute();
+    static void SetSimulateRedirectLoop(bool enabled);
+    static bool SimulateRedirectLoop();
+    static void SetSimulateMetaMovingResponses(int count);
+    static bool ConsumeSimulateMetaMovingResponse();
 };
 }  // namespace object_cache
 }  // namespace datasystem
