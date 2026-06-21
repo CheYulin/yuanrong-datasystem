@@ -35,6 +35,7 @@ std::mutex g_directReadStatsMutex;
 DirectReadStats g_directReadStats;
 bool g_forceDirectRead = false;
 bool g_forceHashRingRefresh = false;
+bool g_preferRemoteDataGet = false;
 }  // namespace
 
 void DirectReadTestHook::Reset()
@@ -43,6 +44,7 @@ void DirectReadTestHook::Reset()
     g_directReadStats = DirectReadStats{};
     g_forceDirectRead = false;
     g_forceHashRingRefresh = false;
+    g_preferRemoteDataGet = false;
 }
 
 DirectReadStats DirectReadTestHook::Snapshot()
@@ -85,6 +87,18 @@ void DirectReadTestHook::RecordDataQuery()
 {
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
     ++g_directReadStats.dataQueryCount;
+}
+
+void DirectReadTestHook::SetPreferRemoteDataGet(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    g_preferRemoteDataGet = enabled;
+}
+
+bool DirectReadTestHook::PreferRemoteDataGet()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    return g_preferRemoteDataGet;
 }
 
 void DirectReadTestHook::RecordHashRingEtcdRefresh()

@@ -858,6 +858,9 @@ private:
                               GetRspPb &rsp, uint32_t version, std::vector<RpcMessage> &payloads,
                               std::vector<std::shared_ptr<Buffer>> &buffers, std::vector<std::string> &failedObjectKey);
 
+    Status FinishDirectReadGet(const GetParam &getParam, GetRspPb &rsp, std::vector<RpcMessage> &payloads,
+                               std::vector<std::shared_ptr<Buffer>> &buffers);
+
     /**
      * @brief Get shared memory data buffers from worker.
      * @param[in] objectsNeedToGet The vector of the object key that needs to get from worker.

@@ -54,8 +54,16 @@ private:
 
 class DirectReadDataClientAdapter : public IObjectReadDataClient {
 public:
+    explicit DirectReadDataClientAdapter(DirectReadRpcAdapter *rpcAdapter);
+
+    void SetGetParam(const GetParam *getParam);
+
     Status ReadData(const master::QueryMetaInfoPb &queryMeta, int64_t subTimeoutMs, size_t objectIndex,
                     GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads) override;
+
+private:
+    DirectReadRpcAdapter *rpcAdapter_;
+    const GetParam *getParam_ = nullptr;
 };
 }  // namespace object_cache
 }  // namespace datasystem

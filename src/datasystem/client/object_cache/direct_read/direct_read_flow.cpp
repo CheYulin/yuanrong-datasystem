@@ -21,10 +21,84 @@
 
 #include <utility>
 
+#include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
+#include "datasystem/common/object_cache/object_bitmap.h"
 #include "datasystem/common/util/status_helper.h"
+#include "datasystem/protos/object_posix.pb.h"
 
 namespace datasystem {
 namespace object_cache {
+namespace {
+uint64_t ResolveReadSize(const master::QueryMetaInfoPb &queryMeta, const GetParam &getParam, size_t objectIndex)
+{
+    if (!getParam.readParams.empty() && objectIndex < getParam.readParams.size()) {
+        return getParam.readParams[objectIndex].size;
+    }
+    return queryMeta.meta().data_size();
+}
+
+void FillPayloadInfoFromMeta(const master::QueryMetaInfoPb &queryMeta, const GetParam &getParam, size_t objectIndex,
+                             GetRspPb::PayloadInfoPb &info)
+{
+    const auto &meta = queryMeta.meta();
+    info.set_object_key(meta.object_key());
+    info.set_data_size(static_cast<int64_t>(ResolveReadSize(queryMeta, getParam, objectIndex)));
+    info.set_version(static_cast<int64_t>(meta.version()));
+    info.set_is_seal(meta.life_state() == static_cast<uint32_t>(ObjectLifeState::OBJECT_SEALED));
+    info.set_write_mode(meta.config().write_mode());
+    info.set_consistency_type(meta.config().consistency_type());
+    info.set_cache_type(meta.config().cache_type());
+}
+
+Status AppendInlinePayloads(const master::QueryMetaInfoPb &queryMeta, std::vector<RpcMessage> &metaPayloads,
+                            std::vector<RpcMessage> &outPayloads, GetRspPb::PayloadInfoPb &info)
+{
+    const auto startIndex = outPayloads.size();
+    for (const auto idx : queryMeta.payload_indexs()) {
+        CHECK_FAIL_RETURN_STATUS(idx < metaPayloads.size(), K_RUNTIME_ERROR, "Invalid inline payload index from meta");
+        outPayloads.emplace_back(std::move(metaPayloads[idx]));
+    }
+    for (size_t index = startIndex; index < outPayloads.size(); ++index) {
+        info.add_part_index(static_cast<uint32_t>(index));
+    }
+    CHECK_FAIL_RETURN_STATUS(!info.part_index().empty(), K_RUNTIME_ERROR, "Inline meta payload is empty");
+    return Status::OK();
+}
+
+Status AppendRemotePayloads(const GetObjectRemoteRspPb &remoteRsp, std::vector<RpcMessage> &remotePayloads,
+                            std::vector<RpcMessage> &outPayloads, GetRspPb::PayloadInfoPb &info)
+{
+    const auto startIndex = outPayloads.size();
+    for (auto &payload : remotePayloads) {
+        outPayloads.emplace_back(std::move(payload));
+    }
+    for (size_t index = startIndex; index < outPayloads.size(); ++index) {
+        info.add_part_index(static_cast<uint32_t>(index));
+    }
+    if (remoteRsp.data_size() > 0) {
+        info.set_data_size(remoteRsp.data_size());
+    }
+    if (remoteRsp.create_time() > 0) {
+        info.set_version(remoteRsp.create_time());
+    }
+    if (remoteRsp.life_state() > 0) {
+        info.set_is_seal(remoteRsp.life_state() == static_cast<uint32_t>(ObjectLifeState::OBJECT_SEALED));
+    }
+    CHECK_FAIL_RETURN_STATUS(!info.part_index().empty(), K_RUNTIME_ERROR, "Remote TCP payload is empty");
+    return Status::OK();
+}
+
+const master::QueryMetaInfoPb *FindQueryMeta(const master::QueryMetaRspPb &metaRsp, const std::string &objectKey)
+{
+    for (const auto &queryMeta : metaRsp.query_metas()) {
+        if (queryMeta.meta().object_key() == objectKey) {
+            return &queryMeta;
+        }
+    }
+    return nullptr;
+}
+}  // namespace
+
 DirectReadFlow::DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
                                int32_t requestTimeoutMs)
     : workerApi_(std::move(workerApi)),
@@ -32,14 +106,20 @@ DirectReadFlow::DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcC
       routeProvider_(workerApi_, &rpcAdapter_),
       routeAdapter_(std::make_shared<DirectReadRouteProviderAdapter>(&routeProvider_)),
       metaAdapter_(std::make_shared<DirectReadMetaClientAdapter>(&rpcAdapter_, workerApi_->hostPort_)),
-      dataAdapter_(std::make_shared<DirectReadDataClientAdapter>()),
+      dataAdapter_(std::make_shared<DirectReadDataClientAdapter>(&rpcAdapter_)),
       accessFlow_(routeAdapter_, metaAdapter_, dataAdapter_)
 {
 }
 
-Status DirectReadFlow::Get(const GetParam &getParam, std::vector<std::shared_ptr<Buffer>> &buffers)
+Status DirectReadFlow::Get(const GetParam &getParam, std::vector<std::shared_ptr<Buffer>> &buffers,
+                           const DirectReadFinishGetFn &finishGet)
 {
-    (void)buffers;
+    CHECK_FAIL_RETURN_STATUS(finishGet != nullptr, K_INVALID, "Direct read finish handler is null");
+    CHECK_FAIL_RETURN_STATUS(buffers.size() == getParam.objectKeys.size(), K_INVALID,
+                             "Direct read buffer size does not match object key count");
+
+    dataAdapter_->SetGetParam(&getParam);
+
     ObjectReadAccessRequest request;
     request.objectKeys.assign(getParam.objectKeys.begin(), getParam.objectKeys.end());
     request.subTimeoutMs = getParam.subTimeoutMs;
@@ -47,7 +127,54 @@ Status DirectReadFlow::Get(const GetParam &getParam, std::vector<std::shared_ptr
 
     ObjectReadAccessMetaResult metaResult;
     RETURN_IF_NOT_OK(accessFlow_.ExecuteMetaPhase(request, metaResult));
-    return Status(K_NOT_SUPPORTED, kNotImplementedFallbackReason);
+
+    GetRspPb getRsp;
+    std::vector<RpcMessage> outPayloads;
+    outPayloads.reserve(metaResult.metaPayloads.size());
+
+    for (size_t objectIndex = 0; objectIndex < getParam.objectKeys.size(); ++objectIndex) {
+        const auto &objectKey = getParam.objectKeys[objectIndex];
+        bool notExist = false;
+        for (const auto &missingKey : metaResult.metaRsp.not_exist_ids()) {
+            if (missingKey == objectKey) {
+                notExist = true;
+                break;
+            }
+        }
+        if (notExist) {
+            getRsp.mutable_last_rc()->set_error_code(K_NOT_FOUND);
+            getRsp.mutable_last_rc()->set_error_msg("Object not found in direct meta query");
+            auto *payloadInfo = getRsp.add_payload_info();
+            payloadInfo->set_object_key(objectKey);
+            payloadInfo->set_data_size(-1);
+            continue;
+        }
+
+        const master::QueryMetaInfoPb *queryMeta = FindQueryMeta(metaResult.metaRsp, objectKey);
+        if (queryMeta == nullptr) {
+            return Status(K_NOT_FOUND, FormatString("Direct meta query missing object %s", objectKey));
+        }
+
+        auto *payloadInfo = getRsp.add_payload_info();
+        FillPayloadInfoFromMeta(*queryMeta, getParam, objectIndex, *payloadInfo);
+        DirectReadTestHook::RecordDataQuery();
+
+        const bool useInlinePayload =
+            queryMeta->payload_indexs_size() > 0 && !DirectReadTestHook::PreferRemoteDataGet();
+        if (useInlinePayload) {
+            RETURN_IF_NOT_OK(AppendInlinePayloads(*queryMeta, metaResult.metaPayloads, outPayloads, *payloadInfo));
+            continue;
+        }
+
+        GetObjectRemoteRspPb remoteRsp;
+        std::vector<RpcMessage> remotePayloads;
+        RETURN_IF_NOT_OK(
+            dataAdapter_->ReadData(*queryMeta, getParam.subTimeoutMs, objectIndex, remoteRsp, remotePayloads));
+        RETURN_IF_NOT_OK(AppendRemotePayloads(remoteRsp, remotePayloads, outPayloads, *payloadInfo));
+    }
+
+    getRsp.mutable_last_rc()->set_error_code(K_OK);
+    return finishGet(getParam, getRsp, outPayloads, buffers);
 }
 }  // namespace object_cache
 }  // namespace datasystem

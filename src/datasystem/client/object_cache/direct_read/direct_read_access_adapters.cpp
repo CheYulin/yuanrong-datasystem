@@ -55,16 +55,32 @@ Status DirectReadMetaClientAdapter::QueryMeta(const HostPort &metaAddress, const
     return rpcAdapter_->QueryMeta(metaAddress, clientWorkerAddress_, getParam, rsp, payloads);
 }
 
+DirectReadDataClientAdapter::DirectReadDataClientAdapter(DirectReadRpcAdapter *rpcAdapter) : rpcAdapter_(rpcAdapter)
+{
+}
+
+void DirectReadDataClientAdapter::SetGetParam(const GetParam *getParam)
+{
+    getParam_ = getParam;
+}
+
 Status DirectReadDataClientAdapter::ReadData(const master::QueryMetaInfoPb &queryMeta, int64_t subTimeoutMs,
                                              size_t objectIndex, GetObjectRemoteRspPb &rsp,
                                              std::vector<RpcMessage> &payloads)
 {
-    (void)queryMeta;
     (void)subTimeoutMs;
-    (void)objectIndex;
-    (void)rsp;
-    (void)payloads;
-    return Status(K_NOT_SUPPORTED, DirectReadFlow::kNotImplementedFallbackReason);
+    RETURN_RUNTIME_ERROR_IF_NULL(rpcAdapter_);
+    RETURN_RUNTIME_ERROR_IF_NULL(getParam_);
+    if (queryMeta.address().empty()) {
+        return Status(K_RUNTIME_ERROR, DirectReadFlow::kDataWorkerUnavailableFallbackReason);
+    }
+    HostPort dataAddress;
+    RETURN_IF_NOT_OK(dataAddress.ParseString(queryMeta.address()));
+    Status remoteRc = rpcAdapter_->GetObjectRemoteTcp(dataAddress, queryMeta, *getParam_, objectIndex, rsp, payloads);
+    if (remoteRc.IsError()) {
+        return Status(remoteRc.GetCode(), DirectReadFlow::kDataWorkerUnavailableFallbackReason);
+    }
+    return Status::OK();
 }
 }  // namespace object_cache
 }  // namespace datasystem

@@ -2641,7 +2641,11 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
     if (ShouldTryDirectRead(workerApi)) {
         DirectReadTestHook::RecordDirectAttempt();
         DirectReadFlow directReadFlow(workerApi, cred_, signature_.get(), requestTimeoutMs_);
-        Status directRc = directReadFlow.Get(getParam, objectBuffers);
+        Status directRc = directReadFlow.Get(
+            getParam, objectBuffers, [this](const GetParam &param, GetRspPb &rsp, std::vector<RpcMessage> &payloads,
+                                            std::vector<std::shared_ptr<Buffer>> &buffers) {
+                return FinishDirectReadGet(param, rsp, payloads, buffers);
+            });
         if (directRc.IsOk()) {
             buffers.clear();
             for (auto &objectBuffer : objectBuffers) {
@@ -2656,7 +2660,8 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
         if (!FLAGS_enable_client_direct_read_fallback) {
             return directRc;
         }
-        DirectReadTestHook::RecordPathFallback(DirectReadFlow::kNotImplementedFallbackReason);
+        DirectReadTestHook::RecordPathFallback(
+            directRc.GetMsg().empty() ? DirectReadFlow::kNotImplementedFallbackReason : directRc.GetMsg());
     }
     Status rc = GetBuffersFromWorker(workerApi, getParam, objectBuffers);
     buffers.clear();
@@ -2969,6 +2974,23 @@ Status ObjectClientImpl::GetBuffersFromWorkerBatched(std::shared_ptr<IClientWork
     return lastError.IsOk() ? Status(K_NOT_FOUND, "Cannot get objects from worker") : lastError;
 }
 #endif
+
+Status ObjectClientImpl::FinishDirectReadGet(const GetParam &getParam, GetRspPb &rsp, std::vector<RpcMessage> &payloads,
+                                             std::vector<std::shared_ptr<Buffer>> &buffers)
+{
+    CHECK_FAIL_RETURN_STATUS(buffers.size() == getParam.objectKeys.size(), K_INVALID,
+                             "Direct read buffer size does not match object key count");
+    uint32_t version = 0;
+    std::vector<std::string> failedObjectKey;
+    failedObjectKey.reserve(getParam.objectKeys.size());
+    RETURN_IF_NOT_OK(ProcessGetResponse(getParam.objectKeys, getParam.readParams, rsp, version, payloads, buffers,
+                                        failedObjectKey));
+    if (getParam.objectKeys.size() > failedObjectKey.size()) {
+        return Status::OK();
+    }
+    Status recvRc(static_cast<StatusCode>(rsp.last_rc().error_code()), rsp.last_rc().error_msg());
+    return recvRc.IsOk() ? Status(K_NOT_FOUND, "Cannot get objects from direct read") : recvRc;
+}
 
 Status ObjectClientImpl::ProcessGetResponse(const std::vector<std::string> &objectKeys,
                                             const std::vector<ReadParam> &readParams, GetRspPb &rsp, uint32_t version,

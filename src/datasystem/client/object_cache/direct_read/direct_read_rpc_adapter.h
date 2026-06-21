@@ -30,6 +30,7 @@
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/protos/hash_ring.pb.h"
 #include "datasystem/protos/master_object.pb.h"
+#include "datasystem/protos/worker_object.pb.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem {
@@ -42,6 +43,10 @@ public:
                      master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads) const;
 
     Status GetClusterState(const HostPort &workerAddress, HashRingPb &ring, int64_t &version) const;
+
+    Status GetObjectRemoteTcp(const HostPort &dataAddress, const master::QueryMetaInfoPb &queryMeta,
+                              const GetParam &getParam, size_t objectIndex, GetObjectRemoteRspPb &rsp,
+                              std::vector<RpcMessage> &payloads) const;
 
 private:
     RpcCredential cred_;

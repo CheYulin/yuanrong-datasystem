@@ -46,6 +46,8 @@ public:
     static void RecordRouteQuery();
     static void RecordMetaQuery();
     static void RecordDataQuery();
+    static void SetPreferRemoteDataGet(bool enabled);
+    static bool PreferRemoteDataGet();
     static void RecordHashRingEtcdRefresh();
     static void RecordHashRingWorkerRefresh();
     static void RecordPathFallback(const std::string &reason);
