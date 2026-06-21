@@ -200,6 +200,10 @@ public:
      */
     Status NotifyRemoteGet(const NotifyRemoteGetReqPb &req, QueryMetaMap queryMetas, NotifyRemoteGetRspPb &rsp);
 
+    Status QueryMetaFromMasterDirect(const HostPort &destMasterHostPort, uint64_t subTimeout,
+                                     const std::vector<std::string> &objKeysToQuery, bool isFromOtherAz,
+                                     datasystem::master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads);
+
 private:
     using ObjectKeysQueryMetaFailed = std::tuple<std::unordered_set<std::string>, std::unordered_set<std::string>>;
     using TbbTransportStubTable = tbb::concurrent_hash_map<std::string, std::shared_ptr<WorkerRemoteWorkerTransApi>>;

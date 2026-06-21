@@ -59,3 +59,12 @@ ds_cc_test(
         "//tests/ut:ut_common",
     ],
 )
+
+ds_cc_test(
+    name = "object_read_access_flow_test",
+    srcs = ["object_read_access_flow_test.cpp"],
+    deps = [
+        "//src/datasystem/common/object_cache:object_read_access_flow",
+        "//tests/ut:ut_common",
+    ],
+)

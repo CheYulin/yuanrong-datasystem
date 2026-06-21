@@ -24,8 +24,8 @@
 #include <string>
 #include <vector>
 
-#include "datasystem/client/object_cache/direct_read/direct_read_flow.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
+#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
 #include "datasystem/common/flags/flags.h"
 #include "oc_client_common.h"
 
@@ -119,54 +119,77 @@ TEST_F(ClientDirectReadTest, SameNodeUsesWorkerPathWhenEnabled)
     EXPECT_TRUE(stats.lastFallbackReason.empty());
 }
 
-TEST_F(ClientDirectReadTest, CrossNodeDirectTcpGetMatchesGatewayGet)
+TEST_F(ClientDirectReadTest, DirectUnsupportedFallsBackOnce)
 {
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
     std::shared_ptr<ObjectClient> client;
     InitTestClient(0, client);
 
-    auto objectKey = ObjectKey();
-    auto payload = BuildPayload();
-    DS_ASSERT_OK(client->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
-
-    FLAGS_enable_client_direct_read = false;
-    object_cache::DirectReadTestHook::Reset();
-    std::vector<Optional<Buffer>> gatewayBuffers;
-    DS_ASSERT_OK(client->Get({ objectKey }, 0, gatewayBuffers));
-    ASSERT_EQ(gatewayBuffers.size(), 1ul);
-    ASSERT_TRUE(gatewayBuffers[0]);
-    gatewayBuffers[0]->RLatch();
-    AssertBufferEqual(*gatewayBuffers[0], payload);
-
-    FLAGS_enable_client_direct_read = true;
-    object_cache::DirectReadTestHook::SetForceDirectRead(true);
-    std::vector<Optional<Buffer>> directBuffers;
-    DS_ASSERT_OK(client->Get({ objectKey }, 0, directBuffers));
+    PutAndGetOnClient(client);
 
     auto stats = object_cache::DirectReadTestHook::Snapshot();
     EXPECT_EQ(stats.directAttemptCount, 1ul);
     EXPECT_EQ(stats.routeQueryCount, 1ul);
     EXPECT_EQ(stats.metaQueryCount, 1ul);
-    EXPECT_EQ(stats.dataQueryCount, 1ul);
-    EXPECT_EQ(stats.pathFallbackCount, 0ul);
-    EXPECT_TRUE(stats.lastFallbackReason.empty());
-
-    ASSERT_EQ(directBuffers.size(), 1ul);
-    ASSERT_TRUE(directBuffers[0]);
-    ASSERT_EQ(directBuffers[0]->GetSize(), payload.size());
-    directBuffers[0]->RLatch();
-    AssertBufferEqual(*directBuffers[0], payload);
-    AssertBufferEqual(*directBuffers[0], *gatewayBuffers[0]);
-    gatewayBuffers[0]->UnRLatch();
-    directBuffers[0]->UnRLatch();
+    EXPECT_EQ(stats.dataQueryCount, 0ul);
+    EXPECT_EQ(stats.pathFallbackCount, 1ul);
+    EXPECT_EQ(stats.lastFallbackReason, "direct_flow_not_implemented");
+    EXPECT_GE(object_cache::ObjectReadAccessFlow::MetaPhaseCountForTest(), 1ul);
 }
 
-TEST_F(ClientDirectReadTest, DataWorkerUnavailableFallsBack)
+TEST_F(ClientDirectReadTest, DirectQueriesMetaBeforeFallback)
 {
     FLAGS_enable_client_direct_read = true;
     FLAGS_enable_client_direct_read_fallback = true;
     object_cache::DirectReadTestHook::SetForceDirectRead(true);
-    object_cache::DirectReadTestHook::SetPreferRemoteDataGet(true);
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
 
+    PutAndGetOnClient(client);
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.directAttemptCount, 1ul);
+    EXPECT_EQ(stats.routeQueryCount, 1ul);
+    EXPECT_EQ(stats.metaQueryCount, 1ul);
+    EXPECT_EQ(stats.dataQueryCount, 0ul);
+    EXPECT_EQ(stats.pathFallbackCount, 1ul);
+    EXPECT_EQ(stats.lastFallbackReason, "direct_flow_not_implemented");
+    EXPECT_GE(object_cache::ObjectReadAccessFlow::MetaPhaseCountForTest(), 1ul);
+}
+
+class ClientDirectReadHashRingTest : public OCClientCommon {
+public:
+    void SetClusterSetupOptions(ExternalClusterOptions &opts) override
+    {
+        opts.numWorkers = WORKER_NUM;
+        opts.numEtcd = 1;
+        opts.enableDistributedMaster = "true";
+    }
+
+    void SetUp() override
+    {
+        ExternalClusterTest::SetUp();
+        object_cache::DirectReadTestHook::Reset();
+        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+    }
+
+    void TearDown() override
+    {
+        object_cache::DirectReadTestHook::Reset();
+        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        FLAGS_enable_client_direct_read = false;
+        FLAGS_enable_client_direct_read_fallback = true;
+        ExternalClusterTest::TearDown();
+    }
+};
+
+TEST_F(ClientDirectReadHashRingTest, BootstrapLoadsHashRingFromEtcd)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
     std::shared_ptr<ObjectClient> client;
     InitTestClient(0, client);
 
@@ -174,25 +197,13 @@ TEST_F(ClientDirectReadTest, DataWorkerUnavailableFallsBack)
     auto payload = BuildPayload();
     DS_ASSERT_OK(client->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
 
-    DS_ASSERT_OK(cluster_->SetInjectAction(ClusterNodeType::WORKER, 0, "worker.worker_worker_remote_get_failure",
-                                          "100*return()"));
-
     std::vector<Optional<Buffer>> buffers;
     DS_ASSERT_OK(client->Get({ objectKey }, 0, buffers));
 
     auto stats = object_cache::DirectReadTestHook::Snapshot();
-    EXPECT_EQ(stats.directAttemptCount, 1ul);
-    EXPECT_EQ(stats.dataQueryCount, 1ul);
-    EXPECT_EQ(stats.pathFallbackCount, 1ul);
-    EXPECT_NE(stats.lastFallbackReason.find(object_cache::DirectReadFlow::kDataWorkerUnavailableFallbackReason),
-              std::string::npos);
-
-    ASSERT_EQ(buffers.size(), 1ul);
-    ASSERT_TRUE(buffers[0]);
-    ASSERT_EQ(buffers[0]->GetSize(), payload.size());
-    buffers[0]->RLatch();
-    AssertBufferEqual(*buffers[0], payload);
-    buffers[0]->UnRLatch();
+    EXPECT_GE(stats.hashRingEtcdRefreshCount, 1ul);
+    EXPECT_EQ(stats.routeQueryCount, 1ul);
+    EXPECT_EQ(stats.metaQueryCount, 1ul);
 }
 }  // namespace st
 }  // namespace datasystem

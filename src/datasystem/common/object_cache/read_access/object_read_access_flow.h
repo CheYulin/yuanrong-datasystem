@@ -15,11 +15,12 @@
  */
 
 /**
- * Description: Shared object read access ports for client and worker reuse.
+ * Description: Shared object read access flow for client direct read and worker gateway read.
  */
 #ifndef DATASYSTEM_COMMON_OBJECT_CACHE_READ_ACCESS_OBJECT_READ_ACCESS_FLOW_H
 #define DATASYSTEM_COMMON_OBJECT_CACHE_READ_ACCESS_OBJECT_READ_ACCESS_FLOW_H
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,11 +28,22 @@
 #include "datasystem/common/rpc/rpc_message.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/protos/master_object.pb.h"
-#include "datasystem/protos/object_posix.pb.h"
+#include "datasystem/protos/worker_object.pb.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem {
 namespace object_cache {
+struct ObjectReadAccessRequest {
+    std::vector<std::string> objectKeys;
+    int64_t subTimeoutMs = 0;
+    HostPort clientWorkerAddress;
+};
+
+struct ObjectReadAccessMetaResult {
+    master::QueryMetaRspPb metaRsp;
+    std::vector<RpcMessage> metaPayloads;
+};
+
 class IObjectReadRouteProvider {
 public:
     virtual ~IObjectReadRouteProvider() = default;
@@ -42,23 +54,37 @@ public:
 class IObjectReadMetaClient {
 public:
     virtual ~IObjectReadMetaClient() = default;
-    virtual Status QueryMeta(const HostPort &metaAddress, const GetParam &getParam, master::QueryMetaRspPb &rsp,
+    virtual Status QueryMeta(const HostPort &metaAddress, const std::vector<std::string> &objectKeys,
+                             int64_t subTimeoutMs, master::QueryMetaRspPb &rsp,
                              std::vector<RpcMessage> &payloads) = 0;
 };
 
 class IObjectReadDataClient {
 public:
     virtual ~IObjectReadDataClient() = default;
-    virtual Status ReadData(const master::QueryMetaInfoPb &queryMeta, const GetParam &getParam, size_t objectIndex,
+    virtual Status ReadData(const master::QueryMetaInfoPb &queryMeta, int64_t subTimeoutMs, size_t objectIndex,
                             GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads) = 0;
 };
 
-// Task 3.6 will move worker/client read orchestration into ObjectReadAccessFlow using the ports above.
 class ObjectReadAccessFlow {
 public:
     ObjectReadAccessFlow(std::shared_ptr<IObjectReadRouteProvider> routeProvider,
                          std::shared_ptr<IObjectReadMetaClient> metaClient,
                          std::shared_ptr<IObjectReadDataClient> dataClient);
+
+    Status ExecuteMetaPhase(const ObjectReadAccessRequest &request, ObjectReadAccessMetaResult &result);
+
+    static void RecordMetaPhaseForTest();
+    static uint64_t MetaPhaseCountForTest();
+    static void ResetTestCounters();
+
+private:
+    Status QueryMetaGroup(const HostPort &metaAddress, const std::vector<std::string> &objectKeys,
+                          int64_t subTimeoutMs, master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads);
+
+    std::shared_ptr<IObjectReadRouteProvider> routeProvider_;
+    std::shared_ptr<IObjectReadMetaClient> metaClient_;
+    std::shared_ptr<IObjectReadDataClient> dataClient_;
 };
 
 }  // namespace object_cache

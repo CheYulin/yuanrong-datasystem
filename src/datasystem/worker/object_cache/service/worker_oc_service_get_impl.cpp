@@ -18,6 +18,7 @@
  * Description: Defines the worker service Get process.
  */
 #include "datasystem/worker/object_cache/service/worker_oc_service_get_impl.h"
+#include "datasystem/worker/object_cache/service/worker_object_read_access_helper.h"
 
 #include <cstdint>
 #include <chrono>
@@ -1405,6 +1406,16 @@ Status WorkerOcServiceGetImpl::QueryMetaDataFromMasterImpl(const HostPort &destM
                                                            std::vector<RpcMessage> &payloads)
 {
     PerfPoint point(PerfKey::WORKER_QUERY_META_IMPL);
+    (void)point;
+    return QueryMetaGroupUsingSharedFlow(*this, destMasterHostPort, objKeysToQuery, isFromOtherAz, subTimeout, rsp,
+                                         payloads);
+}
+
+Status WorkerOcServiceGetImpl::QueryMetaFromMasterDirect(const HostPort &destMasterHostPort, uint64_t subTimeout,
+                                                         const std::vector<std::string> &objKeysToQuery,
+                                                         bool isFromOtherAz, datasystem::master::QueryMetaRspPb &rsp,
+                                                         std::vector<RpcMessage> &payloads)
+{
     datasystem::master::QueryMetaReqPb req;
     SetQueryMetaInfo(req, objKeysToQuery, destMasterHostPort.ToString(), true, isFromOtherAz);
     std::shared_ptr<WorkerMasterOCApi> workerMasterApi =
