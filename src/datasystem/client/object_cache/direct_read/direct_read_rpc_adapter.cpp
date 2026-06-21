@@ -57,5 +57,22 @@ Status DirectReadRpcAdapter::QueryMeta(const HostPort &metaAddress, const HostPo
     opts.SetTimeout(requestTimeoutMs_);
     return stub.QueryMeta(opts, req, rsp, payloads);
 }
+
+Status DirectReadRpcAdapter::GetClusterState(const HostPort &workerAddress, HashRingPb &ring, int64_t &version) const
+{
+    RETURN_RUNTIME_ERROR_IF_NULL(signature_);
+    GetClusterStateReqPb req;
+    RETURN_IF_NOT_OK(signature_->GenerateSignature(req));
+
+    auto channel = std::make_shared<RpcChannel>(workerAddress, cred_);
+    WorkerWorkerOCService_Stub stub(channel, requestTimeoutMs_);
+    RpcOptions opts;
+    opts.SetTimeout(requestTimeoutMs_);
+    GetClusterStateRspPb rsp;
+    RETURN_IF_NOT_OK(stub.GetClusterState(opts, req, rsp));
+    ring.CopyFrom(rsp.hash_ring());
+    version = -1;
+    return Status::OK();
+}
 }  // namespace object_cache
 }  // namespace datasystem

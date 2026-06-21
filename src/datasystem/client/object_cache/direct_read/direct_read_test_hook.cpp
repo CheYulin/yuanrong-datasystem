@@ -34,6 +34,7 @@ namespace {
 std::mutex g_directReadStatsMutex;
 DirectReadStats g_directReadStats;
 bool g_forceDirectRead = false;
+bool g_forceHashRingRefresh = false;
 }  // namespace
 
 void DirectReadTestHook::Reset()
@@ -41,6 +42,7 @@ void DirectReadTestHook::Reset()
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
     g_directReadStats = DirectReadStats{};
     g_forceDirectRead = false;
+    g_forceHashRingRefresh = false;
 }
 
 DirectReadStats DirectReadTestHook::Snapshot()
@@ -77,6 +79,36 @@ void DirectReadTestHook::RecordMetaQuery()
 {
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
     ++g_directReadStats.metaQueryCount;
+}
+
+void DirectReadTestHook::RecordDataQuery()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.dataQueryCount;
+}
+
+void DirectReadTestHook::RecordHashRingEtcdRefresh()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.hashRingEtcdRefreshCount;
+}
+
+void DirectReadTestHook::RecordHashRingWorkerRefresh()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.hashRingWorkerRefreshCount;
+}
+
+void DirectReadTestHook::SetForceHashRingRefresh(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    g_forceHashRingRefresh = enabled;
+}
+
+bool DirectReadTestHook::ForceHashRingRefresh()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    return g_forceHashRingRefresh;
 }
 
 void DirectReadTestHook::RecordPathFallback(const std::string &reason)

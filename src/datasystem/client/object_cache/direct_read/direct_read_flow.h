@@ -44,8 +44,8 @@ public:
 
 private:
     std::shared_ptr<IClientWorkerApi> workerApi_;
-    DirectReadRouteProvider routeProvider_;
     DirectReadRpcAdapter rpcAdapter_;
+    DirectReadRouteProvider routeProvider_;
 };
 }  // namespace object_cache
 }  // namespace datasystem

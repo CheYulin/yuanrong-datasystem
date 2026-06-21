@@ -15,7 +15,7 @@
  */
 
 /**
- * Description: Minimal route provider for client direct read.
+ * Description: Route provider for client direct read backed by ClientHashRingSource.
  */
 #include "datasystem/client/object_cache/direct_read/direct_read_route_provider.h"
 
@@ -26,18 +26,33 @@
 
 namespace datasystem {
 namespace object_cache {
-DirectReadRouteProvider::DirectReadRouteProvider(std::shared_ptr<IClientWorkerApi> workerApi)
-    : workerApi_(std::move(workerApi))
+DirectReadRouteProvider::DirectReadRouteProvider(std::shared_ptr<IClientWorkerApi> workerApi,
+                                                 DirectReadRpcAdapter *rpcAdapter)
+    : hashRingSource_(std::move(workerApi), rpcAdapter)
 {
 }
 
-Status DirectReadRouteProvider::GetMetaAddress(const GetParam &getParam, HostPort &metaAddress) const
+Status DirectReadRouteProvider::GetMetaAddress(const GetParam &getParam, HostPort &metaAddress)
 {
-    (void)getParam;
-    RETURN_RUNTIME_ERROR_IF_NULL(workerApi_);
+    CHECK_FAIL_RETURN_STATUS(!getParam.objectKeys.empty(), K_INVALID, "Direct read requires at least one object key");
+    return GetMetaAddress(getParam.objectKeys.front(), metaAddress);
+}
+
+Status DirectReadRouteProvider::GetMetaAddress(const std::string &objectKey, HostPort &metaAddress)
+{
     DirectReadTestHook::RecordRouteQuery();
-    metaAddress = workerApi_->hostPort_;
-    return Status::OK();
+    RETURN_IF_NOT_OK(RefreshRouteIfNeeded());
+    return hashRingSource_.GetMetaAddress(objectKey, metaAddress);
+}
+
+Status DirectReadRouteProvider::RefreshRouteIfNeeded()
+{
+    return hashRingSource_.RefreshForRouteLookup();
+}
+
+ClientHashRingSource &DirectReadRouteProvider::HashRingSourceForTest()
+{
+    return hashRingSource_;
 }
 }  // namespace object_cache
 }  // namespace datasystem

@@ -28,8 +28,8 @@ namespace object_cache {
 DirectReadFlow::DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
                                int32_t requestTimeoutMs)
     : workerApi_(std::move(workerApi)),
-      routeProvider_(workerApi_),
-      rpcAdapter_(std::move(cred), signature, requestTimeoutMs)
+      rpcAdapter_(std::move(cred), signature, requestTimeoutMs),
+      routeProvider_(workerApi_, &rpcAdapter_)
 {
 }
 

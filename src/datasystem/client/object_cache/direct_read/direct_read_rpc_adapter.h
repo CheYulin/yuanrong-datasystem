@@ -28,6 +28,7 @@
 #include "datasystem/common/rpc/rpc_credential.h"
 #include "datasystem/common/rpc/rpc_message.h"
 #include "datasystem/common/util/net_util.h"
+#include "datasystem/protos/hash_ring.pb.h"
 #include "datasystem/protos/master_object.pb.h"
 #include "datasystem/utils/status.h"
 
@@ -39,6 +40,8 @@ public:
 
     Status QueryMeta(const HostPort &metaAddress, const HostPort &clientWorkerAddress, const GetParam &getParam,
                      master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads) const;
+
+    Status GetClusterState(const HostPort &workerAddress, HashRingPb &ring, int64_t &version) const;
 
 private:
     RpcCredential cred_;

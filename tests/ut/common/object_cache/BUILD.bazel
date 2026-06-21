@@ -50,3 +50,12 @@ ds_cc_test(
         "//tests/ut:ut_common",
     ],
 )
+
+ds_cc_test(
+    name = "read_only_hash_ring_view_test",
+    srcs = ["read_only_hash_ring_view_test.cpp"],
+    deps = [
+        "//src/datasystem/common/object_cache:read_only_hash_ring_view",
+        "//tests/ut:ut_common",
+    ],
+)

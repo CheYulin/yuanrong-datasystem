@@ -30,6 +30,8 @@ struct DirectReadStats {
     uint64_t routeQueryCount = 0;
     uint64_t metaQueryCount = 0;
     uint64_t dataQueryCount = 0;
+    uint64_t hashRingEtcdRefreshCount = 0;
+    uint64_t hashRingWorkerRefreshCount = 0;
     uint64_t pathFallbackCount = 0;
     std::string lastFallbackReason;
 };
@@ -43,7 +45,12 @@ public:
     static void RecordDirectAttempt();
     static void RecordRouteQuery();
     static void RecordMetaQuery();
+    static void RecordDataQuery();
+    static void RecordHashRingEtcdRefresh();
+    static void RecordHashRingWorkerRefresh();
     static void RecordPathFallback(const std::string &reason);
+    static void SetForceHashRingRefresh(bool enabled);
+    static bool ForceHashRingRefresh();
 };
 }  // namespace object_cache
 }  // namespace datasystem
