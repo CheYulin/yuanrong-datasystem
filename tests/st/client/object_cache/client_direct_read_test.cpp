@@ -57,11 +57,13 @@ public:
     {
         ExternalClusterTest::SetUp();
         object_cache::DirectReadTestHook::Reset();
+        object_cache::ObjectReadAccessFlow::ResetTestCounters();
     }
 
     void TearDown() override
     {
         object_cache::DirectReadTestHook::Reset();
+        object_cache::ObjectReadAccessFlow::ResetTestCounters();
         FLAGS_enable_client_direct_read = false;
         FLAGS_enable_client_direct_read_fallback = true;
         ExternalClusterTest::TearDown();

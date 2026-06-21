@@ -20,39 +20,38 @@
 #ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_FLOW_H
 #define DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_FLOW_H
 
-#include <functional>
 #include <memory>
 #include <vector>
 
 #include "datasystem/client/object_cache/client_worker_api/iclient_worker_api.h"
+#include "datasystem/client/object_cache/direct_read/direct_read_access_adapters.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_route_provider.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_rpc_adapter.h"
 #include "datasystem/common/ak_sk/signature.h"
+#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
 #include "datasystem/common/rpc/rpc_credential.h"
 #include "datasystem/object/buffer.h"
-#include "datasystem/protos/object_posix.pb.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem {
 namespace object_cache {
-using DirectReadFinishGetFn = std::function<Status(const GetParam &, GetRspPb &, std::vector<RpcMessage> &,
-                                                   std::vector<std::shared_ptr<Buffer>> &)>;
-
 class DirectReadFlow {
 public:
     static constexpr const char *kNotImplementedFallbackReason = "direct_flow_not_implemented";
-    static constexpr const char *kDataWorkerUnavailableFallbackReason = "data_worker_unavailable";
 
     DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
                    int32_t requestTimeoutMs);
 
-    Status Get(const GetParam &getParam, std::vector<std::shared_ptr<Buffer>> &buffers,
-               const DirectReadFinishGetFn &finishGet);
+    Status Get(const GetParam &getParam, std::vector<std::shared_ptr<Buffer>> &buffers);
 
 private:
     std::shared_ptr<IClientWorkerApi> workerApi_;
     DirectReadRpcAdapter rpcAdapter_;
     DirectReadRouteProvider routeProvider_;
+    std::shared_ptr<DirectReadRouteProviderAdapter> routeAdapter_;
+    std::shared_ptr<DirectReadMetaClientAdapter> metaAdapter_;
+    std::shared_ptr<DirectReadDataClientAdapter> dataAdapter_;
+    ObjectReadAccessFlow accessFlow_;
 };
 }  // namespace object_cache
 }  // namespace datasystem
