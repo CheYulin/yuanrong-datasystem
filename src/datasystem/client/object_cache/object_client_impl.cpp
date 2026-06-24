@@ -43,6 +43,8 @@
 #include "datasystem/client/mmap/immap_table_entry.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_flow.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_fallback.h"
+#include "datasystem/client/object_cache/direct_read/client_hash_ring_source.h"
+#include "datasystem/client/object_cache/direct_read/direct_read_rpc_adapter.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
 #include "datasystem/client/object_cache/client_worker_api/iclient_worker_api.h"
 #include "datasystem/common/device/device_manager_factory.h"
@@ -92,6 +94,7 @@
 
 DS_DECLARE_bool(enable_client_direct_read);
 DS_DECLARE_bool(enable_client_direct_read_fallback);
+DS_DECLARE_bool(enable_distributed_master);
 DS_DECLARE_bool(log_monitor);
 
 const size_t MSET_MAX_KEY_COUNT = 8;
@@ -1392,16 +1395,60 @@ Status ObjectClientImpl::GetAvailableWorkerApi(std::shared_ptr<IClientWorkerApi>
     return Status::OK();
 }
 
-bool ObjectClientImpl::ShouldTryDirectRead(const std::shared_ptr<IClientWorkerApi> &workerApi) const
+bool ObjectClientImpl::HasHealthyLocalWorker()
 {
-    if (!FLAGS_enable_client_direct_read || workerApi == nullptr) {
+    if (workerApi_.size() <= LOCAL_WORKER || workerApi_[LOCAL_WORKER] == nullptr) {
+        return false;
+    }
+    if (listenWorker_.size() <= LOCAL_WORKER || listenWorker_[LOCAL_WORKER] == nullptr) {
+        return false;
+    }
+    return listenWorker_[LOCAL_WORKER]->CheckWorkerAvailable().IsOk();
+}
+
+bool ObjectClientImpl::TryDirectReadCutbackToLocalWorker(const std::shared_ptr<IClientWorkerApi> &workerApi)
+{
+    if (!FLAGS_enable_client_direct_read || DirectReadTestHook::ForceDirectRead()) {
+        return false;
+    }
+    if (HasHealthyLocalWorker() || workerApi == nullptr) {
+        return false;
+    }
+
+    HostPort localAddress;
+    HeartbeatType heartbeatType = HeartbeatType::RPC_HEARTBEAT;
+    WorkerNode oldNode;
+    if (!GetPreferredLocalWorkerToRecover(oldNode, localAddress, heartbeatType)) {
+        return false;
+    }
+
+    if (FLAGS_enable_distributed_master) {
+        DirectReadRpcAdapter rpcAdapter(cred_, signature_.get(), requestTimeoutMs_);
+        ClientHashRingSource ringSource(workerApi, &rpcAdapter);
+        if (ringSource.RefreshForRouteLookup().IsError()
+            || !ringSource.ViewForTest().HasHealthyWorkerAtAddress(localAddress)) {
+            return false;
+        }
+    }
+
+    if (!RecoverPreferredLocalWorker()) {
+        return false;
+    }
+    LOG(INFO) << "[DirectRead] Cut back to local worker gateway at " << localAddress.ToString();
+    return true;
+}
+
+bool ObjectClientImpl::ShouldTryDirectRead(const std::shared_ptr<IClientWorkerApi> &workerApi)
+{
+    (void)workerApi;
+    if (!FLAGS_enable_client_direct_read) {
         return false;
     }
     if (DirectReadTestHook::ForceDirectRead()) {
         return true;
     }
-    // Direct read applies only to cross-node reads where the client uses the remote worker API.
-    return !workerApi->IsShmEnable();
+    // Direct read applies only when the client has no healthy local worker connection.
+    return !HasHealthyLocalWorker();
 }
 
 Status ObjectClientImpl::MGetH2D(const std::vector<std::string> &objectKeys,
@@ -2634,6 +2681,10 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
     RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
+    if (TryDirectReadCutbackToLocalWorker(workerApi)) {
+        raii.reset();
+        RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
+    }
     std::vector<std::shared_ptr<Buffer>> objectBuffers(objectKeys.size());
     GetParam getParam{ .objectKeys = objectKeys,
                        .subTimeoutMs = subTimeoutMs,

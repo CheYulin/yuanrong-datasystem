@@ -1479,7 +1479,11 @@ private:
      */
     Status PostPipelineRH2D(std::promise<AsyncResult> &promise, PiplnRh2dParam &piplnRh2dParam, GetRspPb &rsp);
 
-    bool ShouldTryDirectRead(const std::shared_ptr<IClientWorkerApi> &workerApi) const;
+    bool HasHealthyLocalWorker();
+
+    bool TryDirectReadCutbackToLocalWorker(const std::shared_ptr<IClientWorkerApi> &workerApi);
+
+    bool ShouldTryDirectRead(const std::shared_ptr<IClientWorkerApi> &workerApi);
 
     HostPort ipAddress_;
     RpcAuthKeys authKeys_;

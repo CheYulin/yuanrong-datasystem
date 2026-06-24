@@ -406,6 +406,37 @@ public:
     }
 };
 
+TEST_F(ClientDirectReadCrossNodeTest, CrossNodeGetWithLocalWorkerUsesGatewayPath)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    object_cache::DirectReadTestHook::Reset();
+
+    std::shared_ptr<ObjectClient> writer;
+    InitTestClient(0, writer);
+    auto objectKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(writer->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    std::shared_ptr<ObjectClient> reader;
+    InitTestClient(1, reader);
+    std::vector<Optional<Buffer>> buffers;
+    DS_ASSERT_OK(reader->Get({ objectKey }, 0, buffers));
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_EQ(stats.directAttemptCount, 0ul);
+    EXPECT_EQ(stats.routeQueryCount, 0ul);
+    EXPECT_EQ(stats.metaQueryCount, 0ul);
+    EXPECT_EQ(stats.dataQueryCount, 0ul);
+    EXPECT_EQ(stats.pathFallbackCount, 0ul);
+
+    ASSERT_EQ(buffers.size(), 1ul);
+    ASSERT_TRUE(buffers[0]);
+    buffers[0]->RLatch();
+    AssertBufferEqual(*buffers[0], payload);
+    buffers[0]->UnRLatch();
+}
+
 TEST_F(ClientDirectReadCrossNodeTest, CrossNodeWriteDoesNotUseDirectRead)
 {
     FLAGS_enable_client_direct_read = true;
@@ -489,6 +520,37 @@ public:
         ExternalClusterTest::TearDown();
     }
 };
+
+TEST_F(ClientDirectReadHashRingTest, MetaMovingRefreshesRingAndSucceeds)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    FLAGS_client_direct_read_retry_count = 1;
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    object_cache::DirectReadTestHook::SetSimulateMetaMovingResponses(1);
+
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
+
+    auto objectKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(client->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    std::vector<Optional<Buffer>> buffers;
+    DS_ASSERT_OK(client->Get({ objectKey }, 0, buffers));
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_GE(stats.movingRetryCount, 1ul);
+    EXPECT_GE(stats.hashRingWorkerRefreshCount + stats.hashRingEtcdRefreshCount, 1ul);
+    EXPECT_EQ(stats.pathFallbackCount, 0ul);
+    EXPECT_EQ(stats.metaQueryCount, 2ul);
+
+    ASSERT_EQ(buffers.size(), 1ul);
+    ASSERT_TRUE(buffers[0]);
+    buffers[0]->RLatch();
+    AssertBufferEqual(*buffers[0], payload);
+    buffers[0]->UnRLatch();
+}
 
 TEST_F(ClientDirectReadHashRingTest, BootstrapLoadsHashRingFromEtcd)
 {
