@@ -29,6 +29,8 @@ DS_DECLARE_bool(enable_meta_affinity_replicate);
 namespace datasystem {
 namespace ut {
 
+using namespace object_cache;
+
 class MetaAffinityReplicateTest : public CommonTest {
 public:
     void SetUp() override

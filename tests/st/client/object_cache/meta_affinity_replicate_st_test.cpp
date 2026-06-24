@@ -53,7 +53,6 @@ protected:
     void SetUp() override
     {
         OCClientCommon::SetUp();
-        StartWorkerAndWaitReady({ 0, 1 });
         db_ = InitTestEtcdInstance();
         InitMasterApis();
     }
@@ -128,7 +127,7 @@ TEST_F(MetaAffinityReplicateStTest, SameNodePutSwapsPrimaryToMetaOwner)
     std::vector<Optional<Buffer>> buffers;
     DS_ASSERT_OK(client0->Get({ objectKey }, 0, buffers));
     ASSERT_EQ(buffers.size(), 1u);
-    ASSERT_TRUE(buffers[0].has_value());
+    ASSERT_TRUE(buffers[0]);
     AssertBufferEqual(*buffers[0], payload);
 }
 
