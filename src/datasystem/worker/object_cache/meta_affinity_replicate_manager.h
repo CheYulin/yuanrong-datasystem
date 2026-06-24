@@ -17,6 +17,7 @@
 #ifndef DATASYSTEM_WORKER_OBJECT_CACHE_META_AFFINITY_REPLICATE_MANAGER_H
 #define DATASYSTEM_WORKER_OBJECT_CACHE_META_AFFINITY_REPLICATE_MANAGER_H
 
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>

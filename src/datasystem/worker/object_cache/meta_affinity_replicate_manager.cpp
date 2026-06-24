@@ -41,7 +41,7 @@ void MetaAffinityReplicateManager::Stop()
     }
     LOG(INFO) << "MetaAffinityReplicateManager exit";
     for (auto &thread : threadPool_) {
-        thread.Join();
+        thread.join();
     }
     threadPool_.clear();
 }

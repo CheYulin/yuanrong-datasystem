@@ -128,7 +128,8 @@ Status ExecuteMetaAffinityReplicate(const MetaAffinityReplicateParam &param, con
 
     INJECT_POINT("MetaAffinityReplicate.Migrate.skip", []() { return Status::OK(); });
 
-    DataMigrator migrator(MigrateType::SCALE_DOWN, ctx.etcdCM, ctx.localAddress, ctx.akSkManager, ctx.objectTable);
+    HostPort localAddress = ctx.localAddress;
+    DataMigrator migrator(MigrateType::SCALE_DOWN, ctx.etcdCM, localAddress, ctx.akSkManager, ctx.objectTable);
     migrator.Init();
     auto future = migrator.MigrateToTargetNode({ param.objectKey }, metaWorker, nullptr, false, 0);
     const auto result = future.get();
