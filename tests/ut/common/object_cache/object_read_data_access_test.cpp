@@ -37,7 +37,8 @@ public:
         (void)spec;
         rsp.set_data_size(4);
         payloads.emplace_back();
-        DS_ASSERT_OK(payloads.back().ZeroCopyBuffer("data", 4));
+        char data[] = "data";
+        RETURN_IF_NOT_OK(payloads.back().ZeroCopyBuffer(data, 4));
         return Status::OK();
     }
 
