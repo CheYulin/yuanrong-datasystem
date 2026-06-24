@@ -108,7 +108,7 @@ protected:
         FAIL() << "primary did not become " << expectedPrimary << ", last=" << primary;
     }
 
-    std::string GetHashKeyAtWorkerToken(uint32_t workerIndex)
+    void GetHashKeyAtWorkerToken(uint32_t workerIndex, std::string &objectKey)
     {
         std::string value;
         DS_ASSERT_OK(db_->Get(ETCD_RING_PREFIX, "", value));
@@ -119,7 +119,7 @@ protected:
         const auto iter = ring.workers().find(workerAddr.ToString());
         ASSERT_NE(iter, ring.workers().end());
         ASSERT_GT(iter->second.hash_tokens_size(), 0);
-        return "a_key_hash_to_" + std::to_string(iter->second.hash_tokens(0));
+        objectKey = "a_key_hash_to_" + std::to_string(iter->second.hash_tokens(0));
     }
 
     std::unique_ptr<EtcdStore> db_;
@@ -138,7 +138,8 @@ TEST_F(MetaAffinityReplicateStTest, SameNodePutSwapsPrimaryToMetaOwner)
     std::shared_ptr<ObjectClient> client0;
     InitTestClient(0, client0);
 
-    const std::string objectKey = GetHashKeyAtWorkerToken(1);
+    std::string objectKey;
+    GetHashKeyAtWorkerToken(1, objectKey);
     const std::string payload = RandomData().GetRandomString(1024);
 
     CreateParam param;
