@@ -30,6 +30,7 @@
 #include "datasystem/protos/object_posix.pb.h"
 #include "datasystem/utils/status.h"
 #include "datasystem/worker/object_cache/async_send_manager.h"
+#include "datasystem/worker/object_cache/meta_affinity_replicate_manager.h"
 #include "datasystem/worker/object_cache/service/worker_oc_service_crud_common_api.h"
 
 namespace datasystem {
@@ -164,7 +165,13 @@ private:
      */
     Status TryDeleteObjFromEvictionAndSpillFile(ObjectKV &objectKV, bool isInsert);
 
+    void MetaAffinityReplicateFunc(MetaAffinityReplicateTask &&task);
+
+    void ScheduleMetaAffinityReplicateIfNeeded(const ObjectKV &objectKV);
+
     EtcdClusterManager *etcdCM_{ nullptr };  // back pointer to the cluster manager
+
+    std::unique_ptr<MetaAffinityReplicateManager> metaAffinityReplicateManager_{ nullptr };
 
     std::shared_ptr<ThreadPool> memCpyThreadPool_{ nullptr };
 

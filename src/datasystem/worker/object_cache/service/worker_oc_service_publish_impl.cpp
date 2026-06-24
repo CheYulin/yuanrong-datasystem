@@ -36,12 +36,15 @@
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/common/util/strings_util.h"
 #include "datasystem/common/util/thread_local.h"
+#include "datasystem/object/object_enum.h"
 #include "datasystem/protos/master_object.pb.h"
 #include "datasystem/utils/status.h"
 #include "datasystem/worker/authenticate.h"
 #include "datasystem/worker/object_cache/obj_cache_shm_unit.h"
 #include "datasystem/worker/object_cache/object_kv.h"
 #include "datasystem/worker/object_cache/worker_master_oc_api.h"
+#include "datasystem/worker/object_cache/meta_affinity_replicate_executor.h"
+#include "datasystem/worker/object_cache/meta_affinity_replicate_manager.h"
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/rdma/rdma_util.h"
 
@@ -54,6 +57,8 @@ static const uint64_t SET_LOCAL_PROCESSING_SLOW_US = GetWorkerSlowUs();
 static const uint64_t SET_MASTER_RPC_SLOW_US = GetWorkerSlowUs();
 static constexpr double US_PER_MS = 1000.0;
 
+DS_DECLARE_bool(enable_meta_affinity_replicate);
+
 WorkerOcServicePublishImpl::WorkerOcServicePublishImpl(WorkerOcServiceCrudParam &initParam, EtcdClusterManager *etcdCM,
                                                        std::shared_ptr<ThreadPool> memCpyThreadPool,
                                                        std::shared_ptr<AkSkManager> akSkManager, HostPort &localAddress)
@@ -63,6 +68,43 @@ WorkerOcServicePublishImpl::WorkerOcServicePublishImpl(WorkerOcServiceCrudParam 
       akSkManager_(std::move(akSkManager)),
       localAddress_(localAddress)
 {
+    metaAffinityReplicateManager_ = std::make_unique<MetaAffinityReplicateManager>();
+    (void)metaAffinityReplicateManager_->Init([this](MetaAffinityReplicateTask &&task) {
+        MetaAffinityReplicateFunc(std::move(task));
+    });
+}
+
+void WorkerOcServicePublishImpl::MetaAffinityReplicateFunc(MetaAffinityReplicateTask &&task)
+{
+    MetaAffinityReplicateContext ctx{
+        .etcdCM = etcdCM_,
+        .localAddress = localAddress_,
+        .akSkManager = akSkManager_,
+        .objectTable = objectTable_,
+        .workerMasterApiManager = workerMasterApiManager_,
+    };
+    for (const auto &param : task.GetParams()) {
+        (void)ExecuteMetaAffinityReplicate(param, ctx);
+    }
+}
+
+void WorkerOcServicePublishImpl::ScheduleMetaAffinityReplicateIfNeeded(const ObjectKV &objectKV)
+{
+    if (!FLAGS_enable_meta_affinity_replicate || metaAffinityReplicateManager_ == nullptr) {
+        return;
+    }
+    const auto &objectKey = objectKV.GetObjKey();
+    const SafeObjType &safeObj = objectKV.GetObjEntry();
+    if (safeObj->stateInfo.GetDataFormat() != DataFormat::BINARY) {
+        return;
+    }
+    MetaAffinityReplicateParam param{
+        .objectKey = objectKey,
+        .version = safeObj->GetCreateTime(),
+        .dataFormat = static_cast<uint32_t>(safeObj->stateInfo.GetDataFormat()),
+    };
+    MetaAffinityReplicateTask task(std::move(param));
+    (void)metaAffinityReplicateManager_->AddTask(std::move(task));
 }
 
 Status WorkerOcServicePublishImpl::VertifyObjectReleaseValidity(const PublishReqPb &req, const SafeObjType &safeObj)
@@ -304,6 +346,7 @@ Status WorkerOcServicePublishImpl::PublishObject(ObjectKV &objectKV, const Publi
         VLOG(DEBUG_LOG_LEVEL) << FormatString("Finishing deleting the object %s from disk.", objectKey);
     }
     evictionManager_->Add(objectKey);
+    ScheduleMetaAffinityReplicateIfNeeded(objectKV);
     return Status::OK();
 }
 
