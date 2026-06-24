@@ -35,6 +35,7 @@ struct DirectReadStats {
     uint64_t movingRetryCount = 0;
     uint64_t redirectRetryCount = 0;
     uint64_t staleRouteRetryCount = 0;
+    uint64_t cutbackAttemptCount = 0;
     uint64_t pathFallbackCount = 0;
     std::string lastFallbackReason;
 };
@@ -56,6 +57,7 @@ public:
     static void RecordMovingRetry();
     static void RecordRedirectRetry();
     static void RecordStaleRouteRetry();
+    static void RecordCutbackAttempt();
     static void RecordPathFallback(const std::string &reason);
     static void SetForceHashRingRefresh(bool enabled);
     static bool ForceHashRingRefresh();

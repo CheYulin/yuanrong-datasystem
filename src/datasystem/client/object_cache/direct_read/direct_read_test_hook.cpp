@@ -137,6 +137,12 @@ void DirectReadTestHook::RecordStaleRouteRetry()
     ++g_directReadStats.staleRouteRetryCount;
 }
 
+void DirectReadTestHook::RecordCutbackAttempt()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.cutbackAttemptCount;
+}
+
 void DirectReadTestHook::SetForceHashRingRefresh(bool enabled)
 {
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);

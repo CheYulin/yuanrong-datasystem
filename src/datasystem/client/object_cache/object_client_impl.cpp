@@ -1434,6 +1434,7 @@ bool ObjectClientImpl::TryDirectReadCutbackToLocalWorker(const std::shared_ptr<I
     if (!RecoverPreferredLocalWorker()) {
         return false;
     }
+    DirectReadTestHook::RecordCutbackAttempt();
     LOG(INFO) << "[DirectRead] Cut back to local worker gateway at " << localAddress.ToString();
     return true;
 }
