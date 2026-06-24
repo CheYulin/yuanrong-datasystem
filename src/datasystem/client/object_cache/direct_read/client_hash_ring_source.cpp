@@ -15,7 +15,7 @@
  */
 
 /**
- * Description: Client-side hash ring refresh source (etcd first, worker next, etcd fallback).
+ * Description: Client-side hash ring refresh source (bootstrap etcd, then worker with etcd fallback).
  */
 #include "datasystem/client/object_cache/direct_read/client_hash_ring_source.h"
 
@@ -64,12 +64,12 @@ Status ClientHashRingSource::RefreshForRouteLookup()
         return Status::OK();
     }
     if (!view_.HasSnapshot()) {
+        // Bootstrap: etcd first, then worker fallback.
         return BootstrapRing();
     }
-    if (view_.HasScalingTask() || DirectReadTestHook::ForceHashRingRefresh()) {
-        return RefreshRing();
-    }
-    return Status::OK();
+    // Steady state and scale events: worker first, then etcd fallback.
+    (void)DirectReadTestHook::ForceHashRingRefresh();
+    return RefreshRing();
 }
 
 ReadOnlyHashRingView &ClientHashRingSource::ViewForTest()

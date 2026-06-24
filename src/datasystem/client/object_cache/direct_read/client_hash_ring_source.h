@@ -15,7 +15,7 @@
  */
 
 /**
- * Description: Client-side hash ring refresh source (etcd first, worker next, etcd fallback).
+ * Description: Client-side hash ring refresh source (bootstrap etcd, then worker with etcd fallback).
  */
 #ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_CLIENT_HASH_RING_SOURCE_H
 #define DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_CLIENT_HASH_RING_SOURCE_H
