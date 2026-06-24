@@ -48,7 +48,7 @@ public:
         opts.numOBS = 0;
         opts.enableSpill = false;
         opts.enableDistributedMaster = "true";
-        opts.workerGflagParams += " -enable_meta_affinity_replicate=true -enable_data_replication=true ";
+        opts.workerGflagParams += " -enable_meta_affinity_replicate=true -enable_data_replication=false ";
     }
 
 protected:
