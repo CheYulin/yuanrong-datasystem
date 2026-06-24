@@ -72,7 +72,8 @@ TEST(ObjectReadDataAccessTest, ExtractInlinePayloadsMovesMetaPoolBytes)
     auto queryMeta = BuildInlineMeta(0);
     std::vector<RpcMessage> metaPool;
     metaPool.emplace_back();
-    DS_ASSERT_OK(metaPool.back().ZeroCopyBuffer("abcd", 4));
+    char data[] = "abcd";
+    DS_ASSERT_OK(metaPool.back().ZeroCopyBuffer(data, 4));
 
     std::vector<RpcMessage> out;
     object_cache::ObjectReadL0Outcome outcome = object_cache::ObjectReadL0Outcome::kRemote;
@@ -105,7 +106,8 @@ TEST(ObjectReadDataAccessTest, FetchObjectReadDataUsesInlineWithoutRemoteRpc)
     auto queryMeta = BuildInlineMeta(0);
     std::vector<RpcMessage> metaPool;
     metaPool.emplace_back();
-    DS_ASSERT_OK(metaPool.back().ZeroCopyBuffer("inline", 6));
+    char data[] = "inline";
+    DS_ASSERT_OK(metaPool.back().ZeroCopyBuffer(data, 6));
 
     FakeRemoteClient remote;
     std::vector<RpcMessage> out;
