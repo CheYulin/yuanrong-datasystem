@@ -24,12 +24,14 @@
 
 #include "common.h"
 #include "datasystem/common/ak_sk/ak_sk_manager.h"
+#include "datasystem/common/kvstore/etcd/etcd_constants.h"
 #include "datasystem/common/kvstore/etcd/etcd_store.h"
 #include "datasystem/common/rpc/rpc_message.h"
 #include "datasystem/common/rpc/rpc_stub_cache_mgr.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/common/util/random_data.h"
 #include "datasystem/object_client.h"
+#include "datasystem/protos/hash_ring.pb.h"
 #include "datasystem/protos/master_object.pb.h"
 #include "datasystem/worker/object_cache/worker_master_oc_api.h"
 #include "oc_client_common.h"
@@ -106,6 +108,20 @@ protected:
         FAIL() << "primary did not become " << expectedPrimary << ", last=" << primary;
     }
 
+    std::string GetHashKeyAtWorkerToken(uint32_t workerIndex)
+    {
+        std::string value;
+        DS_ASSERT_OK(db_->Get(ETCD_RING_PREFIX, "", value));
+        HashRingPb ring;
+        ASSERT_TRUE(ring.ParseFromString(value));
+        HostPort workerAddr;
+        DS_ASSERT_OK(cluster_->GetWorkerAddr(workerIndex, workerAddr));
+        const auto iter = ring.workers().find(workerAddr.ToString());
+        ASSERT_NE(iter, ring.workers().end());
+        ASSERT_GT(iter->second.hash_tokens_size(), 0);
+        return "a_key_hash_to_" + std::to_string(iter->second.hash_tokens(0));
+    }
+
     std::unique_ptr<EtcdStore> db_;
     HostPort hostPort_;
     HostPort worker0Address_;
@@ -122,7 +138,7 @@ TEST_F(MetaAffinityReplicateStTest, SameNodePutSwapsPrimaryToMetaOwner)
     std::shared_ptr<ObjectClient> client0;
     InitTestClient(0, client0);
 
-    const std::string objectKey = GetObjectKeyHashToWorker(db_.get(), 1);
+    const std::string objectKey = GetHashKeyAtWorkerToken(1);
     const std::string payload = RandomData().GetRandomString(1024);
 
     CreateParam param;
