@@ -115,7 +115,7 @@ DirectReadFlow::DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcC
       rpcAdapter_(std::move(cred), signature, requestTimeoutMs),
       routeProvider_(workerApi_, &rpcAdapter_),
       routeAdapter_(std::make_shared<DirectReadRouteProviderAdapter>(&routeProvider_)),
-      metaAdapter_(std::make_shared<DirectReadMetaClientAdapter>(&rpcAdapter_, workerApi_->hostPort_)),
+      metaAdapter_(std::make_shared<DirectReadMetaClientAdapter>(&rpcAdapter_, workerApi_->hostPort_, &routeProvider_)),
       dataAdapter_(std::make_shared<DirectReadDataClientAdapter>(&rpcAdapter_)),
       accessFlow_(routeAdapter_, metaAdapter_, dataAdapter_)
 {

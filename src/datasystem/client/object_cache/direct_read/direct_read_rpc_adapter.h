@@ -20,6 +20,7 @@
 #ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_RPC_ADAPTER_H
 #define DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_RPC_ADAPTER_H
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -37,10 +38,13 @@ namespace datasystem {
 namespace object_cache {
 class DirectReadRpcAdapter {
 public:
+    using RouteRefreshFn = std::function<Status()>;
+
     DirectReadRpcAdapter(RpcCredential cred, Signature *signature, int32_t requestTimeoutMs);
 
     Status QueryMeta(const HostPort &metaAddress, const HostPort &clientWorkerAddress, const GetParam &getParam,
-                     master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads) const;
+                     master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads,
+                     const RouteRefreshFn &refreshRoute = nullptr) const;
 
     Status GetClusterState(const HostPort &workerAddress, HashRingPb &ring, int64_t &version) const;
 

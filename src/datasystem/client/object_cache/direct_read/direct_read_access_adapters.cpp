@@ -41,8 +41,12 @@ Status DirectReadRouteProviderAdapter::RefreshRouteIfNeeded()
     return provider_->RefreshRouteIfNeeded();
 }
 
-DirectReadMetaClientAdapter::DirectReadMetaClientAdapter(DirectReadRpcAdapter *rpcAdapter, HostPort clientWorkerAddress)
-    : rpcAdapter_(rpcAdapter), clientWorkerAddress_(std::move(clientWorkerAddress))
+DirectReadMetaClientAdapter::DirectReadMetaClientAdapter(DirectReadRpcAdapter *rpcAdapter,
+                                                         HostPort clientWorkerAddress,
+                                                         DirectReadRouteProvider *routeProvider)
+    : rpcAdapter_(rpcAdapter),
+      clientWorkerAddress_(std::move(clientWorkerAddress)),
+      routeProvider_(routeProvider)
 {
 }
 
@@ -52,7 +56,11 @@ Status DirectReadMetaClientAdapter::QueryMeta(const HostPort &metaAddress, const
 {
     RETURN_RUNTIME_ERROR_IF_NULL(rpcAdapter_);
     GetParam getParam { objectKeys, subTimeoutMs, {}, false };
-    return rpcAdapter_->QueryMeta(metaAddress, clientWorkerAddress_, getParam, rsp, payloads);
+    DirectReadRpcAdapter::RouteRefreshFn refreshRoute;
+    if (routeProvider_ != nullptr) {
+        refreshRoute = [this]() { return routeProvider_->RefreshRouteIfNeeded(); };
+    }
+    return rpcAdapter_->QueryMeta(metaAddress, clientWorkerAddress_, getParam, rsp, payloads, refreshRoute);
 }
 
 DirectReadDataClientAdapter::DirectReadDataClientAdapter(DirectReadRpcAdapter *rpcAdapter) : rpcAdapter_(rpcAdapter)
