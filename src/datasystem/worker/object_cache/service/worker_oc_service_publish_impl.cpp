@@ -48,6 +48,8 @@
 #include "datasystem/common/rdma/fast_transport_manager_wrapper.h"
 #include "datasystem/common/rdma/rdma_util.h"
 
+DS_DECLARE_bool(enable_meta_affinity_replicate);
+
 using namespace datasystem::worker;
 using namespace datasystem::master;
 namespace datasystem {
@@ -56,8 +58,6 @@ static constexpr int DEBUG_LOG_LEVEL = 2;
 static const uint64_t SET_LOCAL_PROCESSING_SLOW_US = GetWorkerSlowUs();
 static const uint64_t SET_MASTER_RPC_SLOW_US = GetWorkerSlowUs();
 static constexpr double US_PER_MS = 1000.0;
-
-DS_DECLARE_bool(enable_meta_affinity_replicate);
 
 WorkerOcServicePublishImpl::WorkerOcServicePublishImpl(WorkerOcServiceCrudParam &initParam, EtcdClusterManager *etcdCM,
                                                        std::shared_ptr<ThreadPool> memCpyThreadPool,
