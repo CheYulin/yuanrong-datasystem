@@ -39,7 +39,6 @@ set(WORKER_OC_SRCS
         service/worker_oc_service_multi_publish_impl.cpp
         service/worker_oc_service_get_impl.cpp
         service/worker_object_read_access_helper.cpp
-        ../../common/object_cache/read_access/object_read_access_flow.cpp
         service/worker_oc_service_delete_impl.cpp
         service/worker_oc_service_clear_data_flow.cpp
         service/worker_oc_service_global_reference_impl.cpp
@@ -70,6 +69,7 @@ set(WORKER_OBJECT_CACHE_DEPEND_LIBS
         common_util
         common_buffer
         common_ref
+        common_oc_read_access
         common_iam
         common_rpc_zmq
         common_event_loop
@@ -101,4 +101,5 @@ add_dependencies(worker_object_cache
         master_heartbeat_protos
         posix_protos
         worker_object_protos
-        master_object_protos)
+        master_object_protos
+        common_oc_read_access)

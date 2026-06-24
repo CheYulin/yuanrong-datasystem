@@ -8,7 +8,11 @@ ds_cc_library(
     name = "common_object_cache",
     srcs = glob(
         ["*.cpp"],
-        exclude = ["buffer.cpp", "device_buffer.cpp"],
+        exclude = [
+            "buffer.cpp",
+            "device_buffer.cpp",
+            "read_only_hash_ring_view.cpp",
+        ],
     ),
     hdrs = glob(["*.h"]),
     deps = [
@@ -82,8 +86,10 @@ ds_cc_library(
     name = "read_only_hash_ring_view_lib",
     srcs = ["read_only_hash_ring_view.cpp"],
     hdrs = ["read_only_hash_ring_view.h"],
+    linkstatic = True,
     deps = [
         "//src/datasystem/common/flags:ds_flags",
+        "//src/datasystem/common/util/gflag:common_util_gflag_def",
         "//src/datasystem/common/util:hash_algorithm",
         "//src/datasystem/common/util:net_util",
         "//src/datasystem/common/util:status_helper",
@@ -103,5 +109,29 @@ ds_cc_library(
         "//src/datasystem/protos:master_object_cc_proto",
         "//src/datasystem/protos:object_posix_cc_proto",
         "//src/datasystem/protos:worker_object_cc_proto",
+    ],
+)
+
+ds_cc_library(
+    name = "query_meta_merge_helper",
+    srcs = ["read_access/query_meta_merge_helper.cpp"],
+    hdrs = ["read_access/query_meta_merge_helper.h"],
+    deps = [
+        "//src/datasystem/common/rpc:rpc_message",
+        "//src/datasystem/common/util:status_helper",
+        "//src/datasystem/protos:master_object_cc_proto",
+    ],
+)
+
+ds_cc_library(
+    name = "query_meta_redirect_helper",
+    srcs = ["read_access/query_meta_redirect_helper.cpp"],
+    hdrs = ["read_access/query_meta_redirect_helper.h"],
+    deps = [
+        ":query_meta_merge_helper",
+        "//src/datasystem/common/rpc:rpc_message",
+        "//src/datasystem/common/util:net_util",
+        "//src/datasystem/common/util:status_helper",
+        "//src/datasystem/protos:master_object_cc_proto",
     ],
 )

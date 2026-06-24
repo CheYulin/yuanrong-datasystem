@@ -20,6 +20,9 @@
 #include "datasystem/worker/object_cache/service/worker_oc_service_get_impl.h"
 #include "datasystem/worker/object_cache/service/worker_object_read_access_helper.h"
 
+#include "datasystem/common/object_cache/read_access/query_meta_merge_helper.h"
+#include "datasystem/common/object_cache/read_access/query_meta_redirect_helper.h"
+
 #include <cstdint>
 #include <chrono>
 #include <iterator>
@@ -1416,24 +1419,35 @@ Status WorkerOcServiceGetImpl::QueryMetaFromMasterDirect(const HostPort &destMas
                                                          bool isFromOtherAz, datasystem::master::QueryMetaRspPb &rsp,
                                                          std::vector<RpcMessage> &payloads)
 {
-    datasystem::master::QueryMetaReqPb req;
-    SetQueryMetaInfo(req, objKeysToQuery, destMasterHostPort.ToString(), true, isFromOtherAz);
-    std::shared_ptr<WorkerMasterOCApi> workerMasterApi =
-        workerMasterApiManager_->GetWorkerMasterApi(destMasterHostPort);
-    CHECK_FAIL_RETURN_STATUS(workerMasterApi != nullptr, K_RUNTIME_ERROR, "Get masterApi failed, cannot queryMeta");
-    std::function<Status(QueryMetaReqPb &, QueryMetaRspPb &, std::vector<RpcMessage> &)> func =
-        [&workerMasterApi, &subTimeout](QueryMetaReqPb &req, QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads) {
-            Status s = workerMasterApi->QueryMeta(req, subTimeout, rsp, payloads);
-            if (s.IsError()) {
-                payloads.clear();
-            }
-            return s;
-        };
-    std::vector<RpcMessage> tmpPayloads;
-    RETURN_IF_NOT_OK(RedirectRetryWhenMetasMoving(req, rsp, tmpPayloads, func));
-    RETURN_IF_NOT_OK(CorrectQueryMetaResponse(tmpPayloads, rsp, payloads));
-    RETURN_IF_NOT_OK(QueryMetadataFromRedirectMaster(rsp, subTimeout, isFromOtherAz, payloads));
-    return Status::OK();
+    QueryMetaAtMasterFn queryMeta = [this, subTimeout, isFromOtherAz](
+                                        const HostPort &metaAddress, const std::vector<std::string> &objectKeys,
+                                        bool enableRedirect, master::QueryMetaRspPb &queryRsp,
+                                        std::vector<RpcMessage> &queryPayloads) -> Status {
+        master::QueryMetaReqPb req;
+        SetQueryMetaInfo(req, objectKeys, metaAddress.ToString(), enableRedirect, isFromOtherAz);
+        std::shared_ptr<WorkerMasterOCApi> workerMasterApi =
+            workerMasterApiManager_->GetWorkerMasterApi(metaAddress);
+        CHECK_FAIL_RETURN_STATUS(workerMasterApi != nullptr, K_RUNTIME_ERROR, "Get masterApi failed, cannot queryMeta");
+        Status status = workerMasterApi->QueryMeta(req, subTimeout, queryRsp, queryPayloads);
+        if (status.IsError()) {
+            queryPayloads.clear();
+        }
+        return status;
+    };
+
+    QueryMetaMovingRetryOptions movingOpts;
+    movingOpts.remainingDeadlineMs = [this]() { return reqTimeoutDuration.CalcRealRemainingTime(); };
+    movingOpts.subTimeoutMs = static_cast<int64_t>(subTimeout);
+
+    QueryMetaRedirectFollowOptions redirectOpts;
+    redirectOpts.resolveRedirectAddress = [this](const std::string &redirectAddress, HostPort &metaAddress) {
+        return GetPrimaryReplicaAddr(redirectAddress, metaAddress);
+    };
+    redirectOpts.rejectNestedRedirectInfo = false;
+    redirectOpts.rejectMovingOnRedirect = false;
+
+    return QueryMetaWithRedirectAndMoving(destMasterHostPort, objKeysToQuery, queryMeta, movingOpts, redirectOpts, rsp,
+                                          payloads);
 }
 
 void WorkerOcServiceGetImpl::ProcessQueryMetaFailedObjsWhenMetaStoredInEtcd(
@@ -1676,32 +1690,28 @@ Status WorkerOcServiceGetImpl::QueryMetadataFromMaster(const std::vector<std::st
 Status WorkerOcServiceGetImpl::QueryMetadataFromRedirectMaster(master::QueryMetaRspPb &rsp, uint64_t subTimeout,
                                                                bool isFromOtherAz, std::vector<RpcMessage> &payloads)
 {
-    for (const auto &redirectInfo : rsp.info()) {
-        std::vector<RpcMessage> redirectPayloads;
-        master::QueryMetaReqPb redirectQueryReq;
-        master::QueryMetaRspPb redirectQueryRsp;
-        std::vector<std::string> redirectIds = { redirectInfo.change_meta_ids().begin(),
-                                                 redirectInfo.change_meta_ids().end() };
-        HostPort redirectMasterAddr;
-        RETURN_IF_NOT_OK(GetPrimaryReplicaAddr(redirectInfo.redirect_meta_address(), redirectMasterAddr));
-        SetQueryMetaInfo(redirectQueryReq, redirectIds, redirectMasterAddr.ToString(), false, isFromOtherAz);
-        std::shared_ptr<WorkerMasterOCApi> redirectWorkerMasterApi =
-            workerMasterApiManager_->GetWorkerMasterApi(redirectMasterAddr);
-        CHECK_FAIL_RETURN_STATUS(redirectWorkerMasterApi != nullptr, K_RUNTIME_ERROR,
+    QueryMetaAtMasterFn queryMeta = [this, subTimeout, isFromOtherAz](
+                                        const HostPort &metaAddress, const std::vector<std::string> &objectKeys,
+                                        bool enableRedirect, master::QueryMetaRspPb &queryRsp,
+                                        std::vector<RpcMessage> &queryPayloads) -> Status {
+        master::QueryMetaReqPb req;
+        SetQueryMetaInfo(req, objectKeys, metaAddress.ToString(), enableRedirect, isFromOtherAz);
+        std::shared_ptr<WorkerMasterOCApi> workerMasterApi =
+            workerMasterApiManager_->GetWorkerMasterApi(metaAddress);
+        CHECK_FAIL_RETURN_STATUS(workerMasterApi != nullptr, K_RUNTIME_ERROR,
                                  "hash master get failed, QueryMetadataFromMaster failed");
-        RETURN_IF_NOT_OK(
-            redirectWorkerMasterApi->QueryMeta(redirectQueryReq, subTimeout, redirectQueryRsp, redirectPayloads));
-        // save the result to rsp and payload
-        RETURN_IF_NOT_OK(CorrectQueryMetaResponse(redirectPayloads, redirectQueryRsp, payloads));
-        std::copy(redirectQueryRsp.mutable_query_metas()->begin(), redirectQueryRsp.mutable_query_metas()->end(),
-                  RepeatedFieldBackInserter(rsp.mutable_query_metas()));
-        std::copy(redirectQueryRsp.mutable_not_exist_ids()->begin(), redirectQueryRsp.mutable_not_exist_ids()->end(),
-                  RepeatedFieldBackInserter(rsp.mutable_not_exist_ids()));
-        std::copy(redirectQueryRsp.mutable_deleting_versions()->begin(),
-                  redirectQueryRsp.mutable_deleting_versions()->end(),
-                  RepeatedFieldBackInserter(rsp.mutable_deleting_versions()));
-    }
-    return Status::OK();
+        RETURN_IF_NOT_OK(workerMasterApi->QueryMeta(req, subTimeout, queryRsp, queryPayloads));
+        return Status::OK();
+    };
+
+    QueryMetaRedirectFollowOptions redirectOpts;
+    redirectOpts.resolveRedirectAddress = [this](const std::string &redirectAddress, HostPort &metaAddress) {
+        return GetPrimaryReplicaAddr(redirectAddress, metaAddress);
+    };
+    redirectOpts.rejectNestedRedirectInfo = false;
+    redirectOpts.rejectMovingOnRedirect = false;
+
+    return FollowQueryMetaRedirects(queryMeta, redirectOpts, rsp, payloads);
 }
 
 /*
@@ -1794,29 +1804,7 @@ void WorkerOcServiceGetImpl::SetQueryMetaInfo(master::QueryMetaReqPb &req, const
 Status WorkerOcServiceGetImpl::CorrectQueryMetaResponse(std::vector<RpcMessage> &tmpPayloads,
                                                         master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads)
 {
-    if (tmpPayloads.empty()) {
-        return Status::OK();
-    }
-    auto payloadSize = payloads.size();
-    auto realPayloadSize = static_cast<uint32_t>(payloadSize);
-    if (payloadSize != realPayloadSize) {
-        RETURN_STATUS(StatusCode::K_RUNTIME_ERROR, "overflow happen");
-    }
-    bool overflow = false;
-    for (auto iter = rsp.mutable_query_metas()->begin(); iter != rsp.mutable_query_metas()->end(); ++iter) {
-        auto &queryMeta = *iter;
-        std::for_each(queryMeta.mutable_payload_indexs()->begin(), queryMeta.mutable_payload_indexs()->end(),
-                      [realPayloadSize, &overflow](uint32_t &idx) {
-                          overflow |= (idx > UINT32_MAX - realPayloadSize);
-                          idx += realPayloadSize;
-                      });
-    }
-    payloads.insert(payloads.end(), std::make_move_iterator(tmpPayloads.begin()),
-                    std::make_move_iterator(tmpPayloads.end()));
-    if (overflow) {
-        RETURN_STATUS(StatusCode::K_RUNTIME_ERROR, "overflow happen");
-    }
-    return Status::OK();
+    return AppendQueryMetaPayloads(payloads, rsp, tmpPayloads);
 }
 
 Status WorkerOcServiceGetImpl::GetObjectsFromAnywhere(std::vector<master::QueryMetaInfoPb> &queryMetas,

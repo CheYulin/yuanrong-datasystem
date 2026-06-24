@@ -21,8 +21,6 @@ list(APPEND CLIENT_SRCS
         object_cache/direct_read/direct_read_test_hook.cpp
         object_cache/direct_read/client_hash_ring_source.cpp
         object_cache/direct_read/direct_read_access_adapters.cpp
-        ../common/object_cache/read_only_hash_ring_view.cpp
-        ../common/object_cache/read_access/object_read_access_flow.cpp
         object_cache/object_client.cpp
         object_cache/object_client_impl.cpp
         object_cache/client_memory_ref_table.cpp
@@ -53,6 +51,8 @@ list(APPEND CLIENT_DEPEND_LIBS
         token
         ak_sk_signature
         common_buffer
+        common_oc_read_access
+        common_read_only_hash_ring_view
         common_event_loop
         common_log
         common_metrics
@@ -140,11 +140,15 @@ add_dependencies(datasystem_static
         posix_protos_client
         worker_object_protos_client
         master_object_protos_client
-        worker_stream_protos_client)
+        worker_stream_protos_client
+        common_oc_read_access
+        common_read_only_hash_ring_view)
 
 add_dependencies(datasystem
         share_memory_protos_client
         posix_protos_client
         worker_object_protos_client
         master_object_protos_client
-        worker_stream_protos_client)
+        worker_stream_protos_client
+        common_oc_read_access
+        common_read_only_hash_ring_view)

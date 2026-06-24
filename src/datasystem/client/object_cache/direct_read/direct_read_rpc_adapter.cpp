@@ -19,15 +19,14 @@
  */
 #include "datasystem/client/object_cache/direct_read/direct_read_rpc_adapter.h"
 
-#include <chrono>
 #include <memory>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include "datasystem/client/object_cache/direct_read/direct_read_flow.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
 #include "datasystem/common/flags/flags.h"
+#include "datasystem/common/object_cache/read_access/query_meta_redirect_helper.h"
 #include "datasystem/common/rpc/rpc_channel.h"
 #include "datasystem/common/rpc/rpc_options.h"
 #include "datasystem/common/util/status_helper.h"
@@ -96,113 +95,6 @@ int32_t MaxControlPlaneRetries()
 {
     return std::max(0, FLAGS_client_direct_read_retry_count);
 }
-
-Status AppendQueryMetaPayloads(std::vector<RpcMessage> &basePayloads, master::QueryMetaRspPb &rsp,
-                               std::vector<RpcMessage> &newPayloads)
-{
-    if (newPayloads.empty()) {
-        return Status::OK();
-    }
-    const auto payloadOffset = static_cast<uint32_t>(basePayloads.size());
-    for (auto &queryMeta : *rsp.mutable_query_metas()) {
-        for (int i = 0; i < queryMeta.payload_indexs_size(); ++i) {
-            queryMeta.set_payload_indexs(i, queryMeta.payload_indexs(i) + static_cast<int32_t>(payloadOffset));
-        }
-    }
-    basePayloads.insert(basePayloads.end(), std::make_move_iterator(newPayloads.begin()),
-                        std::make_move_iterator(newPayloads.end()));
-    return Status::OK();
-}
-
-void MergeQueryMetaResponse(master::QueryMetaRspPb &dest, master::QueryMetaRspPb &src)
-{
-    for (auto &queryMeta : *src.mutable_query_metas()) {
-        dest.add_query_metas()->Swap(&queryMeta);
-    }
-    for (auto &missingKey : *src.mutable_not_exist_ids()) {
-        *dest.add_not_exist_ids() = std::move(missingKey);
-    }
-    for (auto version : src.deleting_versions()) {
-        dest.add_deleting_versions(version);
-    }
-    for (auto &missingKey : *src.mutable_not_exist_ids_is_deleting()) {
-        *dest.add_not_exist_ids_is_deleting() = std::move(missingKey);
-    }
-    if (src.meta_is_moving()) {
-        dest.set_meta_is_moving(true);
-    }
-}
-
-Status QueryMetadataFromRedirectMasters(Signature *signature, RpcCredential cred, int32_t requestTimeoutMs,
-                                        const HostPort &clientWorkerAddress, int64_t subTimeoutMs,
-                                        master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads)
-{
-    const google::protobuf::RepeatedPtrField<RedirectMetaInfo> redirectInfos = rsp.info();
-    rsp.clear_info();
-
-    for (const auto &redirectInfo : redirectInfos) {
-        if (redirectInfo.redirect_meta_address().empty()) {
-            return Status(K_RUNTIME_ERROR, DirectReadFlow::kRedirectLoopFallbackReason);
-        }
-        std::vector<std::string> redirectIds = { redirectInfo.change_meta_ids().begin(),
-                                                 redirectInfo.change_meta_ids().end() };
-        if (redirectIds.empty()) {
-            continue;
-        }
-
-        HostPort redirectMetaAddress;
-        RETURN_IF_NOT_OK(redirectMetaAddress.ParseString(redirectInfo.redirect_meta_address()));
-
-        master::QueryMetaRspPb redirectRsp;
-        std::vector<RpcMessage> redirectPayloads;
-        RETURN_IF_NOT_OK(QueryMetaOnce(signature, cred, requestTimeoutMs, redirectMetaAddress, clientWorkerAddress,
-                                       redirectIds, subTimeoutMs, false, redirectRsp, redirectPayloads));
-        DirectReadTestHook::RecordRedirectRetry();
-
-        if (redirectRsp.meta_is_moving()) {
-            return Status(K_TRY_AGAIN, DirectReadFlow::kMetaMovingFallbackReason);
-        }
-        if (redirectRsp.info_size() > 0) {
-            return Status(K_RUNTIME_ERROR, DirectReadFlow::kRedirectLoopFallbackReason);
-        }
-
-        MergeQueryMetaResponse(rsp, redirectRsp);
-        RETURN_IF_NOT_OK(AppendQueryMetaPayloads(payloads, redirectRsp, redirectPayloads));
-    }
-    return Status::OK();
-}
-
-Status WaitForMetaMigrationToFinish(Signature *signature, RpcCredential cred, int32_t requestTimeoutMs,
-                                    const HostPort &metaAddress, const HostPort &clientWorkerAddress,
-                                    const std::vector<std::string> &objectKeys, int64_t subTimeoutMs,
-                                    master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads,
-                                    const DirectReadRpcAdapter::RouteRefreshFn &refreshRoute)
-{
-    int32_t movingAttempts = 0;
-    const int32_t maxRetries = MaxControlPlaneRetries();
-    int64_t sleepTimeMs = 1;
-    const int64_t maxSleepTimeMs = 128;
-
-    while (rsp.info_size() > 0 && rsp.meta_is_moving()) {
-        DirectReadTestHook::RecordMovingRetry();
-        if (++movingAttempts > maxRetries) {
-            return Status(K_TRY_AGAIN, DirectReadFlow::kMetaMovingFallbackReason);
-        }
-        if (refreshRoute) {
-            RETURN_IF_NOT_OK(refreshRoute());
-        }
-        rsp.Clear();
-        payloads.clear();
-        sleepTimeMs = std::min(sleepTimeMs, subTimeoutMs > 0 ? subTimeoutMs : sleepTimeMs);
-        if (sleepTimeMs > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(sleepTimeMs));
-            sleepTimeMs = std::min(sleepTimeMs * 2, maxSleepTimeMs);
-        }
-        RETURN_IF_NOT_OK(QueryMetaOnce(signature, cred, requestTimeoutMs, metaAddress, clientWorkerAddress, objectKeys,
-                                       subTimeoutMs, true, rsp, payloads));
-    }
-    return Status::OK();
-}
 }  // namespace
 
 DirectReadRpcAdapter::DirectReadRpcAdapter(RpcCredential cred, Signature *signature, int32_t requestTimeoutMs)
@@ -216,26 +108,28 @@ Status DirectReadRpcAdapter::QueryMeta(const HostPort &metaAddress, const HostPo
                                        const RouteRefreshFn &refreshRoute) const
 {
     std::vector<std::string> objectKeys(getParam.objectKeys.begin(), getParam.objectKeys.end());
-    master::QueryMetaRspPb primaryRsp;
-    std::vector<RpcMessage> primaryPayloads;
-    RETURN_IF_NOT_OK(QueryMetaOnce(signature_, cred_, requestTimeoutMs_, metaAddress, clientWorkerAddress, objectKeys,
-                                   getParam.subTimeoutMs, true, primaryRsp, primaryPayloads));
-    RETURN_IF_NOT_OK(WaitForMetaMigrationToFinish(signature_, cred_, requestTimeoutMs_, metaAddress,
-                                                  clientWorkerAddress, objectKeys, getParam.subTimeoutMs, primaryRsp,
-                                                  primaryPayloads, refreshRoute));
+    QueryMetaAtMasterFn queryMeta = [this, &metaAddress, &clientWorkerAddress, &getParam](
+                                        const HostPort &queryMetaAddress, const std::vector<std::string> &keys,
+                                        bool enableRedirect, master::QueryMetaRspPb &queryRsp,
+                                        std::vector<RpcMessage> &queryPayloads) -> Status {
+        return QueryMetaOnce(signature_, cred_, requestTimeoutMs_, queryMetaAddress, clientWorkerAddress, keys,
+                           getParam.subTimeoutMs, enableRedirect, queryRsp, queryPayloads);
+    };
 
-    if (primaryRsp.meta_is_moving()) {
-        return Status(K_TRY_AGAIN, DirectReadFlow::kMetaMovingFallbackReason);
-    }
+    QueryMetaMovingRetryOptions movingOpts;
+    movingOpts.maxMovingRetries = MaxControlPlaneRetries();
+    movingOpts.movingRetryExceededStatus = Status(K_TRY_AGAIN, DirectReadFlow::kMetaMovingFallbackReason);
+    movingOpts.subTimeoutMs = getParam.subTimeoutMs;
+    movingOpts.beforeMovingRetry = refreshRoute;
+    movingOpts.onMovingRetry = []() { DirectReadTestHook::RecordMovingRetry(); };
 
-    rsp = std::move(primaryRsp);
-    payloads.clear();
-    RETURN_IF_NOT_OK(AppendQueryMetaPayloads(payloads, rsp, primaryPayloads));
-    if (rsp.info_size() > 0) {
-        RETURN_IF_NOT_OK(QueryMetadataFromRedirectMasters(signature_, cred_, requestTimeoutMs_, clientWorkerAddress,
-                                                          getParam.subTimeoutMs, rsp, payloads));
-    }
-    return Status::OK();
+    QueryMetaRedirectFollowOptions redirectOpts;
+    redirectOpts.onRedirectRetry = []() { DirectReadTestHook::RecordRedirectRetry(); };
+    redirectOpts.emptyRedirectAddressError = Status(K_RUNTIME_ERROR, DirectReadFlow::kRedirectLoopFallbackReason);
+    redirectOpts.nestedRedirectError = Status(K_RUNTIME_ERROR, DirectReadFlow::kRedirectLoopFallbackReason);
+    redirectOpts.movingOnRedirectError = Status(K_TRY_AGAIN, DirectReadFlow::kMetaMovingFallbackReason);
+
+    return QueryMetaWithRedirectAndMoving(metaAddress, objectKeys, queryMeta, movingOpts, redirectOpts, rsp, payloads);
 }
 
 Status DirectReadRpcAdapter::GetClusterState(const HostPort &workerAddress, HashRingPb &ring, int64_t &version) const

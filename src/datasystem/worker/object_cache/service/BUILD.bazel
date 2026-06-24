@@ -97,6 +97,7 @@ ds_cc_library(
         "//src/datasystem/common/parallel:common_parallel",
         "//src/datasystem/common/perf:common_perf",
         "//src/datasystem/common/object_cache:object_read_access_flow",
+        "//src/datasystem/common/object_cache:query_meta_redirect_helper",
         "//src/datasystem/common/rdma:fast_transport_manager_wrapper",
         "//src/datasystem/common/rdma:rdma_util",
         "//src/datasystem/common/rdma/npu:remote_h2d_manager_header",

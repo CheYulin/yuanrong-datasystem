@@ -26,6 +26,7 @@ ds_cc_library(
 ds_cc_library(
     name = "common_util_gflag_def",
     srcs = [
+        "cluster_master_flags.cpp",
         "common_gflag_define.cpp",
         "common_gflags_validate.cpp",
         "flags.cpp",
@@ -33,6 +34,7 @@ ds_cc_library(
     visibility = ["//src/datasystem:__subpackages__"],
     deps = [
         ":common_util_gflag_header",
+        "//src/datasystem/common/flags:ds_flags_header",
         "//src/datasystem/common/inject:common_inject",
         "//src/datasystem/common/log:common_log_header",
         "//src/datasystem/common/log/spdlog:ds_spdlog",

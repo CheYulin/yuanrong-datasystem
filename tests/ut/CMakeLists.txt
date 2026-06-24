@@ -29,6 +29,8 @@ set(DS_UT_DEPEND_LIBS
         httpclient
         master_object_cache
         worker_object_cache
+        common_oc_read_access
+        common_read_only_hash_ring_view
         worker_hash_ring
         worker_client_manager
         datasystem_worker_static
