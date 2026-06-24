@@ -48,5 +48,19 @@ TEST(ReadOnlyHashRingViewTest, ResolvesMetaAddressFromHashToken)
     DS_ASSERT_OK(view.GetMetaAddress("a_key_hash_to_99", metaAddress));
     EXPECT_EQ(metaAddress.ToString(), workerAddr);
 }
+TEST(ReadOnlyHashRingViewTest, DetectsHealthyWorkerAddress)
+{
+    const std::string workerAddr = "127.0.0.1:9001";
+    object_cache::ReadOnlyHashRingView view;
+    DS_ASSERT_OK(view.UpdateFromPb(BuildSingleWorkerRing(workerAddr, 100), 1));
+
+    HostPort workerAddress;
+    DS_ASSERT_OK(workerAddress.ParseString(workerAddr));
+    EXPECT_TRUE(view.HasHealthyWorkerAtAddress(workerAddress));
+
+    HostPort missingAddress;
+    DS_ASSERT_OK(missingAddress.ParseString("127.0.0.1:9002"));
+    EXPECT_FALSE(view.HasHealthyWorkerAtAddress(missingAddress));
+}
 }  // namespace ut
 }  // namespace datasystem

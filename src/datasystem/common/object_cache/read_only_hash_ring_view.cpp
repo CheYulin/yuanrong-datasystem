@@ -148,6 +148,17 @@ Status ReadOnlyHashRingView::GetMetaAddress(const std::string &objectKey, HostPo
     return Status::OK();
 }
 
+bool ReadOnlyHashRingView::HasHealthyWorkerAtAddress(const HostPort &workerAddress) const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const auto iter = ringInfo_.workers().find(workerAddress.ToString());
+    if (iter == ringInfo_.workers().end()) {
+        return false;
+    }
+    const auto state = iter->second.state();
+    return state == WorkerPb::ACTIVE || state == WorkerPb::LEAVING;
+}
+
 void ReadOnlyHashRingView::RebuildDerivedMapsLocked()
 {
     tokenMap_.clear();

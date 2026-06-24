@@ -46,6 +46,8 @@ public:
 
     Status UpdateFromSerialized(const std::string &serializedRing, int64_t version);
     Status UpdateFromPb(const HashRingPb &ring, int64_t version);
+    bool HasHealthyWorkerAtAddress(const HostPort &workerAddress) const;
+
     Status GetMetaAddress(const std::string &objectKey, HostPort &metaAddress) const;
 
 private:
