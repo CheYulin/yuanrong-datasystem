@@ -22,6 +22,7 @@
 #include <map>
 #include <mutex>
 
+#include "datasystem/common/object_cache/read_access/query_meta_merge_helper.h"
 #include "datasystem/common/util/status_helper.h"
 
 namespace datasystem {
@@ -93,25 +94,7 @@ Status ObjectReadAccessFlow::ExecuteMetaPhase(const ObjectReadAccessRequest &req
         std::vector<RpcMessage> groupPayloads;
         RETURN_IF_NOT_OK(QueryMetaGroup(metaAddress, groupedKeys, request.subTimeoutMs, groupRsp, groupPayloads));
 
-        if (groupRsp.meta_is_moving()) {
-            return Status(K_TRY_AGAIN, "meta_is_moving");
-        }
-
-        const auto payloadOffset = result.metaPayloads.size();
-        for (auto &payload : groupPayloads) {
-            result.metaPayloads.emplace_back(std::move(payload));
-        }
-        for (const auto &missingKey : groupRsp.not_exist_ids()) {
-            *result.metaRsp.add_not_exist_ids() = missingKey;
-        }
-        for (auto &queryMeta : *groupRsp.mutable_query_metas()) {
-            auto *merged = result.metaRsp.add_query_metas();
-            merged->Swap(&queryMeta);
-            for (int i = 0; i < merged->payload_indexs_size(); ++i) {
-                merged->set_payload_indexs(i, merged->payload_indexs(i) + static_cast<int32_t>(payloadOffset));
-            }
-        }
-        result.metaRsp.set_meta_is_moving(groupRsp.meta_is_moving());
+        RETURN_IF_NOT_OK(MergeQueryMetaGroupResult(result.metaRsp, result.metaPayloads, groupRsp, groupPayloads));
     }
     return Status::OK();
 }

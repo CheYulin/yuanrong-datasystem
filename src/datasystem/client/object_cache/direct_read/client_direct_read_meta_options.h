@@ -15,27 +15,23 @@
  */
 
 /**
- * Description: Path fallback reason helpers for client direct read.
+ * Description: Client QueryMeta orchestration options for direct read.
  */
-#ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_FALLBACK_H
-#define DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_FALLBACK_H
+#ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_CLIENT_DIRECT_READ_META_OPTIONS_H
+#define DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_CLIENT_DIRECT_READ_META_OPTIONS_H
 
-#include <string>
+#include <functional>
 
+#include "datasystem/common/object_cache/read_access/query_meta_orchestrating_meta_client.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem {
 namespace object_cache {
-class DirectReadFallback {
-public:
-    static std::string NormalizeReason(const std::string &reason);
-    static bool IsControlPlaneFailure(const Status &status);
-    static bool IsRetriableControlPlaneFailure(const Status &status);
-    /** Outer DirectReadFlow meta retry: stale route / route unavailable only (not moving). */
-    static bool IsOuterMetaPhaseRetriable(const Status &status);
-    static Status ToPathFallbackStatus(const Status &status);
-};
+class DirectReadRouteProvider;
+
+QueryMetaOrchestratingMetaClient::Options BuildClientDirectReadMetaOptions(
+    DirectReadRouteProvider *routeProvider, std::function<Status()> refreshRoute);
 }  // namespace object_cache
 }  // namespace datasystem
 
-#endif  // DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_FALLBACK_H
+#endif  // DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_CLIENT_DIRECT_READ_META_OPTIONS_H

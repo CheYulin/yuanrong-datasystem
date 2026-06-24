@@ -40,20 +40,6 @@ private:
     DirectReadRouteProvider *provider_;
 };
 
-class DirectReadMetaClientAdapter : public IObjectReadMetaClient {
-public:
-    DirectReadMetaClientAdapter(DirectReadRpcAdapter *rpcAdapter, HostPort clientWorkerAddress,
-                                DirectReadRouteProvider *routeProvider);
-
-    Status QueryMeta(const HostPort &metaAddress, const std::vector<std::string> &objectKeys, int64_t subTimeoutMs,
-                     master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads) override;
-
-private:
-    DirectReadRpcAdapter *rpcAdapter_;
-    HostPort clientWorkerAddress_;
-    DirectReadRouteProvider *routeProvider_;
-};
-
 class DirectReadDataClientAdapter : public IObjectReadDataClient {
 public:
     explicit DirectReadDataClientAdapter(DirectReadRpcAdapter *rpcAdapter);

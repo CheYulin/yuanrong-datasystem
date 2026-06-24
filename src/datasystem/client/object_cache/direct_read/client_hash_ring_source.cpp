@@ -51,7 +51,6 @@ ClientHashRingSource::ClientHashRingSource(std::shared_ptr<IClientWorkerApi> wor
 
 Status ClientHashRingSource::GetMetaAddress(const std::string &objectKey, HostPort &metaAddress)
 {
-    RETURN_IF_NOT_OK(RefreshForRouteLookup());
     if (DirectReadTestHook::SimulateStaleRoute()) {
         return Status(K_NOT_READY, DirectReadFlow::kStaleRouteFallbackReason);
     }
@@ -64,12 +63,28 @@ Status ClientHashRingSource::RefreshForRouteLookup()
         return Status::OK();
     }
     if (!view_.HasSnapshot()) {
-        // Bootstrap: etcd first, then worker fallback.
         return BootstrapRing();
     }
-    // Steady state and scale events: worker first, then etcd fallback.
-    (void)DirectReadTestHook::ForceHashRingRefresh();
+    if (view_.HasScalingTask() || DirectReadTestHook::ForceHashRingRefresh()) {
+        return RefreshRing();
+    }
+    return Status::OK();
+}
+
+Status ClientHashRingSource::RefreshOnClusterEvent()
+{
+    if (!FLAGS_enable_distributed_master) {
+        return Status::OK();
+    }
+    if (!view_.HasSnapshot()) {
+        return BootstrapRing();
+    }
     return RefreshRing();
+}
+
+int64_t ClientHashRingSource::Version() const
+{
+    return view_.Version();
 }
 
 ReadOnlyHashRingView &ClientHashRingSource::ViewForTest()
@@ -99,7 +114,6 @@ Status ClientHashRingSource::EnsureInitialized()
 
 Status ClientHashRingSource::LoadFromEtcd()
 {
-    DirectReadTestHook::RecordHashRingEtcdRefresh();
     RETURN_IF_NOT_OK(EnsureInitialized());
     RangeSearchResult res;
     Status rc = etcdStore_->Get(ETCD_RING_PREFIX, "", res);
@@ -107,8 +121,12 @@ Status ClientHashRingSource::LoadFromEtcd()
         RETURN_STATUS(K_NOT_READY, "Hash ring not found in etcd");
     }
     RETURN_IF_NOT_OK(rc);
-    RETURN_IF_NOT_OK(view_.UpdateFromSerialized(res.value, res.modRevision));
-    lastRefreshSource_ = HashRingRefreshSource::ETCD;
+    bool versionChanged = false;
+    RETURN_IF_NOT_OK(view_.UpdateFromSerialized(res.value, res.modRevision, &versionChanged));
+    if (versionChanged) {
+        DirectReadTestHook::RecordHashRingEtcdRefresh();
+        lastRefreshSource_ = HashRingRefreshSource::ETCD;
+    }
     return Status::OK();
 }
 
@@ -116,12 +134,15 @@ Status ClientHashRingSource::LoadFromWorker()
 {
     RETURN_RUNTIME_ERROR_IF_NULL(workerApi_);
     RETURN_RUNTIME_ERROR_IF_NULL(rpcAdapter_);
-    DirectReadTestHook::RecordHashRingWorkerRefresh();
     HashRingPb ring;
     int64_t version = -1;
     RETURN_IF_NOT_OK(rpcAdapter_->GetClusterState(workerApi_->hostPort_, ring, version));
-    RETURN_IF_NOT_OK(view_.UpdateFromPb(ring, version));
-    lastRefreshSource_ = HashRingRefreshSource::WORKER;
+    bool versionChanged = false;
+    RETURN_IF_NOT_OK(view_.UpdateFromPb(ring, version, &versionChanged));
+    if (versionChanged) {
+        DirectReadTestHook::RecordHashRingWorkerRefresh();
+        lastRefreshSource_ = HashRingRefreshSource::WORKER;
+    }
     return Status::OK();
 }
 

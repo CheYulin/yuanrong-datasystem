@@ -28,8 +28,20 @@ namespace datasystem {
 namespace object_cache {
 DirectReadRouteProvider::DirectReadRouteProvider(std::shared_ptr<IClientWorkerApi> workerApi,
                                                  DirectReadRpcAdapter *rpcAdapter)
-    : hashRingSource_(std::move(workerApi), rpcAdapter)
+    : hashRingSourcePtr_(nullptr),
+      ownedRingSource_(std::make_unique<ClientHashRingSource>(std::move(workerApi), rpcAdapter))
 {
+    hashRingSourcePtr_ = ownedRingSource_.get();
+}
+
+DirectReadRouteProvider::DirectReadRouteProvider(ClientHashRingSource &sharedRingSource)
+    : hashRingSourcePtr_(&sharedRingSource), ownedRingSource_(nullptr)
+{
+}
+
+ClientHashRingSource &DirectReadRouteProvider::RingSource()
+{
+    return *hashRingSourcePtr_;
 }
 
 Status DirectReadRouteProvider::GetMetaAddress(const GetParam &getParam, HostPort &metaAddress)
@@ -41,18 +53,22 @@ Status DirectReadRouteProvider::GetMetaAddress(const GetParam &getParam, HostPor
 Status DirectReadRouteProvider::GetMetaAddress(const std::string &objectKey, HostPort &metaAddress)
 {
     DirectReadTestHook::RecordRouteQuery();
-    RETURN_IF_NOT_OK(RefreshRouteIfNeeded());
-    return hashRingSource_.GetMetaAddress(objectKey, metaAddress);
+    return RingSource().GetMetaAddress(objectKey, metaAddress);
 }
 
 Status DirectReadRouteProvider::RefreshRouteIfNeeded()
 {
-    return hashRingSource_.RefreshForRouteLookup();
+    return RingSource().RefreshForRouteLookup();
+}
+
+Status DirectReadRouteProvider::RefreshRouteOnClusterEvent()
+{
+    return RingSource().RefreshOnClusterEvent();
 }
 
 ClientHashRingSource &DirectReadRouteProvider::HashRingSourceForTest()
 {
-    return hashRingSource_;
+    return RingSource();
 }
 }  // namespace object_cache
 }  // namespace datasystem

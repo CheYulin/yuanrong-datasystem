@@ -71,5 +71,16 @@ Status AppendQueryMetaPayloads(std::vector<RpcMessage> &basePayloads, master::Qu
     }
     return Status::OK();
 }
+
+Status MergeQueryMetaGroupResult(master::QueryMetaRspPb &accumulatedRsp, std::vector<RpcMessage> &accumulatedPayloads,
+                                 master::QueryMetaRspPb &groupRsp, std::vector<RpcMessage> &groupPayloads)
+{
+    if (groupRsp.meta_is_moving()) {
+        return Status(K_TRY_AGAIN, "meta_is_moving");
+    }
+    RETURN_IF_NOT_OK(AppendQueryMetaPayloads(accumulatedPayloads, groupRsp, groupPayloads));
+    MergeQueryMetaResponses(accumulatedRsp, groupRsp);
+    return Status::OK();
+}
 }  // namespace object_cache
 }  // namespace datasystem

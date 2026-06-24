@@ -21,7 +21,9 @@
 #include "datasystem/worker/object_cache/service/worker_object_read_access_helper.h"
 
 #include "datasystem/common/object_cache/read_access/query_meta_merge_helper.h"
+#include "datasystem/common/object_cache/read_access/query_meta_orchestrating_meta_client.h"
 #include "datasystem/common/object_cache/read_access/query_meta_redirect_helper.h"
+#include "datasystem/worker/object_cache/service/worker_query_meta_transport.h"
 
 #include <cstdint>
 #include <chrono>
@@ -1414,40 +1416,42 @@ Status WorkerOcServiceGetImpl::QueryMetaDataFromMasterImpl(const HostPort &destM
                                          payloads);
 }
 
+Status WorkerOcServiceGetImpl::QueryMetaOnceAtMaster(const HostPort &metaAddress, uint64_t subTimeout,
+                                                     const std::vector<std::string> &objKeysToQuery,
+                                                     bool isFromOtherAz, bool enableRedirect,
+                                                     master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads)
+{
+    master::QueryMetaReqPb req;
+    SetQueryMetaInfo(req, objKeysToQuery, metaAddress.ToString(), enableRedirect, isFromOtherAz);
+    std::shared_ptr<WorkerMasterOCApi> workerMasterApi = workerMasterApiManager_->GetWorkerMasterApi(metaAddress);
+    CHECK_FAIL_RETURN_STATUS(workerMasterApi != nullptr, K_RUNTIME_ERROR, "Get masterApi failed, cannot queryMeta");
+    Status status = workerMasterApi->QueryMeta(req, subTimeout, rsp, payloads);
+    if (status.IsError()) {
+        payloads.clear();
+    }
+    return status;
+}
+
+QueryMetaOrchestratingMetaClient::Options WorkerOcServiceGetImpl::BuildQueryMetaOrchestratingOptions()
+{
+    QueryMetaOrchestratingMetaClient::Options options;
+    options.moving.remainingDeadlineMs = [this]() { return reqTimeoutDuration.CalcRealRemainingTime(); };
+    options.redirect.resolveRedirectAddress = [this](const std::string &redirectAddress, HostPort &metaAddress) {
+        return GetPrimaryReplicaAddr(redirectAddress, metaAddress);
+    };
+    options.redirect.rejectNestedRedirectInfo = false;
+    options.redirect.rejectMovingOnRedirect = false;
+    return options;
+}
+
 Status WorkerOcServiceGetImpl::QueryMetaFromMasterDirect(const HostPort &destMasterHostPort, uint64_t subTimeout,
                                                          const std::vector<std::string> &objKeysToQuery,
                                                          bool isFromOtherAz, datasystem::master::QueryMetaRspPb &rsp,
                                                          std::vector<RpcMessage> &payloads)
 {
-    QueryMetaAtMasterFn queryMeta = [this, subTimeout, isFromOtherAz](
-                                        const HostPort &metaAddress, const std::vector<std::string> &objectKeys,
-                                        bool enableRedirect, master::QueryMetaRspPb &queryRsp,
-                                        std::vector<RpcMessage> &queryPayloads) -> Status {
-        master::QueryMetaReqPb req;
-        SetQueryMetaInfo(req, objectKeys, metaAddress.ToString(), enableRedirect, isFromOtherAz);
-        std::shared_ptr<WorkerMasterOCApi> workerMasterApi =
-            workerMasterApiManager_->GetWorkerMasterApi(metaAddress);
-        CHECK_FAIL_RETURN_STATUS(workerMasterApi != nullptr, K_RUNTIME_ERROR, "Get masterApi failed, cannot queryMeta");
-        Status status = workerMasterApi->QueryMeta(req, subTimeout, queryRsp, queryPayloads);
-        if (status.IsError()) {
-            queryPayloads.clear();
-        }
-        return status;
-    };
-
-    QueryMetaMovingRetryOptions movingOpts;
-    movingOpts.remainingDeadlineMs = [this]() { return reqTimeoutDuration.CalcRealRemainingTime(); };
-    movingOpts.subTimeoutMs = static_cast<int64_t>(subTimeout);
-
-    QueryMetaRedirectFollowOptions redirectOpts;
-    redirectOpts.resolveRedirectAddress = [this](const std::string &redirectAddress, HostPort &metaAddress) {
-        return GetPrimaryReplicaAddr(redirectAddress, metaAddress);
-    };
-    redirectOpts.rejectNestedRedirectInfo = false;
-    redirectOpts.rejectMovingOnRedirect = false;
-
-    return QueryMetaWithRedirectAndMoving(destMasterHostPort, objKeysToQuery, queryMeta, movingOpts, redirectOpts, rsp,
-                                          payloads);
+    auto transport = std::make_shared<WorkerQueryMetaTransport>(this, isFromOtherAz);
+    QueryMetaOrchestratingMetaClient metaClient(transport, BuildQueryMetaOrchestratingOptions());
+    return metaClient.QueryMeta(destMasterHostPort, objKeysToQuery, static_cast<int64_t>(subTimeout), rsp, payloads);
 }
 
 void WorkerOcServiceGetImpl::ProcessQueryMetaFailedObjsWhenMetaStoredInEtcd(

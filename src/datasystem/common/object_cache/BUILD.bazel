@@ -103,6 +103,7 @@ ds_cc_library(
     srcs = ["read_access/object_read_access_flow.cpp"],
     hdrs = ["read_access/object_read_access_flow.h"],
     deps = [
+        ":query_meta_merge_helper",
         "//src/datasystem/common/rpc:rpc_message",
         "//src/datasystem/common/util:net_util",
         "//src/datasystem/common/util:status_helper",
@@ -129,6 +130,23 @@ ds_cc_library(
     hdrs = ["read_access/query_meta_redirect_helper.h"],
     deps = [
         ":query_meta_merge_helper",
+        "//src/datasystem/common/rpc:rpc_message",
+        "//src/datasystem/common/util:net_util",
+        "//src/datasystem/common/util:status_helper",
+        "//src/datasystem/protos:master_object_cc_proto",
+    ],
+)
+
+ds_cc_library(
+    name = "query_meta_orchestrating_meta_client",
+    srcs = ["read_access/query_meta_orchestrating_meta_client.cpp"],
+    hdrs = [
+        "read_access/query_meta_orchestrating_meta_client.h",
+        "read_access/query_meta_transport.h",
+    ],
+    deps = [
+        ":object_read_access_flow",
+        ":query_meta_redirect_helper",
         "//src/datasystem/common/rpc:rpc_message",
         "//src/datasystem/common/util:net_util",
         "//src/datasystem/common/util:status_helper",

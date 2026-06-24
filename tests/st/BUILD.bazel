@@ -1,6 +1,9 @@
 load("//bazel:build_defs.bzl", "ds_cc_test_library")
+load("@rules_cc//cc:defs.bzl", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
+
+exports_files(["st_bazel_test_main.cpp"])
 
 # ST 公共基础库：common.h、kill_timer.h、st_oc_service_impl 等
 # includes = ["."] 将 tests/st/ 加入 include 路径，使得 "common.h"、
@@ -35,6 +38,15 @@ ds_cc_test_library(
         "//src/datasystem/worker:authenticate",
         "//src/datasystem/worker/object_cache:worker_oc_service_impl",
         "//tests/st/cluster:st_cluster",
+    ],
+)
+
+cc_library(
+    name = "st_test_main",
+    srcs = ["st_bazel_test_main.cpp"],
+    alwayslink = True,
+    deps = [
+        "@com_google_googletest//:gtest",
     ],
 )
 

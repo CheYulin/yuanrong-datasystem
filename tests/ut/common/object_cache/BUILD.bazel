@@ -70,6 +70,15 @@ ds_cc_test(
 )
 
 ds_cc_test(
+    name = "query_meta_orchestrating_meta_client_test",
+    srcs = ["query_meta_orchestrating_meta_client_test.cpp"],
+    deps = [
+        "//src/datasystem/common/object_cache:query_meta_orchestrating_meta_client",
+        "//tests/ut:ut_common",
+    ],
+)
+
+ds_cc_test(
     name = "query_meta_redirect_helper_test",
     srcs = ["query_meta_redirect_helper_test.cpp"],
     deps = [

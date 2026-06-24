@@ -82,7 +82,17 @@ int64_t ReadOnlyHashRingView::Version() const
 bool ReadOnlyHashRingView::HasScalingTask() const
 {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    return !ringInfo_.add_node_info().empty() || !ringInfo_.del_node_info().empty();
+    auto hasUnfinishedChange = [](const google::protobuf::Map<std::string, ChangeNodePb> &changeNodes) {
+        for (const auto &entry : changeNodes) {
+            for (const auto &range : entry.second.changed_ranges()) {
+                if (!range.finished()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    return hasUnfinishedChange(ringInfo_.add_node_info()) || hasUnfinishedChange(ringInfo_.del_node_info());
 }
 
 bool ReadOnlyHashRingView::IsWorkable() const
@@ -91,24 +101,44 @@ bool ReadOnlyHashRingView::IsWorkable() const
     return ringInfo_.cluster_has_init() && !tokenMap_.empty();
 }
 
-Status ReadOnlyHashRingView::UpdateFromSerialized(const std::string &serializedRing, int64_t version)
+Status ReadOnlyHashRingView::UpdateFromSerialized(const std::string &serializedRing, int64_t version,
+                                                bool *versionChanged)
 {
     HashRingPb ring;
     if (!ring.ParseFromString(serializedRing)) {
         RETURN_STATUS(K_RUNTIME_ERROR, "Failed to parse hash ring snapshot");
     }
-    return UpdateFromPb(ring, version);
+    return UpdateFromPb(ring, version, versionChanged);
 }
 
-Status ReadOnlyHashRingView::UpdateFromPb(const HashRingPb &ring, int64_t version)
+Status ReadOnlyHashRingView::UpdateFromPb(const HashRingPb &ring, int64_t version, bool *versionChanged)
 {
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    const int64_t previousVersion = version_;
     if (version_ >= 0 && version >= 0 && version < version_) {
+        if (versionChanged != nullptr) {
+            *versionChanged = false;
+        }
+        return Status::OK();
+    }
+    if (version_ >= 0 && version >= 0 && version == version_ && ringInfo_.SerializeAsString() == ring.SerializeAsString()) {
+        if (versionChanged != nullptr) {
+            *versionChanged = false;
+        }
+        return Status::OK();
+    }
+    if (version < 0 && version_ < 0 && ringInfo_.SerializeAsString() == ring.SerializeAsString()) {
+        if (versionChanged != nullptr) {
+            *versionChanged = false;
+        }
         return Status::OK();
     }
     ringInfo_.CopyFrom(ring);
     version_ = version;
     RebuildDerivedMapsLocked();
+    if (versionChanged != nullptr) {
+        *versionChanged = previousVersion != version_ || previousVersion < 0;
+    }
     return Status::OK();
 }
 
@@ -157,6 +187,17 @@ bool ReadOnlyHashRingView::HasHealthyWorkerAtAddress(const HostPort &workerAddre
     }
     const auto state = iter->second.state();
     return state == WorkerPb::ACTIVE || state == WorkerPb::LEAVING;
+}
+
+bool ReadOnlyHashRingView::HasJoinableWorkerAtAddress(const HostPort &workerAddress) const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const auto iter = ringInfo_.workers().find(workerAddress.ToString());
+    if (iter == ringInfo_.workers().end()) {
+        return false;
+    }
+    const auto state = iter->second.state();
+    return state == WorkerPb::ACTIVE || state == WorkerPb::LEAVING || state == WorkerPb::JOINING;
 }
 
 void ReadOnlyHashRingView::RebuildDerivedMapsLocked()

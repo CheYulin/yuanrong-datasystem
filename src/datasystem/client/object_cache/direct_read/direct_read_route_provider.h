@@ -34,15 +34,20 @@ namespace object_cache {
 class DirectReadRouteProvider : public IObjectReadRouteProvider {
 public:
     DirectReadRouteProvider(std::shared_ptr<IClientWorkerApi> workerApi, DirectReadRpcAdapter *rpcAdapter);
+    explicit DirectReadRouteProvider(ClientHashRingSource &sharedRingSource);
 
     Status GetMetaAddress(const GetParam &getParam, HostPort &metaAddress);
     Status GetMetaAddress(const std::string &objectKey, HostPort &metaAddress) override;
     Status RefreshRouteIfNeeded() override;
+    Status RefreshRouteOnClusterEvent();
 
     ClientHashRingSource &HashRingSourceForTest();
 
 private:
-    mutable ClientHashRingSource hashRingSource_;
+    ClientHashRingSource &RingSource();
+
+    ClientHashRingSource *hashRingSourcePtr_;
+    std::unique_ptr<ClientHashRingSource> ownedRingSource_;
 };
 }  // namespace object_cache
 }  // namespace datasystem

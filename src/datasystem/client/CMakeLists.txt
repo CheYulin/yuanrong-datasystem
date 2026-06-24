@@ -17,6 +17,8 @@ list(APPEND CLIENT_SRCS
         object_cache/direct_read/direct_read_flow.cpp
         object_cache/direct_read/direct_read_route_provider.cpp
         object_cache/direct_read/direct_read_rpc_adapter.cpp
+        object_cache/direct_read/client_query_meta_transport.cpp
+        object_cache/direct_read/client_direct_read_meta_options.cpp
         object_cache/direct_read/direct_read_fallback.cpp
         object_cache/direct_read/direct_read_test_hook.cpp
         object_cache/direct_read/client_hash_ring_source.cpp

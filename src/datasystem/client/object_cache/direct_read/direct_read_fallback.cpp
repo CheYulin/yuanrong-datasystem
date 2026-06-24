@@ -80,6 +80,16 @@ bool DirectReadFallback::IsRetriableControlPlaneFailure(const Status &status)
            || status.GetCode() == K_NOT_READY;
 }
 
+bool DirectReadFallback::IsOuterMetaPhaseRetriable(const Status &status)
+{
+    if (status.GetCode() == K_NOT_READY) {
+        return true;
+    }
+    const auto &msg = status.GetMsg();
+    return ContainsReasonToken(msg, DirectReadFlow::kStaleRouteFallbackReason)
+           || ContainsReasonToken(msg, DirectReadFlow::kRouteUnavailableFallbackReason);
+}
+
 Status DirectReadFallback::ToPathFallbackStatus(const Status &status)
 {
     if (status.IsOk()) {

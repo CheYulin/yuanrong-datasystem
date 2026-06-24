@@ -44,9 +44,10 @@ public:
     bool HasScalingTask() const;
     bool IsWorkable() const;
 
-    Status UpdateFromSerialized(const std::string &serializedRing, int64_t version);
-    Status UpdateFromPb(const HashRingPb &ring, int64_t version);
+    Status UpdateFromSerialized(const std::string &serializedRing, int64_t version, bool *versionChanged = nullptr);
+    Status UpdateFromPb(const HashRingPb &ring, int64_t version, bool *versionChanged = nullptr);
     bool HasHealthyWorkerAtAddress(const HostPort &workerAddress) const;
+    bool HasJoinableWorkerAtAddress(const HostPort &workerAddress) const;
 
     Status GetMetaAddress(const std::string &objectKey, HostPort &metaAddress) const;
 

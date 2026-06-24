@@ -24,8 +24,10 @@
 #include <vector>
 
 #include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
+#include "datasystem/common/object_cache/read_access/query_meta_orchestrating_meta_client.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/worker/object_cache/service/worker_oc_service_get_impl.h"
+#include "datasystem/worker/object_cache/service/worker_query_meta_transport.h"
 
 namespace datasystem {
 namespace object_cache {
@@ -55,21 +57,21 @@ private:
 class WorkerObjectReadMetaClient : public IObjectReadMetaClient {
 public:
     WorkerObjectReadMetaClient(WorkerOcServiceGetImpl *getImpl, bool isFromOtherAz)
-        : getImpl_(getImpl), isFromOtherAz_(isFromOtherAz)
     {
+        auto transport = std::make_shared<WorkerQueryMetaTransport>(getImpl, isFromOtherAz);
+        metaClient_ = std::make_shared<QueryMetaOrchestratingMetaClient>(transport,
+                                                                         getImpl->BuildQueryMetaOrchestratingOptions());
     }
 
     Status QueryMeta(const HostPort &metaAddress, const std::vector<std::string> &objectKeys, int64_t subTimeoutMs,
                      master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads) override
     {
-        RETURN_RUNTIME_ERROR_IF_NULL(getImpl_);
-        return getImpl_->QueryMetaFromMasterDirect(metaAddress, static_cast<uint64_t>(subTimeoutMs), objectKeys,
-                                                  isFromOtherAz_, rsp, payloads);
+        RETURN_RUNTIME_ERROR_IF_NULL(metaClient_);
+        return metaClient_->QueryMeta(metaAddress, objectKeys, subTimeoutMs, rsp, payloads);
     }
 
 private:
-    WorkerOcServiceGetImpl *getImpl_;
-    bool isFromOtherAz_;
+    std::shared_ptr<QueryMetaOrchestratingMetaClient> metaClient_;
 };
 
 class WorkerNullDataClient : public IObjectReadDataClient {

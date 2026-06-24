@@ -27,6 +27,10 @@ DS_DEFINE_bool(enable_client_direct_read, false, "Enable client direct read for 
 DS_DEFINE_bool(enable_client_direct_read_fallback, true,
                "Fallback to the existing client-worker read path when client direct read fails.");
 DS_DEFINE_int32(client_direct_read_retry_count, 1, "Retry count for client direct read route refresh and moving states.");
+DS_DEFINE_bool(client_direct_read_force, false,
+               "Force client direct read even when a healthy local worker exists (single-node test/verify).");
+DS_DEFINE_bool(client_direct_read_refresh_ring_every_lookup, false,
+               "Refresh hash ring on every route lookup instead of event-driven refresh (single-node debug/verify).");
 
 namespace datasystem {
 namespace object_cache {
@@ -67,6 +71,9 @@ void DirectReadTestHook::SetForceDirectRead(bool enabled)
 
 bool DirectReadTestHook::ForceDirectRead()
 {
+    if (FLAGS_client_direct_read_force) {
+        return true;
+    }
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
     return g_forceDirectRead;
 }
@@ -151,6 +158,9 @@ void DirectReadTestHook::SetForceHashRingRefresh(bool enabled)
 
 bool DirectReadTestHook::ForceHashRingRefresh()
 {
+    if (FLAGS_client_direct_read_refresh_ring_every_lookup) {
+        return true;
+    }
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
     return g_forceHashRingRefresh;
 }

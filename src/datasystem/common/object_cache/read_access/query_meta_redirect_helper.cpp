@@ -130,8 +130,8 @@ Status FollowQueryMetaRedirects(QueryMetaAtMasterFn queryMeta, const QueryMetaRe
             return options.nestedRedirectError;
         }
 
-        MergeQueryMetaResponses(rsp, redirectRsp);
         RETURN_IF_NOT_OK(AppendQueryMetaPayloads(payloads, redirectRsp, redirectPayloads));
+        MergeQueryMetaResponses(rsp, redirectRsp);
     }
     return Status::OK();
 }

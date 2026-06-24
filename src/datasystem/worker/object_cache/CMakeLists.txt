@@ -39,6 +39,7 @@ set(WORKER_OC_SRCS
         service/worker_oc_service_multi_publish_impl.cpp
         service/worker_oc_service_get_impl.cpp
         service/worker_object_read_access_helper.cpp
+        service/worker_query_meta_transport.cpp
         service/worker_oc_service_delete_impl.cpp
         service/worker_oc_service_clear_data_flow.cpp
         service/worker_oc_service_global_reference_impl.cpp

@@ -15,42 +15,39 @@
  */
 
 /**
- * Description: Minimal RPC adapter for client direct read.
+ * Description: Client single-shot QueryMeta RPC transport.
  */
-#ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_RPC_ADAPTER_H
-#define DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_RPC_ADAPTER_H
+#ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_CLIENT_QUERY_META_TRANSPORT_H
+#define DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_CLIENT_QUERY_META_TRANSPORT_H
 
-#include <memory>
+#include <cstdint>
 #include <vector>
 
-#include "datasystem/client/object_cache/client_worker_api/iclient_worker_api.h"
 #include "datasystem/common/ak_sk/signature.h"
+#include "datasystem/common/object_cache/read_access/query_meta_transport.h"
 #include "datasystem/common/rpc/rpc_credential.h"
-#include "datasystem/common/rpc/rpc_message.h"
 #include "datasystem/common/util/net_util.h"
-#include "datasystem/protos/hash_ring.pb.h"
 #include "datasystem/protos/master_object.pb.h"
-#include "datasystem/protos/worker_object.pb.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem {
 namespace object_cache {
-class DirectReadRpcAdapter {
+class ClientQueryMetaTransport : public IQueryMetaTransport {
 public:
-    DirectReadRpcAdapter(RpcCredential cred, Signature *signature, int32_t requestTimeoutMs);
+    ClientQueryMetaTransport(RpcCredential cred, Signature *signature, int32_t requestTimeoutMs,
+                             HostPort clientWorkerAddress);
 
-    Status GetClusterState(const HostPort &workerAddress, HashRingPb &ring, int64_t &version) const;
-
-    Status GetObjectRemoteTcp(const HostPort &dataAddress, const master::QueryMetaInfoPb &queryMeta,
-                              const GetParam &getParam, size_t objectIndex, GetObjectRemoteRspPb &rsp,
-                              std::vector<RpcMessage> &payloads) const;
+    Status QueryMetaOnce(const HostPort &metaAddress, const std::vector<std::string> &objectKeys, int64_t subTimeoutMs,
+                         bool enableRedirect, master::QueryMetaRspPb &rsp,
+                         std::vector<RpcMessage> &payloads) override;
 
 private:
     RpcCredential cred_;
     Signature *signature_;
     int32_t requestTimeoutMs_;
+    HostPort clientWorkerAddress_;
 };
 }  // namespace object_cache
 }  // namespace datasystem
 
-#endif  // DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_RPC_ADAPTER_H
+#endif  // DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_CLIENT_QUERY_META_TRANSPORT_H

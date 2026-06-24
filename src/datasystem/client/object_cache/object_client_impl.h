@@ -42,6 +42,8 @@
 #include "datasystem/client/object_cache/client_worker_api/client_worker_remote_api.h"
 #include "datasystem/client/object_cache/device/client_device_object_manager.h"
 #include "datasystem/client/object_cache/device/p2p_subscribe.h"
+#include "datasystem/client/object_cache/direct_read/client_hash_ring_source.h"
+#include "datasystem/client/object_cache/direct_read/direct_read_rpc_adapter.h"
 #include "datasystem/common/log/access_recorder.h"
 #include "datasystem/common/ak_sk/ak_sk_manager.h"
 #include "datasystem/common/object_cache/object_base.h"
@@ -1481,6 +1483,8 @@ private:
 
     bool HasHealthyLocalWorker();
 
+    ClientHashRingSource *GetDirectReadRingSource(const std::shared_ptr<IClientWorkerApi> &workerApi);
+
     bool TryDirectReadCutbackToLocalWorker(const std::shared_ptr<IClientWorkerApi> &workerApi);
 
     bool ShouldTryDirectRead(const std::shared_ptr<IClientWorkerApi> &workerApi);
@@ -1550,6 +1554,11 @@ private:
     uint64_t memcpyParallelThreshold_ = 0;
 
     std::shared_ptr<ServiceDiscovery> serviceDiscovery_ = nullptr;
+
+    std::unique_ptr<DirectReadRpcAdapter> directReadRpcAdapter_;
+    std::unique_ptr<ClientHashRingSource> directReadRingSource_;
+    std::weak_ptr<IClientWorkerApi> directReadRingWorkerApi_;
+    int64_t lastCutbackEvalRingVersion_ = -1;
 };
 }  // namespace object_cache
 }  // namespace datasystem

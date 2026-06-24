@@ -33,7 +33,8 @@ target_link_libraries(common_ref PRIVATE ${COMMON_REF_DEPEND_LIBS})
 set(COMMON_OC_READ_ACCESS_SRCS
         read_access/object_read_access_flow.cpp
         read_access/query_meta_merge_helper.cpp
-        read_access/query_meta_redirect_helper.cpp)
+        read_access/query_meta_redirect_helper.cpp
+        read_access/query_meta_orchestrating_meta_client.cpp)
 
 set(COMMON_OC_READ_ACCESS_DEPEND_LIBS
         common_util

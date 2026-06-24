@@ -26,6 +26,7 @@
 #include <unordered_set>
 
 #include "datasystem/common/object_cache/object_base.h"
+#include "datasystem/common/object_cache/read_access/query_meta_orchestrating_meta_client.h"
 #include "datasystem/utils/status.h"
 #include "datasystem/common/ak_sk/ak_sk_manager.h"
 #include "datasystem/common/rpc/rpc_message.h"
@@ -203,6 +204,12 @@ public:
     Status QueryMetaFromMasterDirect(const HostPort &destMasterHostPort, uint64_t subTimeout,
                                      const std::vector<std::string> &objKeysToQuery, bool isFromOtherAz,
                                      datasystem::master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads);
+
+    Status QueryMetaOnceAtMaster(const HostPort &metaAddress, uint64_t subTimeout,
+                                 const std::vector<std::string> &objKeysToQuery, bool isFromOtherAz, bool enableRedirect,
+                                 master::QueryMetaRspPb &rsp, std::vector<RpcMessage> &payloads);
+
+    QueryMetaOrchestratingMetaClient::Options BuildQueryMetaOrchestratingOptions();
 
 private:
     using ObjectKeysQueryMetaFailed = std::tuple<std::unordered_set<std::string>, std::unordered_set<std::string>>;

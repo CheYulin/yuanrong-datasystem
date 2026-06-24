@@ -38,7 +38,12 @@ public:
     ClientHashRingSource(std::shared_ptr<IClientWorkerApi> workerApi, DirectReadRpcAdapter *rpcAdapter);
 
     Status GetMetaAddress(const std::string &objectKey, HostPort &metaAddress);
+    /** Cheap refresh before route lookup: bootstrap or in-ring scaling task only. */
     Status RefreshForRouteLookup();
+    /** Full refresh on cluster events: meta moving, stale route, version mismatch. */
+    Status RefreshOnClusterEvent();
+
+    int64_t Version() const;
 
     ReadOnlyHashRingView &ViewForTest();
     HashRingRefreshSource LastRefreshSource() const;

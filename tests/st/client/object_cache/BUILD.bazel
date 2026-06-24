@@ -1,4 +1,4 @@
-load("//bazel:build_defs.bzl", "ds_cc_test", "ds_cc_test_library")
+load("//bazel:build_defs.bzl", "ds_cc_test", "ds_cc_test_library", "ds_st_cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -250,6 +250,20 @@ ds_cc_test(
         "//src/datasystem/common:common_constants",
         "//src/datasystem/common/shared_memory:common_shared_memory",
         "//src/datasystem/common/util:raii",
+    ],
+)
+
+ds_st_cc_test(
+    name = "client_direct_read_st_test",
+    srcs = ["client_direct_read_test.cpp"],
+    tags = ["manual"],
+    timeout = "long",
+    deps = OC_CLIENT_COMMON_DEPS + [
+        "//src/datasystem/client/object_cache:object_client",
+        "//src/datasystem/common/object_cache:object_read_access_flow",
+        "//src/datasystem/common/util:timer",
+        "//src/datasystem/worker:add_miss_libs_fixme",
+        "//tests/st/cluster:st_cluster",
     ],
 )
 

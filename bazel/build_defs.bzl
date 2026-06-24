@@ -9,6 +9,43 @@ def ds_cc_library(name, srcs = None, hdrs = None, copts = [], deps = None, **kwa
         **kwargs
     )
 
+def ds_st_cc_test(
+        name,
+        srcs,
+        deps = [],
+        data = [],
+        copts = [],
+        defines = [],
+        linkopts = [],
+        tags = [],
+        timeout = "long",
+        **kwargs):
+    """ST cc_test with tests/st/test_main.cpp instead of gtest_main.
+
+    Avoids libprotoc's main winning the link when cluster/worker deps are pulled in.
+    """
+    native.cc_test(
+        name = name,
+        srcs = ["//tests/st:st_bazel_test_main.cpp"] + srcs,
+        deps = deps + [
+            "@com_google_googletest//:gtest",
+        ],
+        data = data,
+        copts = copts + [
+            "-std=c++17",
+            "-g",
+            "-O0",
+            "-Itests",
+        ],
+        defines = defines + ["WITH_TESTS=1"],
+        linkopts = linkopts + [
+            "-pthread",
+        ],
+        tags = tags + ["ds_test"],
+        timeout = timeout,
+        **kwargs
+    )
+
 def ds_cc_test(
         name,
         srcs,

@@ -111,18 +111,28 @@ TEST(QueryMetaRedirectHelperTest, FollowQueryMetaRedirectsMergesRedirectResponse
         EXPECT_EQ(objectKeys.size(), 1U);
         EXPECT_EQ(objectKeys[0], "obj1");
         EXPECT_FALSE(enableRedirect);
-        queryRsp.add_query_metas()->mutable_meta()->set_object_key("obj1");
+        auto *redirectMeta = queryRsp.add_query_metas();
+        redirectMeta->mutable_meta()->set_object_key("obj1");
+        redirectMeta->add_payload_indexs(0);
         payloads.emplace_back();
         return Status::OK();
     };
 
     std::vector<RpcMessage> payloads;
+    auto *primaryMeta = rsp.add_query_metas();
+    primaryMeta->mutable_meta()->set_object_key("existing");
+    primaryMeta->add_payload_indexs(0);
+    payloads.emplace_back();
+
     ASSERT_TRUE(object_cache::FollowQueryMetaRedirects(queryMeta, {}, rsp, payloads).IsOk());
     EXPECT_EQ(redirectQueries, 1);
-    ASSERT_EQ(rsp.query_metas_size(), 1);
-    EXPECT_EQ(rsp.query_metas(0).meta().object_key(), "obj1");
+    ASSERT_EQ(rsp.query_metas_size(), 2);
+    EXPECT_EQ(rsp.query_metas(0).meta().object_key(), "existing");
+    EXPECT_EQ(rsp.query_metas(0).payload_indexs(0), 0U);
+    EXPECT_EQ(rsp.query_metas(1).meta().object_key(), "obj1");
+    EXPECT_EQ(rsp.query_metas(1).payload_indexs(0), 1U);
     EXPECT_EQ(rsp.info_size(), 0);
-    EXPECT_EQ(payloads.size(), 1U);
+    EXPECT_EQ(payloads.size(), 2U);
 }
 
 TEST(QueryMetaRedirectHelperTest, QueryMetaWithRedirectAndMovingRunsPrimaryThenRedirect)
@@ -138,7 +148,9 @@ TEST(QueryMetaRedirectHelperTest, QueryMetaWithRedirectAndMovingRunsPrimaryThenR
         if (enableRedirect) {
             ++primaryQueries;
             EXPECT_EQ(metaAddress.ToString(), "127.0.0.1:9100");
-            queryRsp.add_query_metas()->mutable_meta()->set_object_key("primary");
+            auto *primaryMeta = queryRsp.add_query_metas();
+            primaryMeta->mutable_meta()->set_object_key("primary");
+            primaryMeta->add_payload_indexs(0);
             auto *info = queryRsp.add_info();
             info->set_redirect_meta_address("127.0.0.1:9200");
             *info->add_change_meta_ids() = "redirected";
@@ -146,7 +158,9 @@ TEST(QueryMetaRedirectHelperTest, QueryMetaWithRedirectAndMovingRunsPrimaryThenR
             return Status::OK();
         }
         ++redirectQueries;
-        queryRsp.add_query_metas()->mutable_meta()->set_object_key("redirected");
+        auto *redirectMeta = queryRsp.add_query_metas();
+        redirectMeta->mutable_meta()->set_object_key("redirected");
+        redirectMeta->add_payload_indexs(0);
         queryPayloads.emplace_back();
         return Status::OK();
     };
@@ -160,6 +174,49 @@ TEST(QueryMetaRedirectHelperTest, QueryMetaWithRedirectAndMovingRunsPrimaryThenR
     EXPECT_EQ(redirectQueries, 1);
     ASSERT_EQ(rsp.query_metas_size(), 2);
     EXPECT_EQ(payloads.size(), 2U);
+    EXPECT_EQ(rsp.query_metas(0).payload_indexs_size(), 1);
+    EXPECT_EQ(rsp.query_metas(0).payload_indexs(0), 0U);
+    EXPECT_EQ(rsp.query_metas(1).payload_indexs_size(), 1);
+    EXPECT_EQ(rsp.query_metas(1).payload_indexs(0), 1U);
+}
+
+TEST(QueryMetaRedirectHelperTest, QueryMetaWithRedirectAndMovingOffsetsRedirectPayloadIndexesWhenPrimaryHasPayload)
+{
+    master::QueryMetaRspPb rsp;
+    std::vector<RpcMessage> payloads;
+
+    object_cache::QueryMetaAtMasterFn queryMeta = [&](const HostPort &, const std::vector<std::string> &,
+                                        bool enableRedirect, master::QueryMetaRspPb &queryRsp,
+                                        std::vector<RpcMessage> &queryPayloads) -> Status {
+        if (enableRedirect) {
+            auto *primaryMeta = queryRsp.add_query_metas();
+            primaryMeta->mutable_meta()->set_object_key("primary");
+            primaryMeta->add_payload_indexs(0);
+            auto *info = queryRsp.add_info();
+            info->set_redirect_meta_address("127.0.0.1:9200");
+            *info->add_change_meta_ids() = "redirected";
+            queryPayloads.emplace_back();
+            return Status::OK();
+        }
+        auto *redirectMeta = queryRsp.add_query_metas();
+        redirectMeta->mutable_meta()->set_object_key("redirected");
+        redirectMeta->add_payload_indexs(0);
+        queryPayloads.emplace_back();
+        return Status::OK();
+    };
+
+    HostPort primaryAddress;
+    ASSERT_TRUE(primaryAddress.ParseString("127.0.0.1:9100").IsOk());
+    ASSERT_TRUE(object_cache::QueryMetaWithRedirectAndMoving(primaryAddress, { "primary" }, queryMeta, {}, {}, rsp,
+                                                             payloads)
+                    .IsOk());
+
+    ASSERT_EQ(rsp.query_metas_size(), 2);
+    ASSERT_EQ(payloads.size(), 2U);
+    EXPECT_EQ(rsp.query_metas(0).meta().object_key(), "primary");
+    EXPECT_EQ(rsp.query_metas(0).payload_indexs(0), 0U);
+    EXPECT_EQ(rsp.query_metas(1).meta().object_key(), "redirected");
+    EXPECT_EQ(rsp.query_metas(1).payload_indexs(0), 1U);
 }
 
 TEST(QueryMetaRedirectHelperTest, FollowQueryMetaRedirectsRejectsEmptyRedirectAddress)

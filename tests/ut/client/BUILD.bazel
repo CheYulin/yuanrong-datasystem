@@ -3,6 +3,16 @@ load("//bazel:build_defs.bzl", "ds_cc_test")
 package(default_visibility = ["//visibility:public"])
 
 ds_cc_test(
+    name = "direct_read_fallback_test",
+    srcs = ["direct_read_fallback_test.cpp"],
+    deps = [
+        "//src/datasystem/client/object_cache:object_client",
+        "//src/datasystem/worker:add_miss_libs_fixme",
+        "//tests/ut:ut_common",
+    ],
+)
+
+ds_cc_test(
     name = "mmap_manager_test",
     srcs = ["mmap_manager_test.cpp"],
     deps = [

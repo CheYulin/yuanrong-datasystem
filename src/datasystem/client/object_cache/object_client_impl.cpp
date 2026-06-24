@@ -1406,6 +1406,19 @@ bool ObjectClientImpl::HasHealthyLocalWorker()
     return listenWorker_[LOCAL_WORKER]->CheckWorkerAvailable().IsOk();
 }
 
+ClientHashRingSource *ObjectClientImpl::GetDirectReadRingSource(const std::shared_ptr<IClientWorkerApi> &workerApi)
+{
+    if (directReadRpcAdapter_ == nullptr) {
+        directReadRpcAdapter_ = std::make_unique<DirectReadRpcAdapter>(cred_, signature_.get(), requestTimeoutMs_);
+    }
+    if (directReadRingSource_ == nullptr || directReadRingWorkerApi_.lock() != workerApi) {
+        directReadRingSource_ = std::make_unique<ClientHashRingSource>(workerApi, directReadRpcAdapter_.get());
+        directReadRingWorkerApi_ = workerApi;
+        lastCutbackEvalRingVersion_ = -1;
+    }
+    return directReadRingSource_.get();
+}
+
 bool ObjectClientImpl::TryDirectReadCutbackToLocalWorker(const std::shared_ptr<IClientWorkerApi> &workerApi)
 {
     if (!FLAGS_enable_client_direct_read || DirectReadTestHook::ForceDirectRead()) {
@@ -1423,12 +1436,8 @@ bool ObjectClientImpl::TryDirectReadCutbackToLocalWorker(const std::shared_ptr<I
     }
 
     if (FLAGS_enable_distributed_master) {
-        DirectReadRpcAdapter rpcAdapter(cred_, signature_.get(), requestTimeoutMs_);
-        ClientHashRingSource ringSource(workerApi, &rpcAdapter);
-        if (ringSource.RefreshForRouteLookup().IsError()
-            || !ringSource.ViewForTest().HasHealthyWorkerAtAddress(localAddress)) {
-            return false;
-        }
+        ClientHashRingSource *ringSource = GetDirectReadRingSource(workerApi);
+        (void)ringSource->RefreshOnClusterEvent();
     }
 
     if (!RecoverPreferredLocalWorker()) {
@@ -2694,7 +2703,8 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
                        .isRH2DSupported = isRH2DSupported };
     if (ShouldTryDirectRead(workerApi)) {
         DirectReadTestHook::RecordDirectAttempt();
-        DirectReadFlow directReadFlow(workerApi, cred_, signature_.get(), requestTimeoutMs_);
+        ClientHashRingSource *ringSource = GetDirectReadRingSource(workerApi);
+        DirectReadFlow directReadFlow(workerApi, cred_, signature_.get(), requestTimeoutMs_, ringSource);
         Status directRc = directReadFlow.Get(
             getParam, objectBuffers, [this](const GetParam &param, GetRspPb &rsp, std::vector<RpcMessage> &payloads,
                                             std::vector<std::shared_ptr<Buffer>> &buffers) {

@@ -51,7 +51,7 @@ public:
     static constexpr const char *kRouteUnavailableFallbackReason = "route_unavailable";
 
     DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
-                   int32_t requestTimeoutMs);
+                   int32_t requestTimeoutMs, ClientHashRingSource *sharedRingSource = nullptr);
 
     Status Get(const GetParam &getParam, std::vector<std::shared_ptr<Buffer>> &buffers,
                const DirectReadFinishGetFn &finishGet);
@@ -61,11 +61,12 @@ private:
 
     Status ExecuteDataPhase(const GetParam &getParam, ObjectReadAccessMetaResult &metaResult, GetRspPb &getRsp,
                             std::vector<RpcMessage> &outPayloads);
+
     std::shared_ptr<IClientWorkerApi> workerApi_;
     DirectReadRpcAdapter rpcAdapter_;
     DirectReadRouteProvider routeProvider_;
     std::shared_ptr<DirectReadRouteProviderAdapter> routeAdapter_;
-    std::shared_ptr<DirectReadMetaClientAdapter> metaAdapter_;
+    std::shared_ptr<IObjectReadMetaClient> metaClient_;
     std::shared_ptr<DirectReadDataClientAdapter> dataAdapter_;
     ObjectReadAccessFlow accessFlow_;
 };

@@ -22,10 +22,13 @@
 #include <algorithm>
 #include <utility>
 
+#include "datasystem/client/object_cache/direct_read/client_direct_read_meta_options.h"
+#include "datasystem/client/object_cache/direct_read/client_query_meta_transport.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_fallback.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
 #include "datasystem/common/flags/flags.h"
 #include "datasystem/common/object_cache/object_bitmap.h"
+#include "datasystem/common/object_cache/read_access/query_meta_orchestrating_meta_client.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/protos/object_posix.pb.h"
 
@@ -103,21 +106,30 @@ const master::QueryMetaInfoPb *FindQueryMeta(const master::QueryMetaRspPb &metaR
     return nullptr;
 }
 
-int32_t MaxControlPlaneRetries()
+std::shared_ptr<IObjectReadMetaClient> CreateDirectReadMetaClient(RpcCredential cred, Signature *signature,
+                                                                  int32_t requestTimeoutMs,
+                                                                  const HostPort &clientWorkerAddress,
+                                                                  DirectReadRouteProvider *routeProvider)
 {
-    return std::max(0, FLAGS_client_direct_read_retry_count);
+    auto transport = std::make_shared<ClientQueryMetaTransport>(std::move(cred), signature, requestTimeoutMs,
+                                                                clientWorkerAddress);
+    std::function<Status()> refreshRoute = [routeProvider]() { return routeProvider->RefreshRouteOnClusterEvent(); };
+    return std::make_shared<QueryMetaOrchestratingMetaClient>(
+        transport, BuildClientDirectReadMetaOptions(routeProvider, std::move(refreshRoute)));
 }
 }  // namespace
 
 DirectReadFlow::DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
-                               int32_t requestTimeoutMs)
+                               int32_t requestTimeoutMs, ClientHashRingSource *sharedRingSource)
     : workerApi_(std::move(workerApi)),
-      rpcAdapter_(std::move(cred), signature, requestTimeoutMs),
-      routeProvider_(workerApi_, &rpcAdapter_),
+      rpcAdapter_(cred, signature, requestTimeoutMs),
+      routeProvider_(sharedRingSource != nullptr ? DirectReadRouteProvider(*sharedRingSource)
+                                                 : DirectReadRouteProvider(workerApi_, &rpcAdapter_)),
       routeAdapter_(std::make_shared<DirectReadRouteProviderAdapter>(&routeProvider_)),
-      metaAdapter_(std::make_shared<DirectReadMetaClientAdapter>(&rpcAdapter_, workerApi_->hostPort_, &routeProvider_)),
+      metaClient_(CreateDirectReadMetaClient(cred, signature, requestTimeoutMs, workerApi_->hostPort_,
+                                             &routeProvider_)),
       dataAdapter_(std::make_shared<DirectReadDataClientAdapter>(&rpcAdapter_)),
-      accessFlow_(routeAdapter_, metaAdapter_, dataAdapter_)
+      accessFlow_(routeAdapter_, metaClient_, dataAdapter_)
 {
 }
 
@@ -125,21 +137,17 @@ Status DirectReadFlow::ExecuteMetaPhaseWithRetry(const ObjectReadAccessRequest &
                                                  ObjectReadAccessMetaResult &result)
 {
     Status lastRc = Status::OK();
-    const int32_t maxRetries = MaxControlPlaneRetries();
+    const int32_t maxRetries = std::max(0, FLAGS_client_direct_read_retry_count);
     for (int32_t attempt = 0; attempt <= maxRetries; ++attempt) {
         lastRc = accessFlow_.ExecuteMetaPhase(request, result);
         if (lastRc.IsOk()) {
             return Status::OK();
         }
-        if (!DirectReadFallback::IsRetriableControlPlaneFailure(lastRc) || attempt == maxRetries) {
+        if (!DirectReadFallback::IsOuterMetaPhaseRetriable(lastRc) || attempt == maxRetries) {
             return DirectReadFallback::ToPathFallbackStatus(lastRc);
         }
-        if (lastRc.GetCode() == K_NOT_READY) {
-            DirectReadTestHook::RecordStaleRouteRetry();
-        } else if (lastRc.GetCode() == K_TRY_AGAIN) {
-            DirectReadTestHook::RecordMovingRetry();
-        }
-        RETURN_IF_NOT_OK(routeProvider_.RefreshRouteIfNeeded());
+        DirectReadTestHook::RecordStaleRouteRetry();
+        RETURN_IF_NOT_OK(routeProvider_.RefreshRouteOnClusterEvent());
     }
     return DirectReadFallback::ToPathFallbackStatus(lastRc);
 }
