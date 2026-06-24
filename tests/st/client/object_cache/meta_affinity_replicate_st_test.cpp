@@ -54,6 +54,8 @@ protected:
     {
         OCClientCommon::SetUp();
         db_ = InitTestEtcdInstance();
+        SetWorkerHashInjection();
+        std::this_thread::sleep_for(std::chrono::seconds(2));
         InitMasterApis();
     }
 
@@ -63,7 +65,11 @@ protected:
         akSkManager_ = std::make_shared<AkSkManager>();
         akSkManager_->SetClientAkSk(accessKey_, secretKey_);
         RpcStubCacheMgr::Instance().Init(100);
+        DS_ASSERT_OK(cluster_->GetWorkerAddr(0, worker0Address_));
         DS_ASSERT_OK(cluster_->GetWorkerAddr(1, worker1Address_));
+        worker0MasterApi_ =
+            std::make_unique<worker::WorkerRemoteMasterOCApi>(worker0Address_, hostPort_, akSkManager_);
+        DS_ASSERT_OK(worker0MasterApi_->Init());
         worker1MasterApi_ =
             std::make_unique<worker::WorkerRemoteMasterOCApi>(worker1Address_, hostPort_, akSkManager_);
         DS_ASSERT_OK(worker1MasterApi_->Init());
@@ -72,16 +78,19 @@ protected:
     Status QueryPrimaryAddress(const std::string &objectKey, std::string &primaryAddress)
     {
         master::QueryMetaReqPb queryReq;
-        master::QueryMetaRspPb queryRsp;
         queryReq.add_ids(objectKey);
         queryReq.set_address(hostPort_.ToString());
         std::vector<RpcMessage> payloads;
-        RETURN_IF_NOT_OK(worker1MasterApi_->QueryMeta(queryReq, 0, queryRsp, payloads));
-        if (queryRsp.query_metas_size() == 0) {
-            return Status(K_NOT_FOUND, "meta not found");
+        for (auto *api : { worker0MasterApi_.get(), worker1MasterApi_.get() }) {
+            master::QueryMetaRspPb queryRsp;
+            payloads.clear();
+            Status status = api->QueryMeta(queryReq, 0, queryRsp, payloads);
+            if (status.IsOk() && queryRsp.query_metas_size() > 0) {
+                primaryAddress = queryRsp.query_metas(0).meta().primary_address();
+                return Status::OK();
+            }
         }
-        primaryAddress = queryRsp.query_metas(0).meta().primary_address();
-        return Status::OK();
+        return Status(K_NOT_FOUND, "meta not found");
     }
 
     void WaitUntilPrimaryIs(const std::string &objectKey, const std::string &expectedPrimary)
@@ -99,8 +108,10 @@ protected:
 
     std::unique_ptr<EtcdStore> db_;
     HostPort hostPort_;
+    HostPort worker0Address_;
     HostPort worker1Address_;
     std::shared_ptr<AkSkManager> akSkManager_;
+    std::unique_ptr<worker::WorkerRemoteMasterOCApi> worker0MasterApi_;
     std::unique_ptr<worker::WorkerRemoteMasterOCApi> worker1MasterApi_;
     std::string accessKey_ = "QTWAOYTTINDUT2QVKYUC";
     std::string secretKey_ = "MFyfvK41ba2giqM7**********KGpownRZlmVmHc";
