@@ -15,7 +15,7 @@
  */
 
 /**
- * Description: Worker helper for ObjectReadAccessFlow meta phase.
+ * Description: Worker helper for ObjectReadMetaAccessFlow meta phase.
  */
 #ifndef DATASYSTEM_WORKER_OBJECT_CACHE_SERVICE_WORKER_OBJECT_READ_ACCESS_HELPER_H
 #define DATASYSTEM_WORKER_OBJECT_CACHE_SERVICE_WORKER_OBJECT_READ_ACCESS_HELPER_H

@@ -29,6 +29,7 @@
 #include "datasystem/common/flags/flags.h"
 #include "datasystem/common/object_cache/object_bitmap.h"
 #include "datasystem/common/object_cache/read_access/query_meta_orchestrating_meta_client.h"
+#include "datasystem/common/object_cache/read_access/object_read_data_access.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/protos/object_posix.pb.h"
 
@@ -58,18 +59,19 @@ void FillPayloadInfoFromMeta(const master::QueryMetaInfoPb &queryMeta, const Get
     info.set_cache_type(meta.config().cache_type());
 }
 
-Status AppendInlinePayloads(const master::QueryMetaInfoPb &queryMeta, std::vector<RpcMessage> &metaPayloads,
-                            std::vector<RpcMessage> &outPayloads, GetRspPb::PayloadInfoPb &info)
+Status AppendInlinePayloadsToGetRsp(const master::QueryMetaInfoPb &queryMeta, std::vector<RpcMessage> &fetchedPayloads,
+                                    std::vector<RpcMessage> &outPayloads, GetRspPb::PayloadInfoPb &info)
 {
     const auto startIndex = outPayloads.size();
-    for (const auto idx : queryMeta.payload_indexs()) {
-        CHECK_FAIL_RETURN_STATUS(idx < metaPayloads.size(), K_RUNTIME_ERROR, "Invalid inline payload index from meta");
-        outPayloads.emplace_back(std::move(metaPayloads[idx]));
+    for (auto &payload : fetchedPayloads) {
+        outPayloads.emplace_back(std::move(payload));
     }
+    fetchedPayloads.clear();
     for (size_t index = startIndex; index < outPayloads.size(); ++index) {
         info.add_part_index(static_cast<uint32_t>(index));
     }
     CHECK_FAIL_RETURN_STATUS(!info.part_index().empty(), K_RUNTIME_ERROR, "Inline meta payload is empty");
+    (void)queryMeta;
     return Status::OK();
 }
 
@@ -120,16 +122,17 @@ std::shared_ptr<IObjectReadMetaClient> CreateDirectReadMetaClient(RpcCredential 
 }  // namespace
 
 DirectReadFlow::DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
-                               int32_t requestTimeoutMs, ClientHashRingSource *sharedRingSource)
+                               int32_t requestTimeoutMs, std::shared_ptr<ClientHashRingSource> sharedRingSource,
+                               std::shared_ptr<DirectReadRpcAdapter> sharedRpcAdapter)
     : workerApi_(std::move(workerApi)),
-      rpcAdapter_(cred, signature, requestTimeoutMs),
-      routeProvider_(sharedRingSource != nullptr ? DirectReadRouteProvider(*sharedRingSource)
-                                                 : DirectReadRouteProvider(workerApi_, &rpcAdapter_)),
-      routeAdapter_(std::make_shared<DirectReadRouteProviderAdapter>(&routeProvider_)),
+      rpcAdapter_(std::move(sharedRpcAdapter)),
+      ringSource_(std::move(sharedRingSource)),
+      routeProvider_(ringSource_ != nullptr ? std::make_shared<DirectReadRouteProvider>(ringSource_)
+                                            : std::make_shared<DirectReadRouteProvider>(workerApi_, rpcAdapter_)),
       metaClient_(CreateDirectReadMetaClient(cred, signature, requestTimeoutMs, workerApi_->hostPort_,
-                                             &routeProvider_)),
-      dataAdapter_(std::make_shared<DirectReadDataClientAdapter>(&rpcAdapter_)),
-      accessFlow_(routeAdapter_, metaClient_, dataAdapter_)
+                                             routeProvider_.get())),
+      dataAdapter_(std::make_shared<DirectReadDataClientAdapter>(rpcAdapter_.get())),
+      metaAccessFlow_(routeProvider_, metaClient_)
 {
 }
 
@@ -139,7 +142,7 @@ Status DirectReadFlow::ExecuteMetaPhaseWithRetry(const ObjectReadAccessRequest &
     Status lastRc = Status::OK();
     const int32_t maxRetries = std::max(0, FLAGS_client_direct_read_retry_count);
     for (int32_t attempt = 0; attempt <= maxRetries; ++attempt) {
-        lastRc = accessFlow_.ExecuteMetaPhase(request, result);
+        lastRc = metaAccessFlow_.ExecuteMetaPhase(request, result);
         if (lastRc.IsOk()) {
             return Status::OK();
         }
@@ -147,7 +150,7 @@ Status DirectReadFlow::ExecuteMetaPhaseWithRetry(const ObjectReadAccessRequest &
             return DirectReadFallback::ToPathFallbackStatus(lastRc);
         }
         DirectReadTestHook::RecordStaleRouteRetry();
-        RETURN_IF_NOT_OK(routeProvider_.RefreshRouteOnClusterEvent());
+        RETURN_IF_NOT_OK(routeProvider_->RefreshRouteOnClusterEvent());
     }
     return DirectReadFallback::ToPathFallbackStatus(lastRc);
 }
@@ -180,20 +183,40 @@ Status DirectReadFlow::ExecuteDataPhase(const GetParam &getParam, ObjectReadAcce
 
         auto *payloadInfo = getRsp.add_payload_info();
         FillPayloadInfoFromMeta(*queryMeta, getParam, objectIndex, *payloadInfo);
-        DirectReadTestHook::RecordDataQuery();
 
-        const bool useInlinePayload =
-            queryMeta->payload_indexs_size() > 0 && !DirectReadTestHook::PreferRemoteDataGet();
-        if (useInlinePayload) {
-            RETURN_IF_NOT_OK(AppendInlinePayloads(*queryMeta, metaResult.metaPayloads, outPayloads, *payloadInfo));
-            continue;
+        ObjectReadSpec spec;
+        if (!getParam.readParams.empty() && objectIndex < getParam.readParams.size()) {
+            spec.readOffset = getParam.readParams[objectIndex].offset;
+            spec.readSize = getParam.readParams[objectIndex].size;
+        } else {
+            spec.readSize = queryMeta->meta().data_size();
         }
 
+        dataAdapter_->SetObjectIndex(objectIndex);
+        std::vector<RpcMessage> fetchedPayloads;
         GetObjectRemoteRspPb remoteRsp;
-        std::vector<RpcMessage> remotePayloads;
-        RETURN_IF_NOT_OK(
-            dataAdapter_->ReadData(*queryMeta, getParam.subTimeoutMs, objectIndex, remoteRsp, remotePayloads));
-        RETURN_IF_NOT_OK(AppendRemotePayloads(remoteRsp, remotePayloads, outPayloads, *payloadInfo));
+        ObjectReadL0Outcome l0Outcome = ObjectReadL0Outcome::kRemote;
+
+        if (DirectReadTestHook::PreferRemoteDataGet()) {
+            DirectReadTestHook::RecordDataQuery();
+            RETURN_IF_NOT_OK(dataAdapter_->FetchRemote(*queryMeta, spec, remoteRsp, fetchedPayloads));
+            l0Outcome = ObjectReadL0Outcome::kRemote;
+        } else {
+            RETURN_IF_NOT_OK(FetchObjectReadData(*queryMeta, spec, metaResult.metaPayloads, *dataAdapter_,
+                                                 fetchedPayloads, &remoteRsp, &l0Outcome));
+            if (l0Outcome == ObjectReadL0Outcome::kRemote) {
+                DirectReadTestHook::RecordDataQuery();
+            } else if (l0Outcome == ObjectReadL0Outcome::kInlineHit) {
+                DirectReadTestHook::RecordInlineDataHit();
+            }
+        }
+
+        if (l0Outcome == ObjectReadL0Outcome::kRemote) {
+            RETURN_IF_NOT_OK(AppendRemotePayloads(remoteRsp, fetchedPayloads, outPayloads, *payloadInfo));
+        } else {
+            RETURN_IF_NOT_OK(
+                AppendInlinePayloadsToGetRsp(*queryMeta, fetchedPayloads, outPayloads, *payloadInfo));
+        }
     }
     return Status::OK();
 }

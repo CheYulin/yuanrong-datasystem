@@ -65,6 +65,47 @@ Status ResolvePrimaryWorkerAddr(const std::map<uint32_t, std::string> &tokenMap,
     workerAddr = tokenMap.begin()->second;
     return Status::OK();
 }
+
+bool IsHealthyWorkerState(int state)
+{
+    return state == WorkerPb::ACTIVE || state == WorkerPb::LEAVING;
+}
+
+bool IsJoinableWorkerState(int state)
+{
+    return state == WorkerPb::ACTIVE || state == WorkerPb::LEAVING || state == WorkerPb::JOINING;
+}
+
+const WorkerPb *FindWorkerPbAtAddress(const HashRingPb &ringInfo,
+                                      const std::map<std::string, HostPort> &workerUuid2AddrMap,
+                                      const HostPort &workerAddress)
+{
+    const auto exact = ringInfo.workers().find(workerAddress.ToString());
+    if (exact != ringInfo.workers().end()) {
+        return &exact->second;
+    }
+    for (const auto &kv : ringInfo.workers()) {
+        HostPort mappedAddress;
+        if (!kv.second.worker_uuid().empty()) {
+            const auto uuidIt = workerUuid2AddrMap.find(kv.second.worker_uuid());
+            if (uuidIt != workerUuid2AddrMap.end()) {
+                mappedAddress = uuidIt->second;
+            } else {
+                const auto semi = kv.first.find(';');
+                const std::string hostPortStr = semi == std::string::npos ? kv.first : kv.first.substr(0, semi);
+                if (!mappedAddress.ParseString(hostPortStr).IsOk()) {
+                    continue;
+                }
+            }
+        } else if (!mappedAddress.ParseString(kv.first).IsOk()) {
+            continue;
+        }
+        if (mappedAddress == workerAddress) {
+            return &kv.second;
+        }
+    }
+    return nullptr;
+}
 }  // namespace
 
 bool ReadOnlyHashRingView::HasSnapshot() const
@@ -115,6 +156,12 @@ Status ReadOnlyHashRingView::UpdateFromPb(const HashRingPb &ring, int64_t versio
 {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     const int64_t previousVersion = version_;
+    if (version_ >= 0 && version < 0) {
+        if (versionChanged != nullptr) {
+            *versionChanged = false;
+        }
+        return Status::OK();
+    }
     if (version_ >= 0 && version >= 0 && version < version_) {
         if (versionChanged != nullptr) {
             *versionChanged = false;
@@ -181,23 +228,15 @@ Status ReadOnlyHashRingView::GetMetaAddress(const std::string &objectKey, HostPo
 bool ReadOnlyHashRingView::HasHealthyWorkerAtAddress(const HostPort &workerAddress) const
 {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    const auto iter = ringInfo_.workers().find(workerAddress.ToString());
-    if (iter == ringInfo_.workers().end()) {
-        return false;
-    }
-    const auto state = iter->second.state();
-    return state == WorkerPb::ACTIVE || state == WorkerPb::LEAVING;
+    const WorkerPb *workerPb = FindWorkerPbAtAddress(ringInfo_, workerUuid2AddrMap_, workerAddress);
+    return workerPb != nullptr && IsHealthyWorkerState(workerPb->state());
 }
 
 bool ReadOnlyHashRingView::HasJoinableWorkerAtAddress(const HostPort &workerAddress) const
 {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    const auto iter = ringInfo_.workers().find(workerAddress.ToString());
-    if (iter == ringInfo_.workers().end()) {
-        return false;
-    }
-    const auto state = iter->second.state();
-    return state == WorkerPb::ACTIVE || state == WorkerPb::LEAVING || state == WorkerPb::JOINING;
+    const WorkerPb *workerPb = FindWorkerPbAtAddress(ringInfo_, workerUuid2AddrMap_, workerAddress);
+    return workerPb != nullptr && IsJoinableWorkerState(workerPb->state());
 }
 
 void ReadOnlyHashRingView::RebuildDerivedMapsLocked()

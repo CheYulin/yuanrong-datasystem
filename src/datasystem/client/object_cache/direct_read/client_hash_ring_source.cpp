@@ -44,8 +44,8 @@ std::string ResolveEtcdAddress()
 }  // namespace
 
 ClientHashRingSource::ClientHashRingSource(std::shared_ptr<IClientWorkerApi> workerApi,
-                                           DirectReadRpcAdapter *rpcAdapter)
-    : workerApi_(std::move(workerApi)), rpcAdapter_(rpcAdapter)
+                                           std::shared_ptr<DirectReadRpcAdapter> rpcAdapter)
+    : workerApi_(std::move(workerApi)), rpcAdapter_(std::move(rpcAdapter))
 {
 }
 

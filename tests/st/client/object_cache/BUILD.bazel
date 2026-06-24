@@ -260,7 +260,7 @@ ds_st_cc_test(
     timeout = "long",
     deps = OC_CLIENT_COMMON_DEPS + [
         "//src/datasystem/client/object_cache:object_client",
-        "//src/datasystem/common/object_cache:object_read_access_flow",
+        "//src/datasystem/common/object_cache:object_read_meta_access_flow",
         "//src/datasystem/common/util:timer",
         "//src/datasystem/worker:add_miss_libs_fixme",
         "//tests/st/cluster:st_cluster",

@@ -27,21 +27,19 @@
 namespace datasystem {
 namespace object_cache {
 DirectReadRouteProvider::DirectReadRouteProvider(std::shared_ptr<IClientWorkerApi> workerApi,
-                                                 DirectReadRpcAdapter *rpcAdapter)
-    : hashRingSourcePtr_(nullptr),
-      ownedRingSource_(std::make_unique<ClientHashRingSource>(std::move(workerApi), rpcAdapter))
+                                                 std::shared_ptr<DirectReadRpcAdapter> rpcAdapter)
+    : ringSource_(std::make_shared<ClientHashRingSource>(std::move(workerApi), std::move(rpcAdapter)))
 {
-    hashRingSourcePtr_ = ownedRingSource_.get();
 }
 
-DirectReadRouteProvider::DirectReadRouteProvider(ClientHashRingSource &sharedRingSource)
-    : hashRingSourcePtr_(&sharedRingSource), ownedRingSource_(nullptr)
+DirectReadRouteProvider::DirectReadRouteProvider(std::shared_ptr<ClientHashRingSource> sharedRingSource)
+    : ringSource_(std::move(sharedRingSource))
 {
 }
 
 ClientHashRingSource &DirectReadRouteProvider::RingSource()
 {
-    return *hashRingSourcePtr_;
+    return *ringSource_;
 }
 
 Status DirectReadRouteProvider::GetMetaAddress(const GetParam &getParam, HostPort &metaAddress)

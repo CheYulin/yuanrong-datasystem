@@ -690,7 +690,14 @@ Status WorkerWorkerOCServiceImpl::GetClusterState(const GetClusterStateReqPb &re
     bool isEtcdAvailable = etcdStore_->Writable().IsOk();
     rsp.set_etcd_available(isEtcdAvailable);
     RETURN_RUNTIME_ERROR_IF_NULL(etcdCm_);
-    *rsp.mutable_hash_ring() = etcdCm_->GetHashRing()->GetHashRingPb();
+    worker::HashRing *hashRing = etcdCm_->GetHashRing();
+    RETURN_RUNTIME_ERROR_IF_NULL(hashRing);
+    *rsp.mutable_hash_ring() = hashRing->GetHashRingPb();
+    const int64_t ringEtcdModRevision = hashRing->GetRingEtcdModRevision();
+    if (ringEtcdModRevision >= 0) {
+        rsp.set_ring_etcd_mod_revision(ringEtcdModRevision);
+    }
+    rsp.set_ring_local_version(hashRing->GetCurrHashRingVersion());
     LOG_IF(INFO, isEtcdAvailable) << "Etcd is available";
     return Status::OK();
 }

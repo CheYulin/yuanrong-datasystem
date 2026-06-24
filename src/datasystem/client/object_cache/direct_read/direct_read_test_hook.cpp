@@ -102,6 +102,12 @@ void DirectReadTestHook::RecordDataQuery()
     ++g_directReadStats.dataQueryCount;
 }
 
+void DirectReadTestHook::RecordInlineDataHit()
+{
+    std::lock_guard<std::mutex> lock(g_directReadStatsMutex);
+    ++g_directReadStats.inlineDataHitCount;
+}
+
 void DirectReadTestHook::SetPreferRemoteDataGet(bool enabled)
 {
     std::lock_guard<std::mutex> lock(g_directReadStatsMutex);

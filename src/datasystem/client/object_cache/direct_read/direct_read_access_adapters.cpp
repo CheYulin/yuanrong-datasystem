@@ -15,7 +15,7 @@
  */
 
 /**
- * Description: Client adapters for ObjectReadAccessFlow.
+ * Description: Client data-phase helper for direct read.
  */
 #include "datasystem/client/object_cache/direct_read/direct_read_access_adapters.h"
 
@@ -24,22 +24,6 @@
 
 namespace datasystem {
 namespace object_cache {
-DirectReadRouteProviderAdapter::DirectReadRouteProviderAdapter(DirectReadRouteProvider *provider) : provider_(provider)
-{
-}
-
-Status DirectReadRouteProviderAdapter::GetMetaAddress(const std::string &objectKey, HostPort &metaAddress)
-{
-    RETURN_RUNTIME_ERROR_IF_NULL(provider_);
-    return provider_->GetMetaAddress(objectKey, metaAddress);
-}
-
-Status DirectReadRouteProviderAdapter::RefreshRouteIfNeeded()
-{
-    RETURN_RUNTIME_ERROR_IF_NULL(provider_);
-    return provider_->RefreshRouteIfNeeded();
-}
-
 DirectReadDataClientAdapter::DirectReadDataClientAdapter(DirectReadRpcAdapter *rpcAdapter) : rpcAdapter_(rpcAdapter)
 {
 }
@@ -49,11 +33,23 @@ void DirectReadDataClientAdapter::SetGetParam(const GetParam *getParam)
     getParam_ = getParam;
 }
 
+void DirectReadDataClientAdapter::SetObjectIndex(size_t objectIndex)
+{
+    objectIndex_ = objectIndex;
+}
+
+Status DirectReadDataClientAdapter::FetchRemote(const master::QueryMetaInfoPb &queryMeta, const ObjectReadSpec &spec,
+                                              GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads)
+{
+    (void)spec;
+    RETURN_RUNTIME_ERROR_IF_NULL(getParam_);
+    return ReadData(queryMeta, getParam_->subTimeoutMs, objectIndex_, rsp, payloads);
+}
+
 Status DirectReadDataClientAdapter::ReadData(const master::QueryMetaInfoPb &queryMeta, int64_t subTimeoutMs,
                                              size_t objectIndex, GetObjectRemoteRspPb &rsp,
                                              std::vector<RpcMessage> &payloads)
 {
-    (void)subTimeoutMs;
     RETURN_RUNTIME_ERROR_IF_NULL(rpcAdapter_);
     RETURN_RUNTIME_ERROR_IF_NULL(getParam_);
     if (queryMeta.address().empty()) {
@@ -61,7 +57,8 @@ Status DirectReadDataClientAdapter::ReadData(const master::QueryMetaInfoPb &quer
     }
     HostPort dataAddress;
     RETURN_IF_NOT_OK(dataAddress.ParseString(queryMeta.address()));
-    Status remoteRc = rpcAdapter_->GetObjectRemoteTcp(dataAddress, queryMeta, *getParam_, objectIndex, rsp, payloads);
+    Status remoteRc =
+        rpcAdapter_->GetObjectRemoteTcp(dataAddress, queryMeta, *getParam_, objectIndex, subTimeoutMs, rsp, payloads);
     if (remoteRc.IsError()) {
         return Status(remoteRc.GetCode(), DirectReadFlow::kDataWorkerUnavailableFallbackReason);
     }

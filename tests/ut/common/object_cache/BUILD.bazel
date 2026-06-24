@@ -61,10 +61,19 @@ ds_cc_test(
 )
 
 ds_cc_test(
-    name = "object_read_access_flow_test",
-    srcs = ["object_read_access_flow_test.cpp"],
+    name = "object_read_data_access_test",
+    srcs = ["object_read_data_access_test.cpp"],
     deps = [
-        "//src/datasystem/common/object_cache:object_read_access_flow",
+        "//src/datasystem/common/object_cache:object_read_data_access",
+        "//tests/ut:ut_common",
+    ],
+)
+
+ds_cc_test(
+    name = "object_read_meta_access_flow_test",
+    srcs = ["object_read_meta_access_flow_test.cpp"],
+    deps = [
+        "//src/datasystem/common/object_cache:object_read_meta_access_flow",
         "//tests/ut:ut_common",
     ],
 )

@@ -30,6 +30,7 @@ struct DirectReadStats {
     uint64_t routeQueryCount = 0;
     uint64_t metaQueryCount = 0;
     uint64_t dataQueryCount = 0;
+    uint64_t inlineDataHitCount = 0;
     uint64_t hashRingEtcdRefreshCount = 0;
     uint64_t hashRingWorkerRefreshCount = 0;
     uint64_t movingRetryCount = 0;
@@ -50,6 +51,7 @@ public:
     static void RecordRouteQuery();
     static void RecordMetaQuery();
     static void RecordDataQuery();
+    static void RecordInlineDataHit();
     static void SetPreferRemoteDataGet(bool enabled);
     static bool PreferRemoteDataGet();
     static void RecordHashRingEtcdRefresh();

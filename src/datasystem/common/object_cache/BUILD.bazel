@@ -99,9 +99,21 @@ ds_cc_library(
 )
 
 ds_cc_library(
-    name = "object_read_access_flow",
-    srcs = ["read_access/object_read_access_flow.cpp"],
-    hdrs = ["read_access/object_read_access_flow.h"],
+    name = "object_read_data_access",
+    srcs = ["read_access/object_read_data_access.cpp"],
+    hdrs = ["read_access/object_read_data_access.h"],
+    deps = [
+        "//src/datasystem/common/rpc:rpc_message",
+        "//src/datasystem/common/util:status_helper",
+        "//src/datasystem/protos:master_object_cc_proto",
+        "//src/datasystem/protos:worker_object_cc_proto",
+    ],
+)
+
+ds_cc_library(
+    name = "object_read_meta_access_flow",
+    srcs = ["read_access/object_read_meta_access_flow.cpp"],
+    hdrs = ["read_access/object_read_meta_access_flow.h"],
     deps = [
         ":query_meta_merge_helper",
         "//src/datasystem/common/rpc:rpc_message",
@@ -145,7 +157,7 @@ ds_cc_library(
         "read_access/query_meta_transport.h",
     ],
     deps = [
-        ":object_read_access_flow",
+        ":object_read_meta_access_flow",
         ":query_meta_redirect_helper",
         "//src/datasystem/common/rpc:rpc_message",
         "//src/datasystem/common/util:net_util",

@@ -29,7 +29,7 @@
 #include "datasystem/client/object_cache/direct_read/direct_read_route_provider.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_rpc_adapter.h"
 #include "datasystem/common/ak_sk/signature.h"
-#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
+#include "datasystem/common/object_cache/read_access/object_read_meta_access_flow.h"
 #include "datasystem/common/rpc/rpc_credential.h"
 #include "datasystem/object/buffer.h"
 #include "datasystem/protos/object_posix.pb.h"
@@ -51,7 +51,8 @@ public:
     static constexpr const char *kRouteUnavailableFallbackReason = "route_unavailable";
 
     DirectReadFlow(std::shared_ptr<IClientWorkerApi> workerApi, RpcCredential cred, Signature *signature,
-                   int32_t requestTimeoutMs, ClientHashRingSource *sharedRingSource = nullptr);
+                   int32_t requestTimeoutMs, std::shared_ptr<ClientHashRingSource> sharedRingSource,
+                   std::shared_ptr<DirectReadRpcAdapter> sharedRpcAdapter);
 
     Status Get(const GetParam &getParam, std::vector<std::shared_ptr<Buffer>> &buffers,
                const DirectReadFinishGetFn &finishGet);
@@ -63,12 +64,12 @@ private:
                             std::vector<RpcMessage> &outPayloads);
 
     std::shared_ptr<IClientWorkerApi> workerApi_;
-    DirectReadRpcAdapter rpcAdapter_;
-    DirectReadRouteProvider routeProvider_;
-    std::shared_ptr<DirectReadRouteProviderAdapter> routeAdapter_;
+    std::shared_ptr<DirectReadRpcAdapter> rpcAdapter_;
+    std::shared_ptr<ClientHashRingSource> ringSource_;
+    std::shared_ptr<DirectReadRouteProvider> routeProvider_;
     std::shared_ptr<IObjectReadMetaClient> metaClient_;
     std::shared_ptr<DirectReadDataClientAdapter> dataAdapter_;
-    ObjectReadAccessFlow accessFlow_;
+    ObjectReadMetaAccessFlow metaAccessFlow_;
 };
 }  // namespace object_cache
 }  // namespace datasystem

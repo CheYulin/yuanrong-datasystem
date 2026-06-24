@@ -15,43 +15,38 @@
  */
 
 /**
- * Description: Client adapters for ObjectReadAccessFlow.
+ * Description: Client data-phase helper for direct read.
  */
 #ifndef DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_ACCESS_ADAPTERS_H
 #define DATASYSTEM_CLIENT_OBJECT_CACHE_DIRECT_READ_DIRECT_READ_ACCESS_ADAPTERS_H
 
 #include <vector>
 
-#include "datasystem/client/object_cache/direct_read/direct_read_route_provider.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_rpc_adapter.h"
-#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
-#include "datasystem/common/util/net_util.h"
+#include "datasystem/common/object_cache/read_access/object_read_data_access.h"
+#include "datasystem/protos/master_object.pb.h"
+#include "datasystem/protos/worker_object.pb.h"
+#include "datasystem/utils/status.h"
 
 namespace datasystem {
 namespace object_cache {
-class DirectReadRouteProviderAdapter : public IObjectReadRouteProvider {
-public:
-    explicit DirectReadRouteProviderAdapter(DirectReadRouteProvider *provider);
-
-    Status GetMetaAddress(const std::string &objectKey, HostPort &metaAddress) override;
-    Status RefreshRouteIfNeeded() override;
-
-private:
-    DirectReadRouteProvider *provider_;
-};
-
-class DirectReadDataClientAdapter : public IObjectReadDataClient {
+class DirectReadDataClientAdapter : public IObjectReadRemoteDataClient {
 public:
     explicit DirectReadDataClientAdapter(DirectReadRpcAdapter *rpcAdapter);
 
     void SetGetParam(const GetParam *getParam);
+    void SetObjectIndex(size_t objectIndex);
 
     Status ReadData(const master::QueryMetaInfoPb &queryMeta, int64_t subTimeoutMs, size_t objectIndex,
-                    GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads) override;
+                    GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads);
+
+    Status FetchRemote(const master::QueryMetaInfoPb &queryMeta, const ObjectReadSpec &spec,
+                       GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads) override;
 
 private:
     DirectReadRpcAdapter *rpcAdapter_;
     const GetParam *getParam_ = nullptr;
+    size_t objectIndex_ = 0;
 };
 }  // namespace object_cache
 }  // namespace datasystem

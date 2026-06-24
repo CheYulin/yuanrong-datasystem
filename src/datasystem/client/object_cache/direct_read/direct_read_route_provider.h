@@ -25,7 +25,7 @@
 #include "datasystem/client/object_cache/client_worker_api/iclient_worker_api.h"
 #include "datasystem/client/object_cache/direct_read/client_hash_ring_source.h"
 #include "datasystem/client/object_cache/direct_read/direct_read_rpc_adapter.h"
-#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
+#include "datasystem/common/object_cache/read_access/object_read_meta_access_flow.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/utils/status.h"
 
@@ -33,8 +33,9 @@ namespace datasystem {
 namespace object_cache {
 class DirectReadRouteProvider : public IObjectReadRouteProvider {
 public:
-    DirectReadRouteProvider(std::shared_ptr<IClientWorkerApi> workerApi, DirectReadRpcAdapter *rpcAdapter);
-    explicit DirectReadRouteProvider(ClientHashRingSource &sharedRingSource);
+    DirectReadRouteProvider(std::shared_ptr<IClientWorkerApi> workerApi,
+                            std::shared_ptr<DirectReadRpcAdapter> rpcAdapter);
+    explicit DirectReadRouteProvider(std::shared_ptr<ClientHashRingSource> sharedRingSource);
 
     Status GetMetaAddress(const GetParam &getParam, HostPort &metaAddress);
     Status GetMetaAddress(const std::string &objectKey, HostPort &metaAddress) override;
@@ -46,8 +47,7 @@ public:
 private:
     ClientHashRingSource &RingSource();
 
-    ClientHashRingSource *hashRingSourcePtr_;
-    std::unique_ptr<ClientHashRingSource> ownedRingSource_;
+    std::shared_ptr<ClientHashRingSource> ringSource_;
 };
 }  // namespace object_cache
 }  // namespace datasystem

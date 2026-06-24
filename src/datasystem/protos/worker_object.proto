@@ -94,6 +94,10 @@ message GetClusterStateReqPb {
 message GetClusterStateRspPb {
   bool etcd_available = 1;
   HashRingPb hash_ring = 2;
+  // etcd modRevision of hash_ring; same version space as Client LoadFromEtcd.
+  int64 ring_etcd_mod_revision = 3;
+  // Worker-local ring generation; used for gateway route cache invalidation (R3).
+  int64 ring_local_version = 4;
 }
 
 enum MigrateType {

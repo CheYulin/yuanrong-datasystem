@@ -4394,10 +4394,6 @@ void OCMetadataManager::TryGetObjectData(const std::string &objectKey, const Tbb
                                          uint64_t &payloadSize, QueryMetaInfoPb &queryMeta,
                                          std::vector<RpcMessage> &payloads)
 {
-    // don't try to query data if enable UB.
-    if (IsUrmaEnabled()) {
-        return;
-    }
     INJECT_POINT("ocMetaManager.noNeedGetFromLocal", []() { return; });
     constexpr uint64_t maxPayloadSize = 512 * 1024ul;
     if (localApi_ == nullptr) {

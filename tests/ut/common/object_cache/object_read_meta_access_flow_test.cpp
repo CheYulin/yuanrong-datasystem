@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
+#include "datasystem/common/object_cache/read_access/object_read_meta_access_flow.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/protos/master_object.pb.h"
@@ -68,29 +68,14 @@ public:
 
     int metaQueryCount = 0;
 };
-
-class FakeDataClient : public object_cache::IObjectReadDataClient {
-public:
-    Status ReadData(const master::QueryMetaInfoPb &queryMeta, int64_t subTimeoutMs, size_t objectIndex,
-                    GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads) override
-    {
-        (void)queryMeta;
-        (void)subTimeoutMs;
-        (void)objectIndex;
-        (void)rsp;
-        (void)payloads;
-        return Status(K_NOT_SUPPORTED, "fake");
-    }
-};
 }  // namespace
 
-TEST(ObjectReadAccessFlowTest, ExecuteMetaPhaseGroupsByRouteAndQueriesMeta)
+TEST(ObjectReadMetaAccessFlowTest, ExecuteMetaPhaseGroupsByRouteAndQueriesMeta)
 {
-    object_cache::ObjectReadAccessFlow::ResetTestCounters();
+    object_cache::ObjectReadMetaAccessFlow::ResetTestCounters();
     auto routeProvider = std::make_shared<FakeRouteProvider>();
     auto metaClient = std::make_shared<FakeMetaClient>();
-    auto dataClient = std::make_shared<FakeDataClient>();
-    object_cache::ObjectReadAccessFlow flow(routeProvider, metaClient, dataClient);
+    object_cache::ObjectReadMetaAccessFlow flow(routeProvider, metaClient);
 
     object_cache::ObjectReadAccessRequest request;
     request.objectKeys = { "key-a", "key-b" };
@@ -99,14 +84,14 @@ TEST(ObjectReadAccessFlowTest, ExecuteMetaPhaseGroupsByRouteAndQueriesMeta)
     object_cache::ObjectReadAccessMetaResult result;
     DS_ASSERT_OK(flow.ExecuteMetaPhase(request, result));
 
-    EXPECT_EQ(routeProvider->refreshCount, 1);
     EXPECT_EQ(routeProvider->routeQueryCount, 2);
+    EXPECT_EQ(routeProvider->refreshCount, 1);
     EXPECT_EQ(metaClient->metaQueryCount, 1);
     EXPECT_EQ(result.metaRsp.query_metas_size(), 2);
-    EXPECT_GE(object_cache::ObjectReadAccessFlow::MetaPhaseCountForTest(), 1ul);
+    EXPECT_GE(object_cache::ObjectReadMetaAccessFlow::MetaPhaseCountForTest(), 1ul);
 }
 
-TEST(ObjectReadAccessFlowTest, MetaMovingReturnsTryAgain)
+TEST(ObjectReadMetaAccessFlowTest, MetaMovingReturnsTryAgain)
 {
     class MovingMetaClient : public FakeMetaClient {
     public:
@@ -124,8 +109,7 @@ TEST(ObjectReadAccessFlowTest, MetaMovingReturnsTryAgain)
 
     auto routeProvider = std::make_shared<FakeRouteProvider>();
     auto metaClient = std::make_shared<MovingMetaClient>();
-    auto dataClient = std::make_shared<FakeDataClient>();
-    object_cache::ObjectReadAccessFlow flow(routeProvider, metaClient, dataClient);
+    object_cache::ObjectReadMetaAccessFlow flow(routeProvider, metaClient);
 
     object_cache::ObjectReadAccessRequest request;
     request.objectKeys = { "moving-key" };

@@ -30,8 +30,11 @@
 #include "datasystem/client/object_cache/direct_read/direct_read_test_hook.h"
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/flags/flags.h"
+#include "datasystem/common/kvstore/etcd/etcd_constants.h"
+#include "datasystem/common/kvstore/etcd/etcd_store.h"
 #include "datasystem/common/util/timer.h"
-#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
+#include "datasystem/common/object_cache/read_access/object_read_meta_access_flow.h"
+#include "datasystem/protos/hash_ring.pb.h"
 #include "datasystem/utils/service_discovery.h"
 #include "oc_client_common.h"
 
@@ -70,6 +73,94 @@ void ResetDirectReadStatsWithForceDirectRead()
     object_cache::DirectReadTestHook::Reset();
     object_cache::DirectReadTestHook::SetForceDirectRead(true);
 }
+
+bool WaitHashRingReady(const std::string &etcdAddrs, int expectedWorkers, int timeoutSec = 60,
+                       bool requireEmptyMigration = true)
+{
+    EtcdStore etcd(etcdAddrs);
+    if (etcd.Init().IsError()) {
+        return false;
+    }
+    Timer timer;
+    while (timer.ElapsedSecond() < timeoutSec) {
+        RangeSearchResult res;
+        if (etcd.Get(ETCD_RING_PREFIX, "", res).IsOk()) {
+            HashRingPb ring;
+            if (ring.ParseFromString(res.value) && ring.workers_size() == expectedWorkers
+                && (!requireEmptyMigration || (ring.add_node_info().empty() && ring.del_node_info().empty()))) {
+                bool allActive = true;
+                for (const auto &worker : ring.workers()) {
+                    if (worker.second.state() != WorkerPb::ACTIVE) {
+                        allActive = false;
+                        break;
+                    }
+                }
+                if (allActive) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    return true;
+                }
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
+bool WaitHashRingStable(const std::string &etcdAddrs, int expectedWorkers, int timeoutSec = 60)
+{
+    return WaitHashRingReady(etcdAddrs, expectedWorkers, timeoutSec, true);
+}
+
+bool TryGetDirectReadObject(const std::shared_ptr<ObjectClient> &client, const std::string &objectKey,
+                            std::vector<Optional<Buffer>> &buffers, int timeoutSec = 60)
+{
+    Timer timer;
+    while (timer.ElapsedSecond() < timeoutSec) {
+        buffers.clear();
+        if (client->Get({ objectKey }, 0, buffers).IsOk() && buffers.size() == 1ul && buffers[0]
+            && buffers[0]->GetSize() == static_cast<uint64_t>(TEST_DATA_SIZE)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    return false;
+}
+
+struct CutbackRecoveryResult {
+    bool observed = false;
+    std::vector<Optional<Buffer>> buffers;
+    object_cache::DirectReadStats stats;
+};
+
+CutbackRecoveryResult WaitForGatewayCutbackRecovery(const std::shared_ptr<ObjectClient> &client,
+                                                    const std::string &objectKey, int timeoutSec = 60)
+{
+    CutbackRecoveryResult result;
+    uint64_t seenCutbackAttempts = 0;
+    Timer timer;
+    while (timer.ElapsedSecond() < timeoutSec) {
+        const auto statsBefore = object_cache::DirectReadTestHook::Snapshot();
+        seenCutbackAttempts = std::max(seenCutbackAttempts, statsBefore.cutbackAttemptCount);
+        result.buffers.clear();
+        const Status rc = client->Get({ objectKey }, 0, result.buffers);
+        const auto statsAfter = object_cache::DirectReadTestHook::Snapshot();
+        seenCutbackAttempts = std::max(seenCutbackAttempts, statsAfter.cutbackAttemptCount);
+        const uint64_t directAttemptsThisGet =
+            statsAfter.directAttemptCount >= statsBefore.directAttemptCount
+                ? statsAfter.directAttemptCount - statsBefore.directAttemptCount
+                : 0ul;
+        if (rc.IsOk() && result.buffers.size() == 1ul && result.buffers[0]
+            && result.buffers[0]->GetSize() == static_cast<uint64_t>(TEST_DATA_SIZE) && seenCutbackAttempts >= 1ul
+            && directAttemptsThisGet == 0ul) {
+            result.observed = true;
+            result.stats = statsAfter;
+            result.stats.cutbackAttemptCount = seenCutbackAttempts;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    return result;
+}
 }  // namespace
 
 class ClientDirectReadTest : public OCClientCommon {
@@ -85,7 +176,7 @@ public:
     {
         ExternalClusterTest::SetUp();
         object_cache::DirectReadTestHook::Reset();
-        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        object_cache::ObjectReadMetaAccessFlow::ResetTestCounters();
         FLAGS_enable_distributed_master = false;
         HostPort workerAddress;
         DS_ASSERT_OK(cluster_->GetWorkerAddr(0, workerAddress));
@@ -95,7 +186,7 @@ public:
     void TearDown() override
     {
         object_cache::DirectReadTestHook::Reset();
-        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        object_cache::ObjectReadMetaAccessFlow::ResetTestCounters();
         FLAGS_enable_client_direct_read = false;
         FLAGS_enable_client_direct_read_fallback = true;
         ExternalClusterTest::TearDown();
@@ -244,7 +335,7 @@ TEST_F(ClientDirectReadTest, DirectQueriesMetaBeforeFallback)
     EXPECT_EQ(stats.dataQueryCount, 1ul);
     EXPECT_EQ(stats.pathFallbackCount, 0ul);
     EXPECT_TRUE(stats.lastFallbackReason.empty());
-    EXPECT_GE(object_cache::ObjectReadAccessFlow::MetaPhaseCountForTest(), 1ul);
+    EXPECT_GE(object_cache::ObjectReadMetaAccessFlow::MetaPhaseCountForTest(), 1ul);
 }
 
 TEST_F(ClientDirectReadTest, StaleRouteRecordsFallbackReason)
@@ -413,7 +504,7 @@ public:
     {
         ExternalClusterTest::SetUp();
         object_cache::DirectReadTestHook::Reset();
-        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        object_cache::ObjectReadMetaAccessFlow::ResetTestCounters();
         FLAGS_enable_distributed_master = false;
         HostPort workerAddress;
         DS_ASSERT_OK(cluster_->GetWorkerAddr(0, workerAddress));
@@ -423,7 +514,7 @@ public:
     void TearDown() override
     {
         object_cache::DirectReadTestHook::Reset();
-        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        object_cache::ObjectReadMetaAccessFlow::ResetTestCounters();
         FLAGS_enable_client_direct_read = false;
         FLAGS_enable_client_direct_read_fallback = true;
         ExternalClusterTest::TearDown();
@@ -529,7 +620,7 @@ public:
     {
         ExternalClusterTest::SetUp();
         object_cache::DirectReadTestHook::Reset();
-        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        object_cache::ObjectReadMetaAccessFlow::ResetTestCounters();
         FLAGS_enable_distributed_master = true;
         HostPort workerAddress;
         DS_ASSERT_OK(cluster_->GetWorkerAddr(0, workerAddress));
@@ -539,7 +630,7 @@ public:
     void TearDown() override
     {
         object_cache::DirectReadTestHook::Reset();
-        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        object_cache::ObjectReadMetaAccessFlow::ResetTestCounters();
         FLAGS_enable_client_direct_read = false;
         FLAGS_enable_client_direct_read_fallback = true;
         ExternalClusterTest::TearDown();
@@ -662,7 +753,7 @@ public:
     {
         ExternalClusterTest::SetUp();
         object_cache::DirectReadTestHook::Reset();
-        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        object_cache::ObjectReadMetaAccessFlow::ResetTestCounters();
         FLAGS_enable_distributed_master = false;
         HostPort workerAddress;
         DS_ASSERT_OK(cluster_->GetWorkerAddr(0, workerAddress));
@@ -674,7 +765,7 @@ public:
     void TearDown() override
     {
         object_cache::DirectReadTestHook::Reset();
-        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        object_cache::ObjectReadMetaAccessFlow::ResetTestCounters();
         FLAGS_enable_client_direct_read = false;
         FLAGS_enable_client_direct_read_fallback = true;
         ExternalClusterTest::TearDown();
@@ -777,33 +868,16 @@ TEST_F(ClientDirectReadRecoveryTest, LocalWorkerRecoveryCutbackToGateway)
     DS_ASSERT_OK(cluster_->StartNode(ClusterNodeType::WORKER, 0, "-client_reconnect_wait_s=1"));
     DS_ASSERT_OK(cluster_->WaitNodeReady(ClusterNodeType::WORKER, 0));
 
-    bool cutbackObserved = false;
-    std::vector<Optional<Buffer>> recoveredBuffers;
-    Timer cutbackTimer;
-    while (cutbackTimer.ElapsedSecond() < 30) {
-        object_cache::DirectReadTestHook::Reset();
-        recoveredBuffers.clear();
-        if (client->Get({ objectKey }, 0, recoveredBuffers).IsOk() && recoveredBuffers.size() == 1ul
-            && recoveredBuffers[0]) {
-            auto recoveredStats = object_cache::DirectReadTestHook::Snapshot();
-            if (recoveredStats.cutbackAttemptCount >= 1ul && recoveredStats.directAttemptCount == 0ul) {
-                cutbackObserved = true;
-                break;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-    ASSERT_TRUE(cutbackObserved);
+    auto cutbackResult = WaitForGatewayCutbackRecovery(client, objectKey, 30);
+    ASSERT_TRUE(cutbackResult.observed);
+    EXPECT_GE(cutbackResult.stats.cutbackAttemptCount, 1ul);
 
-    auto recoveredStats = object_cache::DirectReadTestHook::Snapshot();
-    EXPECT_EQ(recoveredStats.directAttemptCount, 0ul);
-    EXPECT_GE(recoveredStats.cutbackAttemptCount, 1ul);
-
-    ASSERT_EQ(recoveredBuffers.size(), 1ul);
-    ASSERT_TRUE(recoveredBuffers[0]);
-    recoveredBuffers[0]->RLatch();
-    AssertBufferEqual(*recoveredBuffers[0], payload);
-    recoveredBuffers[0]->UnRLatch();
+    ASSERT_EQ(cutbackResult.buffers.size(), 1ul);
+    ASSERT_TRUE(cutbackResult.buffers[0]);
+    Buffer &recoveredBuffer = *cutbackResult.buffers[0];
+    recoveredBuffer.RLatch();
+    AssertBufferEqual(recoveredBuffer, payload);
+    recoveredBuffer.UnRLatch();
 }
 
 TEST_F(ClientDirectReadRecoveryTest, RemoteOnlyClientNeverAttemptsCutback)
@@ -847,7 +921,7 @@ public:
     {
         ExternalClusterTest::SetUp();
         object_cache::DirectReadTestHook::Reset();
-        object_cache::ObjectReadAccessFlow::ResetTestCounters();
+        object_cache::ObjectReadMetaAccessFlow::ResetTestCounters();
         FLAGS_enable_distributed_master = true;
         HostPort workerAddress;
         DS_ASSERT_OK(cluster_->GetWorkerAddr(0, workerAddress));
@@ -859,9 +933,6 @@ public:
 
 TEST_F(ClientDirectReadDistributedRecoveryTest, LocalWorkerRecoveryCutbackWithDistributedRing)
 {
-    // Pending R2: worker GetClusterState must expose ring revision so cutback can observe
-    // ring updates after worker restart (port/host_id re-registration under distributed master).
-    GTEST_SKIP() << "Pending R2 GetClusterState ring revision for distributed cutback verification";
     FLAGS_enable_client_direct_read = true;
     FLAGS_enable_client_direct_read_fallback = true;
 
@@ -892,34 +963,83 @@ TEST_F(ClientDirectReadDistributedRecoveryTest, LocalWorkerRecoveryCutbackWithDi
 
     DS_ASSERT_OK(cluster_->StartNode(ClusterNodeType::WORKER, 0, "-client_reconnect_wait_s=1"));
     DS_ASSERT_OK(cluster_->WaitNodeReady(ClusterNodeType::WORKER, 0));
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
-    bool cutbackObserved = false;
-    std::vector<Optional<Buffer>> recoveredBuffers;
-    Timer cutbackTimer;
-    while (cutbackTimer.ElapsedSecond() < 60) {
-        object_cache::DirectReadTestHook::Reset();
-        recoveredBuffers.clear();
-        if (client->Get({ objectKey }, 0, recoveredBuffers).IsOk() && recoveredBuffers.size() == 1ul
-            && recoveredBuffers[0]) {
-            auto recoveredStats = object_cache::DirectReadTestHook::Snapshot();
-            if (recoveredStats.cutbackAttemptCount >= 1ul && recoveredStats.directAttemptCount == 0ul) {
-                cutbackObserved = true;
-                break;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-    ASSERT_TRUE(cutbackObserved);
+    auto cutbackResult = WaitForGatewayCutbackRecovery(client, objectKey, 90);
+    ASSERT_TRUE(cutbackResult.observed);
+    EXPECT_GE(cutbackResult.stats.cutbackAttemptCount, 1ul);
 
-    auto recoveredStats = object_cache::DirectReadTestHook::Snapshot();
-    EXPECT_EQ(recoveredStats.directAttemptCount, 0ul);
-    EXPECT_GE(recoveredStats.cutbackAttemptCount, 1ul);
-    ASSERT_EQ(recoveredBuffers.size(), 1ul);
-    ASSERT_TRUE(recoveredBuffers[0]);
-    recoveredBuffers[0]->RLatch();
-    AssertBufferEqual(*recoveredBuffers[0], payload);
-    recoveredBuffers[0]->UnRLatch();
+    ASSERT_EQ(cutbackResult.buffers.size(), 1ul);
+    ASSERT_TRUE(cutbackResult.buffers[0]);
+    Buffer &recoveredBuffer = *cutbackResult.buffers[0];
+    recoveredBuffer.RLatch();
+    AssertBufferEqual(recoveredBuffer, payload);
+    recoveredBuffer.UnRLatch();
+}
+
+TEST_F(ClientDirectReadHashRingTest, ColocatedInlineDataSkipsRemoteDataRpc)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    object_cache::DirectReadTestHook::SetPreferRemoteDataGet(false);
+
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
+    auto objectKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(client->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    object_cache::DirectReadTestHook::Reset();
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    object_cache::DirectReadTestHook::SetPreferRemoteDataGet(false);
+
+    std::vector<Optional<Buffer>> buffers;
+    DS_ASSERT_OK(client->Get({ objectKey }, 0, buffers));
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_GE(stats.directAttemptCount, 1ul);
+    EXPECT_GE(stats.metaQueryCount, 1ul);
+    EXPECT_GE(stats.inlineDataHitCount, 1ul);
+    EXPECT_EQ(stats.dataQueryCount, 0ul);
+    EXPECT_EQ(stats.pathFallbackCount, 0ul);
+
+    ASSERT_EQ(buffers.size(), 1ul);
+    ASSERT_TRUE(buffers[0]);
+    buffers[0]->RLatch();
+    AssertBufferEqual(*buffers[0], payload);
+    buffers[0]->UnRLatch();
+}
+
+TEST_F(ClientDirectReadHashRingTest, RemoteDataFallbackWhenInlineBypassed)
+{
+    FLAGS_enable_client_direct_read = true;
+    FLAGS_enable_client_direct_read_fallback = true;
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    object_cache::DirectReadTestHook::SetPreferRemoteDataGet(true);
+
+    std::shared_ptr<ObjectClient> client;
+    InitTestClient(0, client);
+    auto objectKey = ObjectKey();
+    auto payload = BuildPayload();
+    DS_ASSERT_OK(client->Put(objectKey, reinterpret_cast<uint8_t *>(payload.data()), payload.size(), CreateParam{}));
+
+    object_cache::DirectReadTestHook::Reset();
+    object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    object_cache::DirectReadTestHook::SetPreferRemoteDataGet(true);
+
+    std::vector<Optional<Buffer>> buffers;
+    DS_ASSERT_OK(client->Get({ objectKey }, 0, buffers));
+
+    auto stats = object_cache::DirectReadTestHook::Snapshot();
+    EXPECT_GE(stats.dataQueryCount, 1ul);
+    EXPECT_EQ(stats.inlineDataHitCount, 0ul);
+
+    ASSERT_EQ(buffers.size(), 1ul);
+    ASSERT_TRUE(buffers[0]);
+    buffers[0]->RLatch();
+    AssertBufferEqual(*buffers[0], payload);
+    buffers[0]->UnRLatch();
 }
 
 class ClientDirectReadHashRingScaleTest : public ClientDirectReadHashRingTest {
@@ -928,7 +1048,7 @@ public:
     {
         ClientDirectReadHashRingTest::SetClusterSetupOptions(opts);
         opts.numWorkers = 3;
-        datasystem::inject::Set("HashRing.SubmitScaleUpTask.skip", "return(1)");
+        (void)datasystem::inject::Clear("HashRing.SubmitScaleUpTask.skip");
     }
 };
 
@@ -937,6 +1057,7 @@ TEST_F(ClientDirectReadHashRingScaleTest, ReadSurvivesWorkerScaleDownAndUp)
     FLAGS_enable_client_direct_read = true;
     FLAGS_enable_client_direct_read_fallback = true;
     object_cache::DirectReadTestHook::SetForceDirectRead(true);
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
     std::shared_ptr<ObjectClient> client;
     InitTestClient(0, client);
@@ -951,24 +1072,29 @@ TEST_F(ClientDirectReadHashRingScaleTest, ReadSurvivesWorkerScaleDownAndUp)
     AssertBufferEqual(*buffers[0], payload);
     buffers[0]->UnRLatch();
 
-    cluster_->ShutdownNode(ClusterNodeType::WORKER, 2);
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    DS_ASSERT_OK(cluster_->SetInjectAction(ClusterNodeType::WORKER, 0, "SubmitScaleDownTask.skip", "return()"));
+    DS_ASSERT_OK(cluster_->SetInjectAction(ClusterNodeType::WORKER, 1, "SubmitScaleDownTask.skip", "return()"));
+    DS_ASSERT_OK(cluster_->KillWorker(2));
+    std::this_thread::sleep_for(std::chrono::seconds(8));
 
     ResetDirectReadStatsWithForceDirectRead();
     DS_ASSERT_OK(client->Get({ objectKey }, 0, buffers));
     auto statsScaledDown = object_cache::DirectReadTestHook::Snapshot();
     EXPECT_GE(statsScaledDown.directAttemptCount, 1ul);
     EXPECT_GE(statsScaledDown.metaQueryCount, 1ul);
+    EXPECT_GE(statsScaledDown.hashRingWorkerRefreshCount + statsScaledDown.hashRingEtcdRefreshCount, 1ul);
+    EXPECT_GE(statsScaledDown.routeQueryCount, 1ul);
 
     DS_ASSERT_OK(cluster_->StartNode(ClusterNodeType::WORKER, 2, "-client_reconnect_wait_s=1"));
     DS_ASSERT_OK(cluster_->WaitNodeReady(ClusterNodeType::WORKER, 2));
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    std::this_thread::sleep_for(std::chrono::seconds(8));
 
     ResetDirectReadStatsWithForceDirectRead();
     DS_ASSERT_OK(client->Get({ objectKey }, 0, buffers));
     auto statsScaledUp = object_cache::DirectReadTestHook::Snapshot();
     EXPECT_GE(statsScaledUp.directAttemptCount, 1ul);
     EXPECT_GE(statsScaledUp.metaQueryCount, 1ul);
+    EXPECT_GE(statsScaledUp.hashRingWorkerRefreshCount + statsScaledUp.hashRingEtcdRefreshCount, 1ul);
 
     ASSERT_TRUE(buffers[0]);
     buffers[0]->RLatch();

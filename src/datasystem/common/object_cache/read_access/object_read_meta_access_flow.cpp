@@ -15,9 +15,9 @@
  */
 
 /**
- * Description: Shared object read access flow for client direct read and worker gateway read.
+ * Description: Shared route/meta phase for client direct read and worker gateway read.
  */
-#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
+#include "datasystem/common/object_cache/read_access/object_read_meta_access_flow.h"
 
 #include <map>
 #include <mutex>
@@ -32,47 +32,44 @@ std::mutex g_flowTestMutex;
 uint64_t g_metaPhaseCount = 0;
 }  // namespace
 
-ObjectReadAccessFlow::ObjectReadAccessFlow(std::shared_ptr<IObjectReadRouteProvider> routeProvider,
-                                           std::shared_ptr<IObjectReadMetaClient> metaClient,
-                                           std::shared_ptr<IObjectReadDataClient> dataClient)
-    : routeProvider_(std::move(routeProvider)),
-      metaClient_(std::move(metaClient)),
-      dataClient_(std::move(dataClient))
+ObjectReadMetaAccessFlow::ObjectReadMetaAccessFlow(std::shared_ptr<IObjectReadRouteProvider> routeProvider,
+                                                   std::shared_ptr<IObjectReadMetaClient> metaClient)
+    : routeProvider_(std::move(routeProvider)), metaClient_(std::move(metaClient))
 {
 }
 
-void ObjectReadAccessFlow::RecordMetaPhaseForTest()
+void ObjectReadMetaAccessFlow::RecordMetaPhaseForTest()
 {
     std::lock_guard<std::mutex> lock(g_flowTestMutex);
     ++g_metaPhaseCount;
 }
 
-uint64_t ObjectReadAccessFlow::MetaPhaseCountForTest()
+uint64_t ObjectReadMetaAccessFlow::MetaPhaseCountForTest()
 {
     std::lock_guard<std::mutex> lock(g_flowTestMutex);
     return g_metaPhaseCount;
 }
 
-void ObjectReadAccessFlow::ResetTestCounters()
+void ObjectReadMetaAccessFlow::ResetTestCounters()
 {
     std::lock_guard<std::mutex> lock(g_flowTestMutex);
     g_metaPhaseCount = 0;
 }
 
-Status ObjectReadAccessFlow::QueryMetaGroup(const HostPort &metaAddress, const std::vector<std::string> &objectKeys,
-                                            int64_t subTimeoutMs, master::QueryMetaRspPb &rsp,
-                                            std::vector<RpcMessage> &payloads)
+Status ObjectReadMetaAccessFlow::QueryMetaGroup(const HostPort &metaAddress, const std::vector<std::string> &objectKeys,
+                                                int64_t subTimeoutMs, master::QueryMetaRspPb &rsp,
+                                                std::vector<RpcMessage> &payloads)
 {
     RETURN_RUNTIME_ERROR_IF_NULL(metaClient_);
     return metaClient_->QueryMeta(metaAddress, objectKeys, subTimeoutMs, rsp, payloads);
 }
 
-Status ObjectReadAccessFlow::ExecuteMetaPhase(const ObjectReadAccessRequest &request,
-                                              ObjectReadAccessMetaResult &result)
+Status ObjectReadMetaAccessFlow::ExecuteMetaPhase(const ObjectReadAccessRequest &request,
+                                                  ObjectReadAccessMetaResult &result)
 {
     RecordMetaPhaseForTest();
     CHECK_FAIL_RETURN_STATUS(routeProvider_ != nullptr && metaClient_ != nullptr, K_RUNTIME_ERROR,
-                             "Object read access flow ports are not configured");
+                             "Object read meta access flow ports are not configured");
     CHECK_FAIL_RETURN_STATUS(!request.objectKeys.empty(), K_INVALID, "Object read access request has no object keys");
 
     RETURN_IF_NOT_OK(routeProvider_->RefreshRouteIfNeeded());

@@ -1483,7 +1483,14 @@ private:
 
     bool HasHealthyLocalWorker();
 
-    ClientHashRingSource *GetDirectReadRingSource(const std::shared_ptr<IClientWorkerApi> &workerApi);
+    struct DirectReadSession {
+        std::shared_ptr<DirectReadRpcAdapter> rpcAdapter;
+        std::shared_ptr<ClientHashRingSource> ringSource;
+    };
+
+    DirectReadSession AcquireDirectReadSession(const std::shared_ptr<IClientWorkerApi> &workerApi);
+
+    DirectReadSession AcquireDirectReadSessionUnlocked(const std::shared_ptr<IClientWorkerApi> &workerApi);
 
     bool TryDirectReadCutbackToLocalWorker(const std::shared_ptr<IClientWorkerApi> &workerApi);
 
@@ -1555,8 +1562,9 @@ private:
 
     std::shared_ptr<ServiceDiscovery> serviceDiscovery_ = nullptr;
 
-    std::unique_ptr<DirectReadRpcAdapter> directReadRpcAdapter_;
-    std::unique_ptr<ClientHashRingSource> directReadRingSource_;
+    std::mutex directReadStateMutex_;
+    std::shared_ptr<DirectReadRpcAdapter> directReadRpcAdapter_;
+    std::shared_ptr<ClientHashRingSource> directReadRingSource_;
     std::weak_ptr<IClientWorkerApi> directReadRingWorkerApi_;
     int64_t lastCutbackEvalRingVersion_ = -1;
 };

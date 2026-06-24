@@ -439,6 +439,23 @@ public:
         return ringInfo_;
     }
 
+    /**
+     * @brief etcd modRevision of the in-memory hash ring snapshot.
+     */
+    int64_t GetRingEtcdModRevision() const
+    {
+        return currEtcdModRevisionOfRing_.load();
+    }
+
+    /**
+     * @brief Worker-local ring generation bumped on each applied ring update.
+     */
+    int64_t GetCurrHashRingVersion() const
+    {
+        std::shared_lock<std::shared_timed_mutex> lck(mutex_);
+        return currHashRingVersion_;
+    }
+
 protected:
     enum HashState {
         NO_INIT,      // no need to construct the hash ring, refers to centralized master scenario
@@ -751,6 +768,7 @@ protected:
     std::atomic<bool> voluntaryScaleDownDone_{ false };
     std::atomic<bool> allWorkersVoluntaryScaleDown_{ false };
     std::atomic<int64_t> baselineModRevisionOfRing_{ 0 };
+    std::atomic<int64_t> currEtcdModRevisionOfRing_{ -1 };
     int64_t currHashRingVersion_ = 0;
     std::atomic<bool> needForceJoin_{ false };
 

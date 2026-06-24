@@ -15,7 +15,7 @@
  */
 
 /**
- * Description: Worker helper for ObjectReadAccessFlow meta phase.
+ * Description: Worker helper for ObjectReadMetaAccessFlow meta phase.
  */
 #include "datasystem/worker/object_cache/service/worker_object_read_access_helper.h"
 
@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-#include "datasystem/common/object_cache/read_access/object_read_access_flow.h"
+#include "datasystem/common/object_cache/read_access/object_read_meta_access_flow.h"
 #include "datasystem/common/object_cache/read_access/query_meta_orchestrating_meta_client.h"
 #include "datasystem/common/util/status_helper.h"
 #include "datasystem/worker/object_cache/service/worker_oc_service_get_impl.h"
@@ -73,20 +73,6 @@ public:
 private:
     std::shared_ptr<QueryMetaOrchestratingMetaClient> metaClient_;
 };
-
-class WorkerNullDataClient : public IObjectReadDataClient {
-public:
-    Status ReadData(const master::QueryMetaInfoPb &queryMeta, int64_t subTimeoutMs, size_t objectIndex,
-                    GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads) override
-    {
-        (void)queryMeta;
-        (void)subTimeoutMs;
-        (void)objectIndex;
-        (void)rsp;
-        (void)payloads;
-        return Status(K_NOT_SUPPORTED, "worker_meta_only");
-    }
-};
 }  // namespace
 
 Status QueryMetaGroupUsingSharedFlow(WorkerOcServiceGetImpl &getImpl, const HostPort &masterAddress,
@@ -96,8 +82,7 @@ Status QueryMetaGroupUsingSharedFlow(WorkerOcServiceGetImpl &getImpl, const Host
 {
     auto routeProvider = std::make_shared<WorkerFixedMetaRouteProvider>(masterAddress);
     auto metaClient = std::make_shared<WorkerObjectReadMetaClient>(&getImpl, isFromOtherAz);
-    auto dataClient = std::make_shared<WorkerNullDataClient>();
-    ObjectReadAccessFlow flow(routeProvider, metaClient, dataClient);
+    ObjectReadMetaAccessFlow flow(routeProvider, metaClient);
 
     ObjectReadAccessRequest request;
     request.objectKeys = objectKeys;

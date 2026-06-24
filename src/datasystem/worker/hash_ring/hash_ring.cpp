@@ -168,6 +168,7 @@ Status HashRing::InitWithEtcd()
     };
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(status, "InitRing failed");
     baselineModRevisionOfRing_ = res.modRevision;
+    currEtcdModRevisionOfRing_ = res.modRevision;
     taskExecutor_ = std::make_unique<HashRingTaskExecutor>(workerAddr_, workerUuid_, etcdStore_);
     timer_ = std::make_unique<Timer>();
 
@@ -938,6 +939,9 @@ Status HashRing::UpdateRing(const std::string &newSerializedRingInfo, int64_t ve
         std::lock_guard<std::shared_timed_mutex> lock(mutex_);
         RETURN_OK_IF_TRUE(SkipUpdateRing(newRing, version, forceUpdate));
         currHashRingVersion_++;
+        if (version >= 0) {
+            currEtcdModRevisionOfRing_.store(version);
+        }
         LOG(INFO) << "Update ring of version " << version << ". " << SummarizeHashRing(newRing);
         auto lines = SplitRingJson(FormatString("Worker %s update local hash ring to", workerAddr_), newRing);
         std::for_each(lines.begin(), lines.end(), [](const std::string &line) { LOG(INFO) << line; });

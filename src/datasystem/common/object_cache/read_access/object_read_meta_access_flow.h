@@ -15,10 +15,10 @@
  */
 
 /**
- * Description: Shared object read access flow for client direct read and worker gateway read.
+ * Description: Shared route/meta phase for client direct read and worker gateway read.
  */
-#ifndef DATASYSTEM_COMMON_OBJECT_CACHE_READ_ACCESS_OBJECT_READ_ACCESS_FLOW_H
-#define DATASYSTEM_COMMON_OBJECT_CACHE_READ_ACCESS_OBJECT_READ_ACCESS_FLOW_H
+#ifndef DATASYSTEM_COMMON_OBJECT_CACHE_READ_ACCESS_OBJECT_READ_META_ACCESS_FLOW_H
+#define DATASYSTEM_COMMON_OBJECT_CACHE_READ_ACCESS_OBJECT_READ_META_ACCESS_FLOW_H
 
 #include <cstdint>
 #include <memory>
@@ -59,18 +59,10 @@ public:
                              std::vector<RpcMessage> &payloads) = 0;
 };
 
-class IObjectReadDataClient {
+class ObjectReadMetaAccessFlow {
 public:
-    virtual ~IObjectReadDataClient() = default;
-    virtual Status ReadData(const master::QueryMetaInfoPb &queryMeta, int64_t subTimeoutMs, size_t objectIndex,
-                            GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads) = 0;
-};
-
-class ObjectReadAccessFlow {
-public:
-    ObjectReadAccessFlow(std::shared_ptr<IObjectReadRouteProvider> routeProvider,
-                         std::shared_ptr<IObjectReadMetaClient> metaClient,
-                         std::shared_ptr<IObjectReadDataClient> dataClient);
+    ObjectReadMetaAccessFlow(std::shared_ptr<IObjectReadRouteProvider> routeProvider,
+                             std::shared_ptr<IObjectReadMetaClient> metaClient);
 
     Status ExecuteMetaPhase(const ObjectReadAccessRequest &request, ObjectReadAccessMetaResult &result);
 
@@ -84,10 +76,9 @@ private:
 
     std::shared_ptr<IObjectReadRouteProvider> routeProvider_;
     std::shared_ptr<IObjectReadMetaClient> metaClient_;
-    std::shared_ptr<IObjectReadDataClient> dataClient_;
 };
 
 }  // namespace object_cache
 }  // namespace datasystem
 
-#endif  // DATASYSTEM_COMMON_OBJECT_CACHE_READ_ACCESS_OBJECT_READ_ACCESS_FLOW_H
+#endif  // DATASYSTEM_COMMON_OBJECT_CACHE_READ_ACCESS_OBJECT_READ_META_ACCESS_FLOW_H

@@ -42,8 +42,8 @@ public:
     Status GetClusterState(const HostPort &workerAddress, HashRingPb &ring, int64_t &version) const;
 
     Status GetObjectRemoteTcp(const HostPort &dataAddress, const master::QueryMetaInfoPb &queryMeta,
-                              const GetParam &getParam, size_t objectIndex, GetObjectRemoteRspPb &rsp,
-                              std::vector<RpcMessage> &payloads) const;
+                              const GetParam &getParam, size_t objectIndex, int64_t subTimeoutMs,
+                              GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads) const;
 
 private:
     RpcCredential cred_;

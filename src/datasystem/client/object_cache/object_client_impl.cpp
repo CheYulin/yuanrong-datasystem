@@ -1312,6 +1312,10 @@ bool ObjectClientImpl::RecoverPreferredLocalWorker()
         return false;
     }
 
+    if (FLAGS_enable_client_direct_read && !DirectReadTestHook::ForceDirectRead() && oldNode != LOCAL_WORKER) {
+        DirectReadTestHook::RecordCutbackAttempt();
+    }
+
     NotifySwitchToExpectedWorker(localAddress);
     LOG(INFO) << "[Switch] Preferred same-node worker recovered at " << localAddress.ToString();
     return true;
@@ -1406,17 +1410,25 @@ bool ObjectClientImpl::HasHealthyLocalWorker()
     return listenWorker_[LOCAL_WORKER]->CheckWorkerAvailable().IsOk();
 }
 
-ClientHashRingSource *ObjectClientImpl::GetDirectReadRingSource(const std::shared_ptr<IClientWorkerApi> &workerApi)
+ObjectClientImpl::DirectReadSession ObjectClientImpl::AcquireDirectReadSessionUnlocked(
+    const std::shared_ptr<IClientWorkerApi> &workerApi)
 {
     if (directReadRpcAdapter_ == nullptr) {
-        directReadRpcAdapter_ = std::make_unique<DirectReadRpcAdapter>(cred_, signature_.get(), requestTimeoutMs_);
+        directReadRpcAdapter_ = std::make_shared<DirectReadRpcAdapter>(cred_, signature_.get(), requestTimeoutMs_);
     }
     if (directReadRingSource_ == nullptr || directReadRingWorkerApi_.lock() != workerApi) {
-        directReadRingSource_ = std::make_unique<ClientHashRingSource>(workerApi, directReadRpcAdapter_.get());
+        directReadRingSource_ = std::make_shared<ClientHashRingSource>(workerApi, directReadRpcAdapter_);
         directReadRingWorkerApi_ = workerApi;
         lastCutbackEvalRingVersion_ = -1;
     }
-    return directReadRingSource_.get();
+    return DirectReadSession{ directReadRpcAdapter_, directReadRingSource_ };
+}
+
+ObjectClientImpl::DirectReadSession ObjectClientImpl::AcquireDirectReadSession(
+    const std::shared_ptr<IClientWorkerApi> &workerApi)
+{
+    std::lock_guard<std::mutex> lock(directReadStateMutex_);
+    return AcquireDirectReadSessionUnlocked(workerApi);
 }
 
 bool ObjectClientImpl::TryDirectReadCutbackToLocalWorker(const std::shared_ptr<IClientWorkerApi> &workerApi)
@@ -1435,15 +1447,22 @@ bool ObjectClientImpl::TryDirectReadCutbackToLocalWorker(const std::shared_ptr<I
         return false;
     }
 
+    std::shared_ptr<ClientHashRingSource> ringSource;
     if (FLAGS_enable_distributed_master) {
-        ClientHashRingSource *ringSource = GetDirectReadRingSource(workerApi);
+        {
+            std::lock_guard<std::mutex> lock(directReadStateMutex_);
+            ringSource = AcquireDirectReadSessionUnlocked(workerApi).ringSource;
+        }
         (void)ringSource->RefreshOnClusterEvent();
     }
 
     if (!RecoverPreferredLocalWorker()) {
         return false;
     }
-    DirectReadTestHook::RecordCutbackAttempt();
+    if (FLAGS_enable_distributed_master && ringSource != nullptr) {
+        std::lock_guard<std::mutex> lock(directReadStateMutex_);
+        lastCutbackEvalRingVersion_ = ringSource->Version();
+    }
     LOG(INFO) << "[DirectRead] Cut back to local worker gateway at " << localAddress.ToString();
     return true;
 }
@@ -2703,8 +2722,9 @@ Status ObjectClientImpl::Get(const std::vector<std::string> &objectKeys, int64_t
                        .isRH2DSupported = isRH2DSupported };
     if (ShouldTryDirectRead(workerApi)) {
         DirectReadTestHook::RecordDirectAttempt();
-        ClientHashRingSource *ringSource = GetDirectReadRingSource(workerApi);
-        DirectReadFlow directReadFlow(workerApi, cred_, signature_.get(), requestTimeoutMs_, ringSource);
+        const DirectReadSession session = AcquireDirectReadSession(workerApi);
+        DirectReadFlow directReadFlow(workerApi, cred_, signature_.get(), requestTimeoutMs_, session.ringSource,
+                                      session.rpcAdapter);
         Status directRc = directReadFlow.Get(
             getParam, objectBuffers, [this](const GetParam &param, GetRspPb &rsp, std::vector<RpcMessage> &payloads,
                                             std::vector<std::shared_ptr<Buffer>> &buffers) {

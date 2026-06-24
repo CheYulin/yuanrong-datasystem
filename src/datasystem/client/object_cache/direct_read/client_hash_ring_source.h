@@ -35,7 +35,8 @@ class EtcdStore;
 namespace object_cache {
 class ClientHashRingSource {
 public:
-    ClientHashRingSource(std::shared_ptr<IClientWorkerApi> workerApi, DirectReadRpcAdapter *rpcAdapter);
+    ClientHashRingSource(std::shared_ptr<IClientWorkerApi> workerApi,
+                         std::shared_ptr<DirectReadRpcAdapter> rpcAdapter);
 
     Status GetMetaAddress(const std::string &objectKey, HostPort &metaAddress);
     /** Cheap refresh before route lookup: bootstrap or in-ring scaling task only. */
@@ -56,7 +57,7 @@ private:
     Status RefreshRing();
 
     std::shared_ptr<IClientWorkerApi> workerApi_;
-    DirectReadRpcAdapter *rpcAdapter_;
+    std::shared_ptr<DirectReadRpcAdapter> rpcAdapter_;
     ReadOnlyHashRingView view_;
     std::shared_ptr<EtcdStore> etcdStore_;
     HashRingRefreshSource lastRefreshSource_ = HashRingRefreshSource::NONE;

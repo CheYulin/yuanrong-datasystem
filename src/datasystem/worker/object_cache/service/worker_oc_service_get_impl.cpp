@@ -20,6 +20,7 @@
 #include "datasystem/worker/object_cache/service/worker_oc_service_get_impl.h"
 #include "datasystem/worker/object_cache/service/worker_object_read_access_helper.h"
 
+#include "datasystem/common/object_cache/read_access/object_read_data_access.h"
 #include "datasystem/common/object_cache/read_access/query_meta_merge_helper.h"
 #include "datasystem/common/object_cache/read_access/query_meta_orchestrating_meta_client.h"
 #include "datasystem/common/object_cache/read_access/query_meta_redirect_helper.h"
@@ -57,7 +58,7 @@
 #include "datasystem/common/util/raii.h"
 #include "datasystem/common/util/rpc_diagnostic.h"
 #include "datasystem/common/util/rpc_util.h"
-#include "datasystem/common/util/status_helper.h"
+#include "datasystem/common/object_cache/read_access/object_read_data_access.h"
 #include "datasystem/common/util/strings_util.h"
 #include "datasystem/common/util/thread_local.h"
 #include "datasystem/common/util/timer.h"
@@ -277,7 +278,7 @@ Status WorkerOcServiceGetImpl::GetObjectFromAnywhere(const ReadKey &readKey, con
     SetObjectEntryAccordingToMeta(meta, GetMetadataSize(), *entry);
     ReadKey readKeyAfterSet(readKey.objectKey, readKey.readOffset, readKey.readSize);
     ReadObjectKV objectKV(readKeyAfterSet, *entry);
-    Status status = queryMeta.payload_indexs_size() == 0
+    Status status = PlanObjectReadDataPath(queryMeta) == ObjectReadDataPath::kRemote
                         ? GetObjectFromRemoteOnLock(meta, nullptr, address, queryMeta.single_copy(), objectKV)
                         : GetObjectFromQueryMetaResultOnLock(nullptr, queryMeta, payloads, objectKV);
     if (status.IsError()) {
@@ -2032,7 +2033,7 @@ Status WorkerOcServiceGetImpl::GetObjectFromAnywhereWithLock(const ReadKey &read
         commId = std::make_shared<std::string>(request->GetClientCommUuid());
     }
     ReadObjectKV objectKV(readKey, *entry, commId);
-    Status status = queryMeta.payload_indexs_size() == 0
+    Status status = PlanObjectReadDataPath(queryMeta) == ObjectReadDataPath::kRemote
                         ? GetObjectFromRemoteOnLock(meta, request, address, queryMeta.single_copy(), objectKV)
                         : GetObjectFromQueryMetaResultOnLock(request, queryMeta, payloads, objectKV);
     if (status.IsError()) {
@@ -2225,18 +2226,13 @@ Status WorkerOcServiceGetImpl::GetObjectFromQueryMetaResultOnLock(const std::sha
     const auto &objectKey = objectKV.GetObjKey();
     VLOG(1) << FormatString("[ObjectKey %s] Get from query result", objectKey);
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(objectKV.CheckReadOffset(), "Read offset verify failed");
-    CHECK_FAIL_RETURN_STATUS(
-        *idxs.rbegin() < payloads.size(), StatusCode::K_RUNTIME_ERROR,
-        FormatString("payload index[%ld] large equal than payloads size[%ld]", *idxs.rbegin(), payloads.size()));
-    std::vector<RpcMessage> objDatas;
-    objDatas.resize(queryMeta.payload_indexs_size());
-    uint32_t i = 0;
-    for (auto idx : idxs) {
+    if (!idxs.empty()) {
         CHECK_FAIL_RETURN_STATUS(
-            idx < payloads.size(), StatusCode::K_RUNTIME_ERROR,
-            FormatString("payload index[%ld] large equal than payloads size[%ld]", idx, payloads.size()));
-        objDatas[i++] = std::move(payloads[idx]);
+            *idxs.rbegin() < payloads.size(), StatusCode::K_RUNTIME_ERROR,
+            FormatString("payload index[%ld] large equal than payloads size[%ld]", *idxs.rbegin(), payloads.size()));
     }
+    std::vector<RpcMessage> objDatas;
+    RETURN_IF_NOT_OK(ExtractInlinePayloads(queryMeta, payloads, objDatas));
     RETURN_IF_NOT_OK(SaveBinaryObjectToMemory(objectKV, objDatas, evictionManager_, memCpyThreadPool_));
     if (queryMeta.is_from_other_az()) {
         objectKV.GetObjEntry()->stateInfo.SetNeedToDelete(true);

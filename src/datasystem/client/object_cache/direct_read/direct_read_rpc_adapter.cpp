@@ -19,6 +19,7 @@
  */
 #include "datasystem/client/object_cache/direct_read/direct_read_rpc_adapter.h"
 
+#include <algorithm>
 #include <memory>
 #include <utility>
 
@@ -49,12 +50,12 @@ Status DirectReadRpcAdapter::GetClusterState(const HostPort &workerAddress, Hash
     GetClusterStateRspPb rsp;
     RETURN_IF_NOT_OK(stub.GetClusterState(opts, req, rsp));
     ring.CopyFrom(rsp.hash_ring());
-    version = -1;
+    version = rsp.ring_etcd_mod_revision() > 0 ? rsp.ring_etcd_mod_revision() : -1;
     return Status::OK();
 }
 
 Status DirectReadRpcAdapter::GetObjectRemoteTcp(const HostPort &dataAddress, const master::QueryMetaInfoPb &queryMeta,
-                                                const GetParam &getParam, size_t objectIndex,
+                                                const GetParam &getParam, size_t objectIndex, int64_t subTimeoutMs,
                                                 GetObjectRemoteRspPb &rsp, std::vector<RpcMessage> &payloads) const
 {
     RETURN_RUNTIME_ERROR_IF_NULL(signature_);
@@ -74,10 +75,15 @@ Status DirectReadRpcAdapter::GetObjectRemoteTcp(const HostPort &dataAddress, con
     req.set_data_size(meta.data_size());
     RETURN_IF_NOT_OK(signature_->GenerateSignature(req));
 
+    int32_t rpcTimeoutMs = requestTimeoutMs_;
+    if (subTimeoutMs > 0) {
+        rpcTimeoutMs = static_cast<int32_t>(std::min<int64_t>(subTimeoutMs, requestTimeoutMs_));
+    }
+
     auto channel = std::make_shared<RpcChannel>(dataAddress, cred_);
-    WorkerWorkerOCService_Stub stub(channel, requestTimeoutMs_);
+    WorkerWorkerOCService_Stub stub(channel, rpcTimeoutMs);
     RpcOptions opts;
-    opts.SetTimeout(requestTimeoutMs_);
+    opts.SetTimeout(rpcTimeoutMs);
     RETURN_IF_NOT_OK(stub.GetObjectRemote(opts, req, rsp, payloads));
     if (rsp.has_error() && rsp.error().error_code() != static_cast<int32_t>(StatusCode::K_OK)) {
         return Status(static_cast<StatusCode>(rsp.error().error_code()), rsp.error().error_msg());
