@@ -155,14 +155,14 @@ std::future<MigrateDataHandler::MigrateResult> DataMigrator::MigrateToSpecificNo
 
 std::future<MigrateDataHandler::MigrateResult> DataMigrator::MigrateToTargetNode(
     const std::vector<std::string> &objectKeys, const HostPort &targetAddr, std::shared_ptr<SelectionStrategy> strategy,
-    bool isRetry, uint32_t slotId)
+    bool isRetry, uint32_t slotId, bool isSlotMigration)
 {
     if (!strategy) {
         strategy = GetStrategyByType();
     }
 
     auto traceID = Trace::Instance().GetTraceID();
-    return threadPool_->Submit([this, objectKeys, targetAddr, traceID, strategy, isRetry, slotId]() {
+    return threadPool_->Submit([this, objectKeys, targetAddr, traceID, strategy, isRetry, slotId, isSlotMigration]() {
         TraceGuard traceGuard = Trace::Instance().SetTraceNewID(traceID);
 
         MigrateDataHandler::MigrateResult finalResult;
@@ -181,7 +181,7 @@ std::future<MigrateDataHandler::MigrateResult> DataMigrator::MigrateToTargetNode
         std::vector<ImmutableString> needMigrateDataIds{ objectKeys.begin(), objectKeys.end() };
         MigrateDataHandler handler(type_, localAddress_.ToString(), needMigrateDataIds, objectTable_, remoteWorkerStub,
                                    strategy, nullptr, isRetry, slotId);
-        auto result = handler.MigrateDataToRemote(true);
+        auto result = handler.MigrateDataToRemote(isSlotMigration);
         return result;
     });
 }
@@ -252,7 +252,7 @@ void DataMigrator::SubmitL2CacheTasksBySlot(const std::map<uint32_t, std::vector
         auto strategy = std::make_shared<ScaleDownNodeSelector>(etcdCM_, localAddress_);
         LOG(INFO) << FormatString("[MigrateL2Cache] Slot %u (%zu objects) -> %s", slot, objs.size(),
                                   currentTarget.ToString());
-        futures.emplace_back(slot, MigrateToTargetNode(objs, currentTarget, strategy, false, slot));
+        futures.emplace_back(slot, MigrateToTargetNode(objs, currentTarget, strategy, false, slot, true));
         sameNodeRetryCounts[slot] = 0;
     }
 }
@@ -269,9 +269,10 @@ bool DataMigrator::TrySubmitSameNodeRetryForL2Slot(uint32_t slot, const MigrateD
 
     int retryCount = ++sameNodeRetryCounts[slot];
     if (retryCount > maxSameNodeRetryCount) {
-        LOG(WARNING) << FormatString("[MigrateL2Cache] Slot %u same-node failedIds retry exceeded max(%d), stop "
-                                     "retry on node %s",
-                                     slot, maxSameNodeRetryCount, result.address);
+        LOG(WARNING) << FormatString(
+            "[MigrateL2Cache] Slot %u same-node failedIds retry exceeded max(%d), stop "
+            "retry on node %s",
+            slot, maxSameNodeRetryCount, result.address);
         return true;
     }
 
@@ -288,7 +289,7 @@ bool DataMigrator::TrySubmitSameNodeRetryForL2Slot(uint32_t slot, const MigrateD
         slot, result.address, retryCount, maxSameNodeRetryCount, result.successIds.size(), result.failedIds.size());
     newFutures.emplace_back(
         slot, MigrateToTargetNode(std::vector<std::string>{ result.failedIds.begin(), result.failedIds.end() },
-                                  sameHost, result.strategy, true, slot));
+                                  sameHost, result.strategy, true, slot, true));
     return true;
 }
 
@@ -317,7 +318,7 @@ void DataMigrator::TrySubmitRedirectRetryForL2Slot(uint32_t slot, MigrateDataHan
     LOG(INFO) << FormatString("[MigrateL2Cache] Slot %u retry with new node: %s", slot, nextTarget);
     newFutures.emplace_back(
         slot, MigrateToTargetNode(std::vector<std::string>{ result.failedIds.begin(), result.failedIds.end() },
-                                  hostPort, result.strategy, false, slot));
+                                  hostPort, result.strategy, false, slot, true));
 }
 
 void DataMigrator::ProcessL2CacheSlotFutures(std::vector<SlotMigrateFuture> &futures, int maxSameNodeRetryCount,
@@ -398,9 +399,9 @@ Status DataMigrator::ConnectAndCreateRemoteApi(std::shared_ptr<WorkerRemoteWorke
     }
 
     RETURN_IF_NOT_OK(etcdCM_->CheckConnection(workerAddr, true));
-    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(CreateRemoteWorkerApi(workerAddr.ToString(), localAddress_, akSkManager_,
-                                                           remoteWorkerStub),
-                                     "[Migrate Data] Create remote worker api failed.");
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
+        CreateRemoteWorkerApi(workerAddr.ToString(), localAddress_, akSkManager_, remoteWorkerStub),
+        "[Migrate Data] Create remote worker api failed.");
     return Status::OK();
 }
 

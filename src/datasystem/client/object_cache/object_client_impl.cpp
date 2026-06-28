@@ -18,6 +18,7 @@
  * Description: Data system Object Client implementation.
  */
 
+#include "datasystem/client/object_cache/meta_affinity/meta_affinity_client_ring_source.h"
 #include "datasystem/client/object_cache/object_client_impl.h"
 
 #include <algorithm>
@@ -88,6 +89,8 @@
 #include "datasystem/object/buffer.h"
 
 DS_DECLARE_bool(log_monitor);
+DS_DECLARE_bool(enable_meta_affinity_replicate);
+DS_DECLARE_bool(enable_distributed_master);
 
 const size_t MSET_MAX_KEY_COUNT = 8;
 static constexpr size_t OBJ_META_MAX_SIZE_LIMIT = 64;
@@ -484,9 +487,8 @@ void ObjectClientImpl::ConfigureUrmaDataPlaneFailureCallback(WorkerNode node,
         return;
     }
     std::weak_ptr<client::IClientWorkerCommonApi> weakWorkerApi(workerApi);
-    workerApi->SetUrmaDataPlaneFailureCallback([this, node, weakWorkerApi]() {
-        return SubmitUrmaDataPlaneSwitch(node, weakWorkerApi);
-    });
+    workerApi->SetUrmaDataPlaneFailureCallback(
+        [this, node, weakWorkerApi]() { return SubmitUrmaDataPlaneSwitch(node, weakWorkerApi); });
 }
 
 bool ObjectClientImpl::SubmitUrmaDataPlaneSwitch(WorkerNode node,
@@ -526,8 +528,8 @@ bool ObjectClientImpl::SubmitUrmaDataPlaneSwitch(WorkerNode node,
     return true;
 }
 
-bool ObjectClientImpl::IsCurrentUrmaDataPlaneTrigger(
-    WorkerNode node, const std::shared_ptr<client::IClientWorkerCommonApi> &workerApi)
+bool ObjectClientImpl::IsCurrentUrmaDataPlaneTrigger(WorkerNode node,
+                                                     const std::shared_ptr<client::IClientWorkerCommonApi> &workerApi)
 {
     std::lock_guard<std::mutex> lock(switchNodeMutex_);
     return currentNode_ == node && workerApi_[node] != nullptr && workerApi_[node].get() == workerApi.get();
@@ -1387,14 +1389,93 @@ Status ObjectClientImpl::GetAvailableWorkerApi(std::shared_ptr<IClientWorkerApi>
     return Status::OK();
 }
 
+bool ObjectClientImpl::HasHealthyLocalWorker() const
+{
+    if (workerApi_.size() <= LOCAL_WORKER || workerApi_[LOCAL_WORKER] == nullptr) {
+        return false;
+    }
+    if (listenWorker_.size() <= LOCAL_WORKER || listenWorker_[LOCAL_WORKER] == nullptr) {
+        return false;
+    }
+    return listenWorker_[LOCAL_WORKER]->CheckWorkerAvailable().IsOk();
+}
+
+bool ObjectClientImpl::ShouldRouteWriteToMetaOwner() const
+{
+    return FLAGS_enable_meta_affinity_replicate && FLAGS_enable_distributed_master && !HasHealthyLocalWorker();
+}
+
+Status ObjectClientImpl::EnsureMetaAffinityRingSource()
+{
+    std::lock_guard<std::mutex> lock(metaAffinityWriteMutex_);
+    if (metaAffinityRingSource_ != nullptr) {
+        return Status::OK();
+    }
+    std::shared_ptr<IClientWorkerApi> gateway;
+    {
+        std::lock_guard<std::mutex> switchLock(switchNodeMutex_);
+        if (workerApi_.size() > STANDBY1_WORKER && workerApi_[STANDBY1_WORKER] != nullptr) {
+            gateway = workerApi_[STANDBY1_WORKER];
+        } else if (workerApi_.size() > LOCAL_WORKER && workerApi_[LOCAL_WORKER] != nullptr) {
+            gateway = workerApi_[LOCAL_WORKER];
+        }
+    }
+    if (gateway == nullptr) {
+        RETURN_STATUS(K_INVALID, "No worker api for meta affinity route bootstrap");
+    }
+    metaAffinityRingSource_ =
+        std::make_shared<MetaAffinityClientRingSource>(gateway, signature_.get(), requestTimeoutMs_);
+    return metaAffinityRingSource_->BootstrapRing();
+}
+
+Status ObjectClientImpl::GetWriteWorkerApi(const std::string &objectKey, std::shared_ptr<IClientWorkerApi> &workerApi,
+                                           std::unique_ptr<Raii> &raii)
+{
+    if (!ShouldRouteWriteToMetaOwner()) {
+        return GetAvailableWorkerApi(workerApi, raii);
+    }
+    RETURN_IF_NOT_OK(EnsureMetaAffinityRingSource());
+    HostPort metaOwner;
+    RETURN_IF_NOT_OK(metaAffinityRingSource_->RefreshForRouteLookup());
+    RETURN_IF_NOT_OK(metaAffinityRingSource_->GetMetaAddress(objectKey, metaOwner));
+
+    std::lock_guard<std::mutex> lock(metaAffinityWriteMutex_);
+    if (workerApi_.size() > STANDBY1_WORKER && workerApi_[STANDBY1_WORKER] != nullptr
+        && workerApi_[STANDBY1_WORKER]->hostPort_ == metaOwner) {
+        workerApi = workerApi_[STANDBY1_WORKER];
+        RETURN_IF_NOT_OK(CheckConnection(STANDBY1_WORKER));
+        workerApi->IncreaseInvokeCount();
+        raii = std::make_unique<Raii>([workerApi]() { workerApi->DecreaseInvokeCount(); });
+        return Status::OK();
+    }
+
+    if (metaAffinityWriteWorkerApi_ == nullptr || metaAffinityWriteWorkerAddress_ != metaOwner) {
+        metaAffinityWriteWorkerApi_ = std::make_shared<ClientWorkerRemoteApi>(
+            metaOwner, cred_, HeartbeatType::NO_HEARTBEAT, token_, signature_.get(), tenantId_,
+            enableCrossNodeConnection_, enableExclusiveConnection_, deviceId_);
+        metaAffinityWriteWorkerApi_->isUseStandbyWorker_ = true;
+        RETURN_IF_NOT_OK(
+            metaAffinityWriteWorkerApi_->Init(requestTimeoutMs_, connectTimeoutMs_, fastTransportMemSize_));
+        metaAffinityWriteWorkerAddress_ = metaOwner;
+    }
+    workerApi = metaAffinityWriteWorkerApi_;
+    CHECK_FAIL_RETURN_STATUS(workerApi->healthy_, K_RPC_UNAVAILABLE, "Meta affinity write worker is unavailable");
+    workerApi->IncreaseInvokeCount();
+    raii = std::make_unique<Raii>([workerApi]() { workerApi->DecreaseInvokeCount(); });
+    LOG(INFO) << FormatString("[MetaAffinityWrite] route object %s to meta owner worker %s", objectKey,
+                              metaOwner.ToString());
+    return Status::OK();
+}
+
 Status ObjectClientImpl::MGetH2D(const std::vector<std::string> &objectKeys,
                                  const std::vector<DeviceBlobList> &devBlobList, std::vector<std::string> &failedKeys,
                                  uint64_t timeoutMs)
 {
     PerfPoint perfPoint(PerfKey::HETERO_CLIENT_MGET_H2D);
     auto access = AccessRecorder::Object(AccessRecorderKey::DS_HETERO_CLIENT_MGETH2D);
-    access.ObjectKeysSummaryRef(objectKeys)
-        .DataSizeProvider([&devBlobList] { return CalculateDeviceBlobSize(devBlobList); });
+    access.ObjectKeysSummaryRef(objectKeys).DataSizeProvider([&devBlobList] {
+        return CalculateDeviceBlobSize(devBlobList);
+    });
 
     auto rc = CheckMGetH2DInput(objectKeys, devBlobList);
     if (rc.IsError()) {
@@ -1454,8 +1535,9 @@ std::shared_future<AsyncResult> ObjectClientImpl::AsyncMGetH2D(const std::vector
     }
 
     auto asyncState = std::make_shared<AsyncMGetH2DState>(objectKeys, devBlobList);
-    access->ObjectKeysSummaryRef(asyncState->objectKeys)
-        .DataSizeProvider([asyncState] { return CalculateDeviceBlobSize(asyncState->devBlobList); });
+    access->ObjectKeysSummaryRef(asyncState->objectKeys).DataSizeProvider([asyncState] {
+        return CalculateDeviceBlobSize(asyncState->devBlobList);
+    });
     std::shared_future<AsyncResult> future = asyncState->promise.get_future().share();
 
     auto traceContext = Trace::Instance().GetContext();
@@ -1487,8 +1569,8 @@ std::shared_future<AsyncResult> ObjectClientImpl::AsyncMGetH2D(const std::vector
             return Status::OK();
         });
 
-    auto copyCompleteTask = [this, traceContext,
-        asyncState = std::move(asyncState), access = std::move(access)]() mutable {
+    auto copyCompleteTask = [this, traceContext, asyncState = std::move(asyncState),
+                             access = std::move(access)]() mutable {
         TraceGuard traceGuard = Trace::Instance().SetTraceContext(traceContext);
         auto rc = asyncState->rpcFuture.get();
         if (rc.IsOk()) {
@@ -1746,8 +1828,9 @@ Status ObjectClientImpl::MSetD2H(const std::vector<std::string> &objectKeys,
 {
     PerfPoint perfPoint(PerfKey::HETERO_CLIENT_MSET_D2H);
     auto access = AccessRecorder::Object(AccessRecorderKey::DS_HETERO_CLIENT_MSETD2H);
-    access.ObjectKeysSummaryRef(objectKeys)
-        .DataSizeProvider([&devBlobList] { return CalculateDeviceBlobSize(devBlobList); });
+    access.ObjectKeysSummaryRef(objectKeys).DataSizeProvider([&devBlobList] {
+        return CalculateDeviceBlobSize(devBlobList);
+    });
     auto rc = CheckMSetD2HInput(objectKeys, devBlobList, setParam);
     if (rc.IsError()) {
         access.Result(rc).Record();
@@ -1781,13 +1864,13 @@ std::shared_future<AsyncResult> ObjectClientImpl::AsyncMSetD2H(const std::vector
     }
 
     auto asyncState = std::make_shared<AsyncMSetD2HState>(objectKeys, devBlobList, setParam);
-    access->ObjectKeysSummaryRef(asyncState->objectKeys)
-        .DataSizeProvider([asyncState] { return CalculateDeviceBlobSize(asyncState->devBlobList); });
+    access->ObjectKeysSummaryRef(asyncState->objectKeys).DataSizeProvider([asyncState] {
+        return CalculateDeviceBlobSize(asyncState->devBlobList);
+    });
 
     auto traceContext = Trace::Instance().GetContext();
     return asyncSetRPCPool_->Submit(
-        [this, traceContext,
-         asyncState = std::move(asyncState), access = std::move(access)]() mutable {
+        [this, traceContext, asyncState = std::move(asyncState), access = std::move(access)]() mutable {
             TraceGuard traceGuard = Trace::Instance().SetTraceContext(traceContext);
             auto rc = MSetD2HImpl(asyncState->objectKeys, asyncState->devBlobList, asyncState->setParam);
             access->Result(rc).Record();
@@ -1907,7 +1990,7 @@ Status ObjectClientImpl::Create(const std::string &objectKey, uint64_t dataSize,
     CHECK_FAIL_RETURN_STATUS(dataSize > 0, K_INVALID, "The dataSize value should be bigger than zero.");
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
-    RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
+    RETURN_IF_NOT_OK(GetWriteWorkerApi(objectKey, workerApi, raii));
     PerfPoint createPoint(PerfKey::CLIENT_CREATE_OBJECT);
     VLOG(1) << "Begin to create object, object_key: " << objectKey;
     buffer.reset();  // Decrease should precede increase to avoid worker lost (ref cnt will be clear) and then restart.
@@ -1996,7 +2079,7 @@ Status ObjectClientImpl::MultiCreate(const std::vector<std::string> &objectKeyLi
     // Pre-condition check for whether we should attempt shared memory or UB
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
-    RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
+    RETURN_IF_NOT_OK(GetWriteWorkerApi(objectKeyList.front(), workerApi, raii));
     bool canUseShm = workerApi->IsShmEnable() && dataSizeSum >= workerApi->shmThreshold_;
     if (canUseShm || IsUrmaEnabled() || !skipCheckExistence) {
         if (!skipCheckExistence) {
@@ -2165,7 +2248,10 @@ Status ObjectClientImpl::Seal(const std::shared_ptr<ObjectBufferInfo> &bufferInf
     }
     VLOG(1) << "Begin to seal object, object_key: " << objectKey;
     PerfPoint rpcPoint(PerfKey::RPC_CLIENT_SEAL_OBJECT);
-    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerApi_[LOCAL_WORKER]->Publish(bufferInfo, isShm, true, nestedObjectKeys),
+    std::shared_ptr<IClientWorkerApi> workerApi;
+    std::unique_ptr<Raii> raii;
+    RETURN_IF_NOT_OK(GetWriteWorkerApi(objectKey, workerApi, raii));
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerApi->Publish(bufferInfo, isShm, true, nestedObjectKeys),
                                      FormatString("Seal object %s", objectKey));
     rpcPoint.Record();
     VLOG(1) << "Finished sealing object, object_key: " << objectKey;
@@ -2191,15 +2277,15 @@ Status ObjectClientImpl::Publish(const std::shared_ptr<ObjectBufferInfo> &buffer
     bufferInfo->isSeal = false;
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
-    RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
+    RETURN_IF_NOT_OK(GetWriteWorkerApi(objectKey, workerApi, raii));
     Timer timer;
     auto rc = workerApi->Publish(bufferInfo, isShm, false, nestedObjectKeys, ttlSecond, existence);
     const auto elapsedUs = static_cast<uint64_t>(timer.ElapsedMicroSecond());
     const double elapsedMs = static_cast<double>(elapsedUs) / US_PER_MS;
-    PLOG_IF_OR_VLOG(INFO, elapsedUs >= CLIENT_LOCAL_OR_RPC_SLOW_US || rc.IsError(), 1,
-                    FormatString("Finished publishing object to worker, object_key: %s, path: %s, cost: %.3fms, rc: %s",
-                                 objectKey, isShm ? "SHM" : (bufferInfo->ubUrmaDataInfo != nullptr ? "UB" : "TCP"),
-                                 elapsedMs, rc.ToString()));
+    PLOG_IF_OR_VLOG(
+        INFO, elapsedUs >= CLIENT_LOCAL_OR_RPC_SLOW_US || rc.IsError(), 1,
+        FormatString("Finished publishing object to worker, object_key: %s, path: %s, cost: %.3fms, rc: %s", objectKey,
+                     isShm ? "SHM" : (bufferInfo->ubUrmaDataInfo != nullptr ? "UB" : "TCP"), elapsedMs, rc.ToString()));
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(rc, FormatString("Publish object %s", objectKey));
     return Status::OK();
 }
@@ -2338,7 +2424,7 @@ Status ObjectClientImpl::Put(const std::string &objectKey, const uint8_t *data, 
                              "Nested object references cannot be nested in a loop.");
     std::shared_ptr<IClientWorkerApi> workerApi;
     std::unique_ptr<Raii> raii;
-    RETURN_IF_NOT_OK(GetAvailableWorkerApi(workerApi, raii));
+    RETURN_IF_NOT_OK(GetWriteWorkerApi(objectKey, workerApi, raii));
 
     Timer setTimer;
     LOG(INFO) << FormatString("[Set] Begin, objectKey: %s, clientId: %s, worker: %s, path: %s", objectKey,
@@ -2440,8 +2526,8 @@ std::vector<std::pair<std::string *, uint32_t>> ObjectClientImpl::PostProcessPip
                     .chunkSize = buffer->GetSize() > OsXprtPipln::ChunkTag::chunkSize2MB ? 1UL : 0UL,
                     .reqId = reqId,
                 };
-                chunkManager->DoPiplnStep2_ChunkConsume(reqId, reinterpret_cast<uint64_t>(buffer->ImmutableData()),
-                                                        tag, buffer->GetSize());
+                chunkManager->DoPiplnStep2_ChunkConsume(reqId, reinterpret_cast<uint64_t>(buffer->ImmutableData()), tag,
+                                                        buffer->GetSize());
                 chunkManager->MarkCancelOrDone(reqId, false /* isDone */);
                 needWaitKeysIds.emplace_back(&objectKey, reqId);
             }

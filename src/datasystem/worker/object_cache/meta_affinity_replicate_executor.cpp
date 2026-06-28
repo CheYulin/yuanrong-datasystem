@@ -93,6 +93,7 @@ void MarkLocalCopyOnOriginWorker(const MetaAffinityReplicateContext &ctx, const 
     if (ctx.objectTable->Get(objectKey, entry).IsError() || entry->WLock().IsError()) {
         return;
     }
+    // Origin publish worker keeps data as a non-primary local copy after primary moves to meta owner.
     (*entry)->stateInfo.SetPrimaryCopy(false);
     entry->WUnlock();
 }

@@ -75,6 +75,8 @@ namespace object_cache {
 using TbbGlobalRefTable = tbb::concurrent_hash_map<std::string, int>;
 using GlobalRefInfo = std::pair<int, std::shared_ptr<TbbGlobalRefTable::accessor>>;
 
+class MetaAffinityClientRingSource;
+
 struct P2PPeer {
     void *devPointer;
     uint32_t *srcRank;
@@ -1156,6 +1158,15 @@ private:
      */
     Status GetAvailableWorkerApi(std::shared_ptr<IClientWorkerApi> &workerApi, std::unique_ptr<Raii> &raii);
 
+    bool HasHealthyLocalWorker() const;
+
+    bool ShouldRouteWriteToMetaOwner() const;
+
+    Status EnsureMetaAffinityRingSource();
+
+    Status GetWriteWorkerApi(const std::string &objectKey, std::shared_ptr<IClientWorkerApi> &workerApi,
+                             std::unique_ptr<Raii> &raii);
+
     /**
      * @brief Mmap a ShmUnit to client.
      * @param[in] fd The ShmUnit store fd.
@@ -1541,6 +1552,11 @@ private:
     uint64_t memcpyParallelThreshold_ = 0;
 
     std::shared_ptr<ServiceDiscovery> serviceDiscovery_ = nullptr;
+
+    std::mutex metaAffinityWriteMutex_;
+    std::shared_ptr<MetaAffinityClientRingSource> metaAffinityRingSource_;
+    std::shared_ptr<IClientWorkerApi> metaAffinityWriteWorkerApi_;
+    HostPort metaAffinityWriteWorkerAddress_;
 };
 }  // namespace object_cache
 }  // namespace datasystem

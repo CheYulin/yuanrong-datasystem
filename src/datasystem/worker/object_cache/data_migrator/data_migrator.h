@@ -70,7 +70,8 @@ public:
      */
     std::future<MigrateDataHandler::MigrateResult> MigrateToTargetNode(
         const std::vector<std::string> &objectKeys, const HostPort &targetAddr,
-        std::shared_ptr<SelectionStrategy> strategy = nullptr, bool isRetry = false, uint32_t slotId = 0);
+        std::shared_ptr<SelectionStrategy> strategy = nullptr, bool isRetry = false, uint32_t slotId = 0,
+        bool isSlotMigration = false);
 
     /**
      * @brief Migrate L2 cache objects by slot grouping.
@@ -91,7 +92,7 @@ public:
         std::copy(failedKeys_.begin(), failedKeys_.end(), std::back_inserter(failedMigrateObjectKeys));
     }
 
-        /**
+    /**
      * @brief Checks the connection to the target Worker node and creates a remote Worker API if connected.
      * @param[in,out] remoteWorkerStub Pointer to the remote Worker API.
      * @param[in] workerAddr Address of the target Worker node.
@@ -126,9 +127,9 @@ private:
      * @param[in] strategy Selection strategy for node selection on failure.
      * @return Future of migrate result.
      */
-    std::future<MigrateDataHandler::MigrateResult> MigrateToSpecificNode(
-        const std::vector<std::string> &objectKeys, const HostPort &targetAddr,
-        std::shared_ptr<SelectionStrategy> strategy);
+    std::future<MigrateDataHandler::MigrateResult> MigrateToSpecificNode(const std::vector<std::string> &objectKeys,
+                                                                         const HostPort &targetAddr,
+                                                                         std::shared_ptr<SelectionStrategy> strategy);
 
     /**
      * @brief Migrate data by master group (normal migration).

@@ -26,6 +26,7 @@ ds_cc_library(
 ds_cc_library(
     name = "common_util_gflag_def",
     srcs = [
+        "cluster_master_flags.cpp",
         "common_gflag_define.cpp",
         "common_gflags_validate.cpp",
         "flags.cpp",
