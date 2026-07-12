@@ -107,6 +107,18 @@ add_datasystem_test(ds_ut_stream TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
 add_datasystem_test(ds_ut_object TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
 add_datasystem_test(ds_ut_slot_store TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
 
+add_executable(ds_ut_nds
+        common/device/nds/alignment_gate_test.cpp
+        common/device/nds/fake_nds_spill_reader_test.cpp
+        common/device/hbm_ipc/mock_ipc_hbm_backend_test.cpp
+        test_main.cpp)
+target_link_libraries(ds_ut_nds PRIVATE
+        GTest::gtest
+        GTest::gmock
+        common_device_nds
+        common_device_hbm_ipc)
+add_datasystem_test(ds_ut_nds TEST_ENVIRONMENTS ${TEST_ENVIRONMENT})
+
 add_executable(flags_ut "${CMAKE_CURRENT_SOURCE_DIR}/common/flags/flags_test.cpp")
 target_link_libraries(flags_ut ds_flags GTest::gtest GTest::gmock)
 add_datasystem_test(flags_ut)

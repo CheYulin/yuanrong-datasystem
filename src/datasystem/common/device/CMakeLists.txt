@@ -1,4 +1,6 @@
 add_subdirectory(ascend)
+add_subdirectory(nds)
+add_subdirectory(hbm_ipc)
 if (BUILD_HETERO_GPU)
     add_subdirectory(nvidia)
 endif()

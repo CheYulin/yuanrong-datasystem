@@ -142,3 +142,29 @@ ds_cc_library(
         "//src/datasystem/common/util:status_helper",
     ],
 )
+
+ds_cc_library(
+    name = "alignment_gate",
+    srcs = ["nds/alignment_gate.cpp"],
+    hdrs = ["nds/alignment_gate.h"],
+)
+
+ds_cc_library(
+    name = "fake_nds_spill_reader",
+    srcs = ["nds/fake_nds_spill_reader.cpp"],
+    hdrs = [
+        "nds/fake_nds_spill_reader.h",
+        "nds/nds_spill_reader.h",
+    ],
+    deps = ["//src/datasystem/common/util:status_helper"],
+)
+
+ds_cc_library(
+    name = "mock_ipc_hbm_backend",
+    srcs = ["hbm_ipc/mock_ipc_hbm_backend.cpp"],
+    hdrs = [
+        "hbm_ipc/ipc_hbm_backend.h",
+        "hbm_ipc/mock_ipc_hbm_backend.h",
+    ],
+    deps = ["//src/datasystem/common/util:status_helper"],
+)

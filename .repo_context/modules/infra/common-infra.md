@@ -58,7 +58,7 @@
 | `metrics` | resource metrics and exporters | builds `common_metrics` and exporter base |
 | `rdma` | fast transport wrappers and optional URMA/RDMA support | conditional build based on feature flags |
 | `l2cache` | persistence and secondary-storage support | includes OBS/SFS clients, slot client, persistence API |
-| `device` | Ascend and optional Nvidia device support wrappers | builds `common_device` over backend-specific device libs |
+| `device` | Ascend and optional Nvidia device support wrappers | builds `common_device`; `device/nds` → `common_device_nds` (AlignmentGate, FakeNdsSpillReader); `device/hbm_ipc` → `common_device_hbm_ipc` (MockIpcHbmBackend) |
 | `os_transport_pipeline` | optional pipeline H2D transport path | only built when `BUILD_PIPLN_H2D` is enabled |
 
 Detailed follow-up docs now exist for:
