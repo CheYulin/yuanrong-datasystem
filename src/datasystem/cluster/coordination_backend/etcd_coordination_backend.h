@@ -75,6 +75,31 @@ public:
                int32_t timeoutMs = SEND_RPC_TIMEOUT_MS_DEFAULT) override;
 
     /**
+     * @brief Idempotently create one ETCD logical table.
+     * @param[in] tableName Logical table name.
+     * @param[in] tablePrefix Physical table prefix.
+     * @return Backend operation status.
+     */
+    Status CreateTable(const std::string &tableName, const std::string &tablePrefix) override;
+
+    /**
+     * @brief Idempotently create one ETCD logical table using an exact physical prefix.
+     * @param[in] tableName Logical table name.
+     * @param[in] tablePrefix Exact physical ETCD table prefix.
+     * @return Backend operation status.
+     */
+    Status CreateTableWithExactPrefix(const std::string &tableName, const std::string &tablePrefix) override;
+
+    /**
+     * @brief Put one exact ETCD key/value pair.
+     * @param[in] tableName Logical table name.
+     * @param[in] key Exact relative key.
+     * @param[in] value Value bytes.
+     * @return Backend operation status.
+     */
+    Status Put(const std::string &tableName, const std::string &key, const std::string &value) override;
+
+    /**
      * @brief Execute callback-form single-key ETCD CAS with revision information.
      * @param[in] tableName Logical table name.
      * @param[in] key Exact relative key.
@@ -147,6 +172,12 @@ public:
     Status ShutdownEventSources() override;
 
     /**
+     * @brief Stop ETCD watch event sources without touching membership keepalive.
+     * @return Backend operation status.
+     */
+    Status ShutdownWatchEventSources() override;
+
+    /**
      * @brief Shut down all runtime resources of the non-owning ETCD store binding.
      * @return Backend operation status.
      */
@@ -191,6 +222,18 @@ public:
      * @param[in] eventHandler Event callback to consume.
      */
     void SetEventHandler(EventHandler &&eventHandler) override;
+
+    /**
+     * @brief Install the ETCD member local-isolation callback.
+     * @param[in] handler Callback to consume.
+     */
+    void SetLocalIsolationHandler(LocalIsolationHandler handler) override;
+
+    /**
+     * @brief Install the ETCD member local-recovery callback.
+     * @param[in] handler Callback to consume.
+     */
+    void SetLocalRecoveryHandler(LocalRecoveryHandler handler) override;
 
     /**
      * @brief Install the existing bool ETCD store-state callback.

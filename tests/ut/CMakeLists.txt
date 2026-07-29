@@ -85,6 +85,7 @@ list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/dynamic_config_updater_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/flags_monitor_gate_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/flags_config_monitor_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/cluster_topology_schema_test\\.cpp$)
+list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/control_backend_scope_classifier_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/topology_key_helper_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/coordination_backend_contract_test\\.cpp$)
 list(FILTER DS_TEST_UT_SRCS EXCLUDE REGEX .*/cluster/ds_coordination_backend_session_test\\.cpp$)
@@ -155,6 +156,7 @@ add_ds_ut_executable(ds_ut_stream
         $<TARGET_OBJECTS:_ds_ut_common_obj>)
 add_ds_ut_executable(ds_ut_object
         ${DS_UT_OBJECT_SRCS}
+        cluster/testing/fake_coordination_backend.cpp
         $<TARGET_OBJECTS:_ds_ut_main_obj>
         $<TARGET_OBJECTS:_ds_ut_common_obj>)
 if (BUILD_WITH_URMA OR BUILD_WITH_URMA_MOCK)
@@ -196,6 +198,7 @@ add_ds_ut_executable(data_worker_options_test
         $<TARGET_OBJECTS:_ds_ut_common_obj>)
 add_executable(cluster_topology_contract_ut
         cluster/cluster_topology_schema_test.cpp
+        cluster/control_backend_scope_classifier_test.cpp
         cluster/coordination_backend_contract_test.cpp
         cluster/ds_coordination_backend_session_test.cpp
         cluster/membership_contract_test.cpp
@@ -228,6 +231,8 @@ add_executable(cluster_topology_contract_ut
 if (BUILD_WITH_URMA_MOCK)
         target_compile_definitions(ds_ut PRIVATE USE_URMA USE_URMA_MOCK)
         target_link_libraries(ds_ut PRIVATE common_urma_mock_obj)
+        target_compile_definitions(ds_ut_object PRIVATE USE_URMA USE_URMA_MOCK)
+        target_link_libraries(ds_ut_object PRIVATE common_urma_mock_obj)
 endif()
 
 target_link_libraries(ds_ut PRIVATE

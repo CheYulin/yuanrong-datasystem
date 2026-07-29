@@ -15,6 +15,7 @@
 #define DATASYSTEM_WORKER_WORKER_HEALTH_CHECK_H
 
 #include "datasystem/common/util/status_helper.h"
+#include "datasystem/worker/runtime/worker_runtime_types.h"
 
 namespace datasystem {
 
@@ -41,6 +42,7 @@ bool IsHealthy();
  * @param[in] allowed True for NORMAL/CONTROL_DEGRADED; false for isolated or stopping states.
  */
 void SetTopologyServingAdmission(bool allowed);
+void SetTopologyServingAdmission(const worker::WorkerAdmissionGateUpdate &update);
 
 void SetUnhealthy();
 }  // namespace datasystem

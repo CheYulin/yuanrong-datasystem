@@ -34,6 +34,7 @@
 
 #include "datasystem/common/ak_sk/ak_sk_manager.h"
 #include "datasystem/common/object_cache/object_bitmap.h"
+#include "datasystem/common/rpc/scoped_bthread_local.h"
 #include "datasystem/common/rpc/rpc_message.h"
 #include "datasystem/common/util/net_util.h"
 #include "datasystem/common/util/timer.h"
@@ -42,10 +43,12 @@
 #include "datasystem/protos/object_posix.pb.h"
 #include "datasystem/protos/worker_object.pb.h"
 #include "datasystem/utils/status.h"
+
 #include "datasystem/worker/object_cache/async_send_manager.h"
 #include "datasystem/worker/object_cache/limiter/data_limiter.h"
 #include "datasystem/worker/object_cache/object_kv.h"
 #include "datasystem/worker/object_cache/service/worker_oc_service_crud_common_api.h"
+#include "datasystem/worker/runtime/worker_runtime_facade.h"
 
 namespace datasystem {
 namespace object_cache {
@@ -63,7 +66,6 @@ class WorkerOcServiceMigrateImpl : public WorkerOcServiceCrudCommonApi,
     friend class WorkerOCServiceImpl;
 
 public:
-
     /**
      * @brief Construct WorkerOcServicePublishImpl.
      * @param[in] initParam The parameter used to init WorkerOcServiceCrudCommonApi.
@@ -73,8 +75,7 @@ public:
      * @param[in] rateController Shared migration rate controller.
      */
     WorkerOcServiceMigrateImpl(WorkerOcServiceCrudParam &initParam, std::shared_ptr<ThreadPool> memcpyThreadPool,
-                               std::shared_ptr<AkSkManager> akSkManager,
-                               const std::string &localAddr,
+                               std::shared_ptr<AkSkManager> akSkManager, const std::string &localAddr,
                                std::shared_ptr<MigrateDataRateController> rateController);
 
     /**
@@ -105,6 +106,16 @@ public:
      * @return K_OK after the drain; K_RPC_DEADLINE_EXCEEDED if admitted requests remain.
      */
     Status CloseIncomingMigrationAdmissionAndWait(std::chrono::steady_clock::time_point deadline);
+
+    void SetOutOfMemoryHandler(std::function<void(const Status &, const std::string &, memory::CacheType)> handler)
+    {
+        outOfMemoryHandler_ = std::move(handler);
+    }
+
+    void SetRuntimeFacade(const worker::WorkerRuntimeFacade *runtime)
+    {
+        runtime_ = runtime;
+    }
 
     /**
      * @brief Whether the admission gate has been closed by CloseIncomingMigrationAdmissionAndWait.
@@ -153,8 +164,7 @@ private:
     template <typename T>
     void BatchLockForMigrateData(const T &infoList, LockedEntryMap &lockedEntries,
                                  std::unordered_set<std::string> &successIds,
-                                 std::unordered_set<std::string> &failedIds,
-                                 LockedEntryMap &needModifyPrimary)
+                                 std::unordered_set<std::string> &failedIds, LockedEntryMap &needModifyPrimary)
     {
         lockedEntries.clear();
         std::map<std::string, uint64_t> toLockIds;
@@ -264,8 +274,8 @@ private:
      */
     Status StartRemoteReadTasks(const MigrateDataDirectReqPb &req, const ObjectInfoMap &needReadDataIds,
                                 const std::vector<uint32_t> &shmIndexMapping,
-                                const std::vector<std::shared_ptr<ShmOwner>> &shmOwners,
-                                std::vector<ReadTask> &tasks, std::unordered_set<std::string> &failedIds);
+                                const std::vector<std::shared_ptr<ShmOwner>> &shmOwners, std::vector<ReadTask> &tasks,
+                                std::unordered_set<std::string> &failedIds);
 
     /**
      * @brief Get shared memory owner by index.
@@ -275,7 +285,7 @@ private:
      * @return Shared memory owner or nullptr.
      */
     std::shared_ptr<ShmOwner> GetShmOwnerByIndex(int idx, const std::vector<uint32_t> &shmIndexMapping,
-                                                  const std::vector<std::shared_ptr<ShmOwner>> &shmOwners) const;
+                                                 const std::vector<std::shared_ptr<ShmOwner>> &shmOwners) const;
 
     /**
      * @brief Process remote read for a single object.
@@ -288,9 +298,8 @@ private:
      * @return K_OK on success, the error otherwise.
      */
     Status ProcessRemoteReadForObject(const MigrateDataDirectReqPb::ObjectInfoPb &object,
-                                      ObjectInfoMap::const_iterator needReadIt,
-                                      std::shared_ptr<ShmUnit> shmUnit, size_t metaSize,
-                                      std::vector<ReadTask> &tasks,
+                                      ObjectInfoMap::const_iterator needReadIt, std::shared_ptr<ShmUnit> shmUnit,
+                                      size_t metaSize, std::vector<ReadTask> &tasks,
                                       std::unordered_set<std::string> &failedIds);
 
     /**
@@ -413,7 +422,11 @@ private:
                                  std::shared_ptr<ShmUnit> unit);
 
     Status BatchAllocateObjectGroupBySlot(const MigrateDataReqPb &req,
-                                          std::unordered_map<std::string, std::shared_ptr<ShmUnit>> &units);
+                                          std::unordered_map<std::string, std::shared_ptr<ShmUnit>> &units,
+                                          memory::CacheType &failedCacheType);
+
+    Status AllocateSlotObject(const std::string &tenantId, uint64_t needSize, memory::CacheType cacheType,
+                              const std::shared_ptr<ShmUnit> &shmUnit);
 
     /**
      * @brief For test mock purpose.
@@ -529,6 +542,10 @@ private:
      */
     bool IsNoSpace(const Status &status) const;
 
+    void RecordOutOfMemory(const Status &status, const std::string &operation, memory::CacheType cacheType) const;
+
+    void FlushPendingOutOfMemory() const;
+
     /**
      * @brief Check resource before migrate data.
      * @param[in] req Migrate data request.
@@ -544,6 +561,8 @@ private:
      * @return K_OK while accepting migrations; K_NOT_READY after local ScaleIn starts.
      */
     Status CheckMigrateDataAdmission(const MigrateDataReqPb &req, MigrateDataRspPb &rsp);
+
+    Status CheckMigrateDataDirectAdmission(const MigrateDataDirectReqPb &req, MigrateDataDirectRspPb &rsp);
 
     /**
      * @brief Acquire one incoming migration admission slot.
@@ -563,8 +582,7 @@ private:
      * @param[in] payloads Object data.
      * @return K_OK on success, the error otherwise.
      */
-    Status MigrateDataImpl(const MigrateDataReqPb &req, MigrateDataRspPb &rsp,
-                           std::vector<RpcMessage> payloads);
+    Status MigrateDataImpl(const MigrateDataReqPb &req, MigrateDataRspPb &rsp, std::vector<RpcMessage> payloads);
 
     /**
      * @brief Get migrate data objects.
@@ -666,6 +684,17 @@ private:
     std::string localAddr_;
 
     std::shared_ptr<MigrateDataRateController> rateController_;
+
+    std::function<void(const Status &, const std::string &, memory::CacheType)> outOfMemoryHandler_;
+
+    const worker::WorkerRuntimeFacade *runtime_{ nullptr };
+
+    struct PendingOutOfMemory {
+        Status status;
+        std::string operation;
+        memory::CacheType cacheType;
+    };
+    static ScopedBthreadLocal<std::vector<PendingOutOfMemory>> pendingOutOfMemory_;
 
     // Protects incomingMigrationAdmissionClosed_ and incomingMigrationCount_.
     std::mutex incomingMigrationMutex_;

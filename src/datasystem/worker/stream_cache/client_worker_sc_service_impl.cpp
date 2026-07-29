@@ -18,6 +18,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <sstream>
+#include <type_traits>
 #include <utility>
 
 #include "datasystem/common/constants.h"
@@ -44,6 +45,7 @@
 #include "datasystem/utils/status.h"
 #include "datasystem/worker/authenticate.h"
 #include "datasystem/worker/cluster_event_type.h"
+#include "datasystem/worker/runtime/worker_runtime_facade.h"
 #include "datasystem/worker/worker_health_check.h"
 #include "datasystem/worker/stream_cache/client_worker_sc_service_impl.h"
 #include "datasystem/worker/stream_cache/metrics/sc_metrics_monitor.h"
@@ -61,6 +63,29 @@ DS_DECLARE_uint32(sc_shared_page_size_mb);
 namespace datasystem {
 namespace worker {
 namespace stream_cache {
+namespace {
+using RuntimeAdmissionGuard = datasystem::worker::WorkerRuntimeFacade::AdmissionGuard;
+
+Status AcquireStreamAdmissionGuard(const worker::WorkerRuntimeFacade *runtime,
+                                   std::optional<RuntimeAdmissionGuard> &guard)
+{
+    if (runtime == nullptr) {
+        return Status::OK();
+    }
+    RuntimeAdmissionGuard candidate;
+    RETURN_IF_NOT_OK(
+        runtime->AcquireAdmissionGuard(worker::WorkerAdmissionKind::NORMAL_WRITE, "StreamCacheService", candidate));
+    guard.emplace(std::move(candidate));
+    return Status::OK();
+}
+
+Status CheckStreamAdmission(const worker::WorkerRuntimeFacade *runtime, const std::string &operation)
+{
+    return runtime == nullptr ? Status::OK()
+                              : runtime->CheckAdmission(worker::WorkerAdmissionKind::NORMAL_WRITE, operation);
+}
+}  // namespace
+
 static const std::string CLIENT_WORKER_SC_SERVICE_IMPL = "ClientWorkerSCServiceImpl";
 template class BlockedCreateRequest<CreateShmPageRspPb, CreateShmPageReqPb>;
 template class MemAllocRequestList<CreateShmPageRspPb, CreateShmPageReqPb>;
@@ -80,8 +105,8 @@ ClientWorkerSCServiceImpl::ClientWorkerSCServiceImpl(HostPort serverAddr, HostPo
       metadataRoute_(metadataRoute),
       membership_(membership)
 {
-    workerMasterApiManager_ = std::make_shared<WorkerMasterSCApiManager>(localWorkerAddress_, akSkManager_,
-                                                                        masterSCService, metadataRoute_);
+    workerMasterApiManager_ =
+        std::make_shared<WorkerMasterSCApiManager>(localWorkerAddress_, akSkManager_, masterSCService, metadataRoute_);
 }
 
 Status ClientWorkerSCServiceImpl::Init()
@@ -131,9 +156,26 @@ Status ClientWorkerSCServiceImpl::ValidateWorkerState()
     return Status::OK();
 }
 
+void ClientWorkerSCServiceImpl::SetRuntimeFacade(const worker::WorkerRuntimeFacade *runtime)
+{
+    runtime_ = runtime;
+}
+
+Status ClientWorkerSCServiceImpl::CommitMemoryWriteAdmission(const std::string &operation) const
+{
+    if (runtime_ == nullptr) {
+        return Status::OK();
+    }
+    RuntimeAdmissionGuard guard;
+    return runtime_->AcquireAdmissionGuard(worker::WorkerAdmissionKind::NORMAL_WRITE, operation, guard);
+}
+
 Status ClientWorkerSCServiceImpl::CreateProducer(
     std::shared_ptr<ServerUnaryWriterReader<CreateProducerRspPb, CreateProducerReqPb>> serverApi)
 {
+    std::optional<RuntimeAdmissionGuard> admissionGuard;
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(AcquireStreamAdmissionGuard(runtime_, admissionGuard),
+                                     "acquire admission guard failed");
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(ValidateWorkerState(), "validate worker state failed");
     CreateProducerReqPb req;
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(serverApi->Read(req), "serverApi read request failed");
@@ -171,12 +213,16 @@ Status ClientWorkerSCServiceImpl::CreateProducerInternal(
     // The real work of the close will be driven in another thread. Launch it now and then release this current thread
     // so that it does not hold up the rpc threads.
     auto traceId = Trace::Instance().GetTraceID();
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(CheckStreamAdmission(runtime_, "CreateProducer"), "check admission failed");
     threadPool_->Execute([=]() mutable {
         GetRequestContext()->scTimeoutDuration = parentDuration;
         Raii outerResetDuration([]() { GetRequestContext()->scTimeoutDuration.Reset(); });
         TraceGuard traceGuard = Trace::Instance().SetTraceNewID(traceId);
         CreateProducerRspPb rsp;
-        Status rc = CreateProducerImpl(namespaceUri, req, rsp);
+        Status rc = CheckStreamAdmission(runtime_, "CreateProducerAsync");
+        if (rc.IsOk()) {
+            rc = CreateProducerImpl(namespaceUri, req, rsp);
+        }
         CheckErrorReturn(rc, rsp, FormatString("[S:%s] CreateProducerImpl failed with rc ", namespaceUri), serverApi);
         recorder->Result(rc);
         if (rc.IsOk()) {
@@ -236,10 +282,10 @@ Status ClientWorkerSCServiceImpl::CreateProducerHandleSend(std::shared_ptr<Worke
         GetRequestContext()->scTimeoutDuration.CalcRealRemainingTime(), std::move(createProducerFn));
 }
 
-void ClientWorkerSCServiceImpl::CleanupCreateProducer(
-    const std::string &namespaceUri, const std::string &producerId,
-    const std::shared_ptr<StreamManagerWithLock> &streamMgrWithLock,
-    const std::shared_ptr<StreamManager> &streamMgr, bool blockMemoryReclaim, bool rollbackProducer)
+void ClientWorkerSCServiceImpl::CleanupCreateProducer(const std::string &namespaceUri, const std::string &producerId,
+                                                      const std::shared_ptr<StreamManagerWithLock> &streamMgrWithLock,
+                                                      const std::shared_ptr<StreamManager> &streamMgr,
+                                                      bool blockMemoryReclaim, bool rollbackProducer)
 {
     if (blockMemoryReclaim) {
         streamMgr->UnblockMemoryReclaim();
@@ -252,9 +298,10 @@ void ClientWorkerSCServiceImpl::CleanupCreateProducer(
                                          namespaceUri, std::placeholders::_1));
 }
 
-Status ClientWorkerSCServiceImpl::PrepareExistingProducerStream(
-    bool streamExisted, const Optional<StreamFields> &streamFields,
-    const std::shared_ptr<StreamManager> &streamMgr, bool &blockMemoryReclaim)
+Status ClientWorkerSCServiceImpl::PrepareExistingProducerStream(bool streamExisted,
+                                                                const Optional<StreamFields> &streamFields,
+                                                                const std::shared_ptr<StreamManager> &streamMgr,
+                                                                bool &blockMemoryReclaim)
 {
     if (!streamExisted) {
         return Status::OK();
@@ -266,9 +313,10 @@ Status ClientWorkerSCServiceImpl::PrepareExistingProducerStream(
     return PostCreateStreamManager(streamMgr, streamFields, reserveShm);
 }
 
-void ClientWorkerSCServiceImpl::CommitCreatedProducer(
-    const std::string &clientId, const std::string &namespaceUri, const std::string &producerId,
-    const std::shared_ptr<StreamManagerWithLock> &streamMgrWithLock, CreatePubSubCtrl::Accessor &createLock)
+void ClientWorkerSCServiceImpl::CommitCreatedProducer(const std::string &clientId, const std::string &namespaceUri,
+                                                      const std::string &producerId,
+                                                      const std::shared_ptr<StreamManagerWithLock> &streamMgrWithLock,
+                                                      CreatePubSubCtrl::Accessor &createLock)
 {
     {
         std::unique_lock<std::shared_timed_mutex> lock(clearMutex_);
@@ -278,10 +326,12 @@ void ClientWorkerSCServiceImpl::CommitCreatedProducer(
     createStreamLocks_.BlockingErase(createLock);
 }
 
-Status ClientWorkerSCServiceImpl::RegisterFirstProducer(
-    bool firstProducer, const std::string &namespaceUri, const std::string &producerId,
-    const Optional<StreamFields> &streamFields, const CreateProducerReqPb &req,
-    const std::shared_ptr<StreamManager> &streamMgr, bool &rollbackProducer)
+Status ClientWorkerSCServiceImpl::RegisterFirstProducer(bool firstProducer, const std::string &namespaceUri,
+                                                        const std::string &producerId,
+                                                        const Optional<StreamFields> &streamFields,
+                                                        const CreateProducerReqPb &req,
+                                                        const std::shared_ptr<StreamManager> &streamMgr,
+                                                        bool &rollbackProducer)
 {
     if (!firstProducer) {
         return Status::OK();
@@ -306,16 +356,15 @@ Status ClientWorkerSCServiceImpl::RegisterFirstProducer(
 
 Status ClientWorkerSCServiceImpl::FillCreateProducerResponse(
     const std::string &namespaceUri, const std::string &producerId, const Optional<StreamFields> &streamFields,
-    const std::shared_ptr<StreamManager> &streamMgr,
-    DataVerificationHeader::SenderProducerNo senderProducerNo, uint64_t streamNo,
-    const CreateProducerReqPb &req, CreateProducerRspPb &rsp)
+    const std::shared_ptr<StreamManager> &streamMgr, DataVerificationHeader::SenderProducerNo senderProducerNo,
+    uint64_t streamNo, const CreateProducerReqPb &req, CreateProducerRspPb &rsp)
 {
     ShmView cursor;
     RETURN_IF_NOT_OK(streamMgr->AddCursorForProducer(producerId, cursor));
     if (StreamManager::EnableSharedPage(streamFields->streamMode_)) {
         ShmView metadata;
-        RETURN_IF_NOT_OK(streamMgr->GetOrCreateShmMeta(TenantAuthManager::Instance()->ExtractTenantId(namespaceUri),
-                                                       metadata));
+        RETURN_IF_NOT_OK(
+            streamMgr->GetOrCreateShmMeta(TenantAuthManager::Instance()->ExtractTenantId(namespaceUri), metadata));
         auto *view = rsp.mutable_stream_meta_view();
         view->set_fd(metadata.fd);
         view->set_mmap_size(metadata.mmapSz);
@@ -363,11 +412,11 @@ Status ClientWorkerSCServiceImpl::CreateProducerImpl(const std::string &namespac
     bool rollbackProducer = false;
     auto streamMgr = streamMgrWithLock->mgr_;
     uint64_t streamNo = streamMgr->GetStreamNo();
-    Raii raii([this, &namespaceUri, &streamMgrWithLock, &streamMgr, &blockMemoryReclaim, &rollbackProducer,
-               &producerId]() {
-        CleanupCreateProducer(namespaceUri, producerId, streamMgrWithLock, streamMgr, blockMemoryReclaim,
-                              rollbackProducer);
-    });
+    Raii raii(
+        [this, &namespaceUri, &streamMgrWithLock, &streamMgr, &blockMemoryReclaim, &rollbackProducer, &producerId]() {
+            CleanupCreateProducer(namespaceUri, producerId, streamMgrWithLock, streamMgr, blockMemoryReclaim,
+                                  rollbackProducer);
+        });
     RETURN_IF_NOT_OK(PrepareExistingProducerStream(streamExisted, streamFields, streamMgr, blockMemoryReclaim));
     const bool firstProducer = (streamMgr->GetLocalProducerCount() == 0);
     CHECK_FAIL_RETURN_STATUS(firstProducer || streamFields->streamMode_ != StreamMode::SPSC, K_INVALID,
@@ -381,8 +430,8 @@ Status ClientWorkerSCServiceImpl::CreateProducerImpl(const std::string &namespac
     // We will let go the accessor at this point to prevent deadlock. The master may send back a SyncConsumerNode
     // rpc back to this worker if this is the first producer. We are still protected by the createLock
     streamMgrWithLock->Release();
-    RETURN_IF_NOT_OK(RegisterFirstProducer(firstProducer, namespaceUri, producerId, streamFields, req, streamMgr,
-                                           rollbackProducer));
+    RETURN_IF_NOT_OK(
+        RegisterFirstProducer(firstProducer, namespaceUri, producerId, streamFields, req, streamMgr, rollbackProducer));
     RETURN_IF_NOT_OK(FillCreateProducerResponse(namespaceUri, producerId, streamFields, streamMgr, senderProducerNo,
                                                 streamNo, req, rsp));
 
@@ -626,9 +675,8 @@ Status ClientWorkerSCServiceImpl::SendBatchedCloseProducerReq(std::set<std::stri
         Status masterCloseRcPerCall;
         std::string masterAddr;
         do {
-            CHECK_FAIL_RETURN_STATUS(
-                GetRequestContext()->scTimeoutDuration.CalcRealRemainingTime() > 0,
-                K_RPC_DEADLINE_EXCEEDED, "Rpc timeout");
+            CHECK_FAIL_RETURN_STATUS(GetRequestContext()->scTimeoutDuration.CalcRealRemainingTime() > 0,
+                                     K_RPC_DEADLINE_EXCEEDED, "Rpc timeout");
 
             // We only send a CloseProducer Request on last producer close
             VLOG(SC_NORMAL_LOG_LEVEL) << FormatString("[S:%s] Sending close producer to master. Attempt: %d",
@@ -691,6 +739,9 @@ Status ClientWorkerSCServiceImpl::CloseProducerImplForceClose(uint32_t lockId, s
 Status ClientWorkerSCServiceImpl::Subscribe(
     std::shared_ptr<ServerUnaryWriterReader<SubscribeRspPb, SubscribeReqPb>> serverApi)
 {
+    std::optional<RuntimeAdmissionGuard> admissionGuard;
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(AcquireStreamAdmissionGuard(runtime_, admissionGuard),
+                                     "acquire admission guard failed");
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(ValidateWorkerState(), "validate worker state failed");
     SubscribeReqPb req;
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(serverApi->Read(req), "serverApi read request failed");
@@ -719,12 +770,16 @@ Status ClientWorkerSCServiceImpl::SubscribeInternal(
     // The real work of the close will be driven in another thread. Launch it now and then release this current thread
     // so that it does not hold up the rpc threads.
     auto traceId = Trace::Instance().GetTraceID();
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(CheckStreamAdmission(runtime_, "Subscribe"), "check admission failed");
     threadPool_->Execute([=]() mutable {
         GetRequestContext()->scTimeoutDuration = parentDuration;
         Raii outerResetDuration([]() { GetRequestContext()->scTimeoutDuration.Reset(); });
         TraceGuard traceGuard = Trace::Instance().SetTraceNewID(traceId);
         SubscribeRspPb rsp;
-        Status rc = SubscribeImpl(namespaceUri, req, rsp);
+        Status rc = CheckStreamAdmission(runtime_, "SubscribeAsync");
+        if (rc.IsOk()) {
+            rc = SubscribeImpl(namespaceUri, req, rsp);
+        }
         CheckErrorReturn(rc, rsp, "SubscribeImpl failed with rc ", serverApi);
         recorder->Result(rc);
         recorder->Record();
@@ -756,9 +811,8 @@ Status ClientWorkerSCServiceImpl::SubscribeHandleSend(std::shared_ptr<StreamMana
 {
     auto subscribeFn = [&] {
         std::shared_ptr<WorkerMasterSCApi> api;
-        RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
-            workerMasterApiManager_->GetWorkerMasterApi(streamName, api),
-            "Getting master api failed. stream name = " + streamName);
+        RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerMasterApiManager_->GetWorkerMasterApi(streamName, api),
+                                         "Getting master api failed. stream name = " + streamName);
         masterAddress = api->Address();
         master::SubscribeReqPb masterReq;
         auto &consumerMetaPb = *masterReq.mutable_consumer_meta();
@@ -965,9 +1019,8 @@ Status ClientWorkerSCServiceImpl::CloseConsumerImpl(const std::string &consumerI
         auto closeConsumerFn = [&] {
             // We don't care about lastAckCursor change when close consumer, so we set it as 0.
             std::shared_ptr<WorkerMasterSCApi> api;
-            RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
-                workerMasterApiManager_->GetWorkerMasterApi(streamName, api),
-                "Getting master api failed. stream name = " + streamName);
+            RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerMasterApiManager_->GetWorkerMasterApi(streamName, api),
+                                             "Getting master api failed. stream name = " + streamName);
             masterAddr = api->Address();
             master::CloseConsumerReqPb req;
             auto &consumerMetaPb = *req.mutable_consumer_meta();
@@ -1043,6 +1096,9 @@ void ClientWorkerSCServiceImpl::AsyncSendMemReq(const std::string &namespaceUri)
 Status ClientWorkerSCServiceImpl::CreateShmPage(
     std::shared_ptr<ServerUnaryWriterReader<CreateShmPageRspPb, CreateShmPageReqPb>> serverApi)
 {
+    std::optional<RuntimeAdmissionGuard> admissionGuard;
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(AcquireStreamAdmissionGuard(runtime_, admissionGuard),
+                                     "acquire admission guard failed");
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(ValidateWorkerState(), "validate worker state failed");
     PerfPoint point(PerfKey::WORKER_CREATE_WRITE_PAGE_ALL);
     CreateShmPageReqPb req;
@@ -1077,25 +1133,17 @@ Status ClientWorkerSCServiceImpl::HandleBlockedRequestImpl(const std::string &st
     RETURN_IF_NOT_OK(GetStreamManager(streamName, accessor));
     std::shared_ptr<StreamManager> streamMgr = accessor->second;
     point1.Record();
-    // Check the next request.
-    size_t nextReqSz;
-    bool bigElement;
-    std::tie(nextReqSz, bigElement) = streamMgr->GetNextBlockedRequestSize();
-    // Big element doesn't go through the ack chain, and we will focus more
-    // on CreateShmPage request which incur a lot of lock conflicts with the ack thread
-    if (!(bigElement || streamMgr->CheckHadEnoughMem(nextReqSz))) {
-        // We will try to release pages (if any) as if this thread is doing ack manually
-        // Part of the ack process may also call StreamManager::HandleBlockedRequestImpl
-        // in which case we can expect StreamMgr::GetBlockedCreateRequest below can return
-        // K_TRY_AGAIN
-        VLOG(SC_NORMAL_LOG_LEVEL) << FormatString("[%s S:%s] Most likely OOM. Reclaim memory", LogPrefix(), streamName);
-        streamMgr->AckCursors();
-    }
     std::shared_ptr<BlockedCreateRequest<W, R>> blockedReq;
     INJECT_POINT("HandleBlockedRequestImpl.sleep");
     auto rc = streamMgr->GetBlockedCreateRequest(blockedReq);
     RETURN_OK_IF_TRUE(rc.GetCode() == K_TRY_AGAIN);
     RETURN_IF_NOT_OK(rc);
+    const char *operation =
+        std::is_same<W, CreateLobPageRspPb>::value ? "AllocBigShmMemoryAsync" : "CreateShmPageAsync";
+    Status admissionRc = CheckStreamAdmission(runtime_, operation);
+    if (admissionRc.IsError()) {
+        return blockedReq->SendStatus(admissionRc);
+    }
     // Treat OOM as normal. HandleBlockedRequestImpl will re-queue the request
     RETURN_IF_NOT_OK_EXCEPT(streamMgr->template HandleBlockedRequestImpl(std::move(blockedReq), true), K_OUT_OF_MEMORY);
     return Status::OK();
@@ -1104,6 +1152,9 @@ Status ClientWorkerSCServiceImpl::HandleBlockedRequestImpl(const std::string &st
 Status ClientWorkerSCServiceImpl::AllocBigShmMemory(
     std::shared_ptr<ServerUnaryWriterReader<CreateLobPageRspPb, CreateLobPageReqPb>> serverApi)
 {
+    std::optional<RuntimeAdmissionGuard> admissionGuard;
+    RETURN_IF_NOT_OK_PRINT_ERROR_MSG(AcquireStreamAdmissionGuard(runtime_, admissionGuard),
+                                     "acquire admission guard failed");
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(ValidateWorkerState(), "validate worker state failed");
     CreateLobPageReqPb req;
     RETURN_IF_NOT_OK(serverApi->Read(req));
@@ -1240,9 +1291,8 @@ Status ClientWorkerSCServiceImpl::DeleteStreamHandleSend(const std::string &stre
 {
     auto deleteFn = [&] {
         std::shared_ptr<WorkerMasterSCApi> api;
-        RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
-            workerMasterApiManager_->GetWorkerMasterApi(streamName, api),
-            "Getting master api failed. stream name = " + streamName);
+        RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerMasterApiManager_->GetWorkerMasterApi(streamName, api),
+                                         "Getting master api failed. stream name = " + streamName);
         master::DeleteStreamReqPb masterReq;
         masterReq.set_stream_name(streamName);
         masterReq.mutable_src_node_addr()->set_host(localWorkerAddress_.Host());
@@ -1280,9 +1330,8 @@ Status ClientWorkerSCServiceImpl::QueryGlobalProducersNumImpl(const QueryGlobalN
                               localWorkerAddress_.ToString(), namespaceUri);
     auto queryFn = [&] {
         std::shared_ptr<WorkerMasterSCApi> api;
-        RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
-            workerMasterApiManager_->GetWorkerMasterApi(namespaceUri, api),
-            "Getting master api failed. stream name = " + namespaceUri);
+        RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerMasterApiManager_->GetWorkerMasterApi(namespaceUri, api),
+                                         "Getting master api failed. stream name = " + namespaceUri);
         master::QueryGlobalNumReqPb masterReq;
         masterReq.set_stream_name(namespaceUri);
         masterReq.set_redirect(true);
@@ -1321,9 +1370,8 @@ Status ClientWorkerSCServiceImpl::QueryGlobalConsumersNumImpl(const QueryGlobalN
                               localWorkerAddress_.ToString(), namespaceUri);
     auto queryFn = [&] {
         std::shared_ptr<WorkerMasterSCApi> api;
-        RETURN_IF_NOT_OK_PRINT_ERROR_MSG(
-            workerMasterApiManager_->GetWorkerMasterApi(namespaceUri, api),
-            "Getting master api failed. stream name = " + namespaceUri);
+        RETURN_IF_NOT_OK_PRINT_ERROR_MSG(workerMasterApiManager_->GetWorkerMasterApi(namespaceUri, api),
+                                         "Getting master api failed. stream name = " + namespaceUri);
         master::QueryGlobalNumReqPb masterReq;
         masterReq.set_stream_name(namespaceUri);
         masterReq.set_redirect(true);
@@ -1670,8 +1718,7 @@ Status ClientWorkerSCServiceImpl::GetAllStreamMetadata(const GetMetadataAllStrea
     return Status::OK();
 }
 
-bool ClientWorkerSCServiceImpl::CheckConditionsForStream(const std::string &streamName,
-                                                         const std::string &masterAddr)
+bool ClientWorkerSCServiceImpl::CheckConditionsForStream(const std::string &streamName, const std::string &masterAddr)
 {
     if (!masterAddr.empty()) {
         HostPort masterAddress;
@@ -1823,8 +1870,7 @@ Status ClientWorkerSCServiceImpl::DeleteStreamContext(const std::string &streamN
     return Status::OK();
 }
 
-Status ClientWorkerSCServiceImpl::GetWorkerStub(const HostPort &workerHostPort,
-                                                std::shared_ptr<RpcStubBase> &stub)
+Status ClientWorkerSCServiceImpl::GetWorkerStub(const HostPort &workerHostPort, std::shared_ptr<RpcStubBase> &stub)
 {
     // Worker<->worker stream block/unblock RPCs (ClientWorkerSCService) must use the
     // transport selected by FLAGS_use_brpc, exactly like WORKER_WORKER_SC_SVC. The

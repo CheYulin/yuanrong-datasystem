@@ -117,7 +117,7 @@ public:
     size_t Size() const
     {
         std::shared_lock<std::shared_timed_mutex> lock(timersLock_);
-        return timerPool_->size();
+        return timerPool_ == nullptr ? 0 : timerPool_->size();
     }
 
     /**
@@ -155,7 +155,7 @@ private:
     using TimerPoolType = std::map<uint64_t, std::list<TimerImpl>>;
     mutable std::shared_timed_mutex timersLock_;  // We need to hold the lock to protect timerPool_
     std::unique_ptr<TimerPoolType> timerPool_{ nullptr };
-    int runTimerFD_{ 0 };
+    int runTimerFD_{ -1 };
     std::unique_ptr<EventLoop> timerEvLoop_{ nullptr };
     std::unique_ptr<ThreadPool> asyncEraseAndRunTimer_{ nullptr };
     const int eraseThreadNum{ 1 };

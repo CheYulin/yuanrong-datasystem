@@ -29,6 +29,12 @@ CREDENTIAL_KEY_RE = re.compile(
     r"tenant[_ -]?access[_ -]?key|tenant[_ -]?secret[_ -]?key|ak|sk|"
     r"username|user|account|login|tenant|namespace)\s*(?::|=(?!=))"
 )
+CREDENTIAL_EXEMPT_SYNTAX_RE = re.compile(
+    r"^[+-]?\s*(?:"
+    r"#\s*include\s+(?:\"(?:\\.|[^\"\\])*\"|<[^>\r\n]+>)|"
+    r"using\s+namespace\s+(?:::)?[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*\s*;"
+    r")"
+)
 SAFE_CREDENTIAL_RHS_RE = re.compile(
     r"(?x)"
     r"(?:"
@@ -177,14 +183,18 @@ def _index_inside_quoted_string(line: str, index: int) -> bool:
 
 
 def _credential_assignment_is_sensitive(line: str) -> bool:
-    stripped_line = line.strip()
-    for match in CREDENTIAL_KEY_RE.finditer(line):
-        if _index_inside_quoted_string(line, match.start()):
+    scan_line = line.strip()
+    syntax_match = CREDENTIAL_EXEMPT_SYNTAX_RE.match(scan_line)
+    if syntax_match:
+        scan_line = scan_line[syntax_match.end():]
+    stripped_line = scan_line.strip()
+    for match in CREDENTIAL_KEY_RE.finditer(scan_line):
+        if _index_inside_quoted_string(scan_line, match.start()):
             continue
-        raw_value = line[match.end():].strip()
+        raw_value = scan_line[match.end():].strip()
         if not raw_value:
             continue
-        if stripped_line.startswith(("//", "/*", "*")) and "=" not in line[match.start():match.end()]:
+        if stripped_line.startswith(("//", "/*", "*")) and "=" not in scan_line[match.start():match.end()]:
             continue
         if stripped_line.startswith(("//", "/*", "*")) and re.match(r"0[xX][0-9A-Fa-f]+|\d+", raw_value):
             continue

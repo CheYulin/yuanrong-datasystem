@@ -13,6 +13,7 @@
 #include "datasystem/worker/worker_health_check.h"
 
 #include <fstream>
+#include <mutex>
 
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/flags/flags.h"
@@ -32,6 +33,10 @@ DS_DEFINE_validator(health_check_path, &Validator::ValidatePathString);
 namespace datasystem {
 std::atomic<bool> g_health{ false };
 std::atomic<bool> g_topologyServingAdmission{ true };
+namespace {
+std::mutex g_topologyServingAdmissionMutex;
+uint64_t g_topologyServingAdmissionRevision{ 0 };
+}  // namespace
 
 Status ResetHealthProbe()
 {
@@ -75,9 +80,23 @@ bool IsHealthy()
 
 void SetTopologyServingAdmission(bool allowed)
 {
-    const bool previous = g_topologyServingAdmission.exchange(allowed);
-    if (previous != allowed) {
-        LOG(INFO) << "Cluster topology business admission is now " << (allowed ? "open" : "closed");
+    SetTopologyServingAdmission(
+        worker::WorkerAdmissionGateUpdate{ allowed, worker::NextWorkerAdmissionGateRevision() });
+}
+
+void SetTopologyServingAdmission(const worker::WorkerAdmissionGateUpdate &update)
+{
+    bool previous;
+    {
+        std::lock_guard<std::mutex> lock(g_topologyServingAdmissionMutex);
+        if (update.revision <= g_topologyServingAdmissionRevision) {
+            return;
+        }
+        g_topologyServingAdmissionRevision = update.revision;
+        previous = g_topologyServingAdmission.exchange(update.open);
+    }
+    if (previous != update.open) {
+        LOG(INFO) << "Cluster topology business admission is now " << (update.open ? "open" : "closed");
     }
 }
 

@@ -23,10 +23,13 @@ ds_cc_library(
         "executor/storage_scan_plan.cpp",
     ],
     hdrs = [
+        "executor/cancellation_token.h",
         "executor/hash_key_filter.h",
         "executor/key_filter.h",
         "executor/storage_scan_plan.h",
         "executor/storage_scan_plan_access.h",
+        "executor/topology_cleanup_effect.h",
+        "executor/topology_phase_action.h",
         "executor/topology_phase_callbacks.h",
         "model/topology_types.h",
     ],
@@ -42,6 +45,19 @@ ds_cc_library(
     hdrs = [
         "model/topology_types.h",
         "runtime/control_backend_state.h",
+    ],
+)
+
+ds_cc_library(
+    name = "cluster_control_backend_scope_classifier",
+    srcs = [
+        "runtime/control_backend_scope_classifier.cpp",
+    ],
+    hdrs = [
+        "runtime/control_backend_scope_classifier.h",
+    ],
+    deps = [
+        ":cluster_control_backend_state",
     ],
 )
 
@@ -103,6 +119,7 @@ ds_cc_library(
         "routing/placement_facade.h",
         "routing/placement_types.h",
         "runtime/control_backend_state.h",
+        "runtime/control_backend_scope_classifier.h",
         "runtime/coordination_event_dispatcher.h",
         "runtime/topology_engine.h",
         "runtime/topology_observer.h",
@@ -113,6 +130,7 @@ ds_cc_library(
     ],
     deps = [
         ":cluster_membership_codec",
+        ":cluster_control_backend_scope_classifier",
         ":cluster_topology_keyspace",
         ":cluster_topology_scope",
         "//include/datasystem/utils:utils_headers",
@@ -120,7 +138,6 @@ ds_cc_library(
         "//src/datasystem/cluster/coordination_backend:topology_recovery_reporter",
         "//src/datasystem/common/ak_sk:hasher",
         "//src/datasystem/common/kvstore:kv_store",
-        "//src/datasystem/common/kvstore/etcd:etcd_store",
         "//src/datasystem/common/log:common_log_header",
         "//src/datasystem/common/util:hash_algorithm",
         "//src/datasystem/common/util:common_util",

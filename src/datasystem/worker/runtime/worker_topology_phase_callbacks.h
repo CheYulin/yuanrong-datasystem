@@ -28,33 +28,91 @@
 
 namespace datasystem {
 
-class MetadataManagerHolder;
-
-namespace object_cache {
-class WorkerOCServiceImpl;
-}
-
-namespace master {
-class OCMetadataManager;
-class SCMetadataManager;
-}  // namespace master
-
 namespace worker {
 
 using TopologyReadinessCheck =
     std::function<Status(std::chrono::steady_clock::time_point, const cluster::CancellationToken &)>;
-using ObjectCacheServiceProvider = std::function<object_cache::WorkerOCServiceImpl *()>;
+
+/**
+ * @brief Inject object-cache actions triggered by Worker topology callbacks.
+ */
+class IWorkerTopologyObjectCacheActions {
+public:
+    /**
+     * @brief Destroy the injected action interface.
+     */
+    virtual ~IWorkerTopologyObjectCacheActions() = default;
+
+    /**
+     * @brief Drain local object-cache data for one ScaleIn batch.
+     * @param[in] context Fenced callback context.
+     * @return Drain status.
+     */
+    virtual Status DrainScaleInData(const cluster::TopologyCallbackContext &context) = 0;
+
+    /**
+     * @brief Prepare object-cache ScaleIn cleanup authorization and effect.
+     * @param[in] context Fenced callback context.
+     * @param[out] prepared Executor-owned cleanup authorization and effect.
+     * @return Preparation status.
+     */
+    virtual Status PrepareScaleInCleanup(const cluster::TopologyCallbackContext &context,
+                                         std::unique_ptr<cluster::TopologyPreparedCleanup> &prepared) = 0;
+
+    /**
+     * @brief Run object-cache local data cleanup for one Failure callback.
+     * @param[in] context Fenced callback context.
+     * @return Cleanup status.
+     */
+    virtual Status CleanupLocalData(const cluster::TopologyCallbackContext &context) = 0;
+};
+
+/**
+ * @brief Inject metadata recovery and cleanup actions triggered by Worker topology callbacks.
+ */
+class IWorkerTopologyMetadataActions {
+public:
+    /**
+     * @brief Destroy the injected metadata action interface.
+     */
+    virtual ~IWorkerTopologyMetadataActions() = default;
+
+    /**
+     * @brief Migrate metadata for one ScaleOut or ScaleIn metadata task.
+     * @param[in] context Fenced callback context.
+     * @return Migration status.
+     */
+    virtual Status MigrateMetadata(const cluster::TopologyCallbackContext &context) = 0;
+
+    /**
+     * @brief Recover metadata after one failed member is confirmed.
+     * @param[in] context Fenced callback context.
+     * @return First metadata recovery error, or K_OK.
+     */
+    virtual Status RecoverFailureMetadata(const cluster::TopologyCallbackContext &context) = 0;
+
+    /**
+     * @brief Cleanup failed-member metadata before local data cleanup.
+     * @param[in] context Fenced callback context.
+     * @return First metadata cleanup error, or K_OK.
+     */
+    virtual Status CleanupFailureMetadata(const cluster::TopologyCallbackContext &context) = 0;
+
+    /**
+     * @brief Cleanup device metadata after local data cleanup.
+     * @param[in] context Fenced callback context.
+     * @return Device metadata cleanup status.
+     */
+    virtual Status CleanupDeviceMetadata(const cluster::TopologyCallbackContext &context) = 0;
+};
 
 /**
  * @brief Complete Worker dependencies required by topology phase callbacks.
  */
 struct WorkerTopologyPhaseCallbackDependencies {
-    bool centralizedMetadata;
-    bool localMetadataMaster;
-    bool streamMetadataEnabled;
-    MetadataManagerHolder &metadataManagers;
-    ObjectCacheServiceProvider objectCacheServiceProvider;
     TopologyReadinessCheck readinessCheck;
+    std::shared_ptr<IWorkerTopologyMetadataActions> metadataActions;
+    std::shared_ptr<IWorkerTopologyObjectCacheActions> objectCacheActions;
 };
 
 /**
@@ -129,20 +187,11 @@ private:
     static Status CheckContext(const cluster::TopologyCallbackContext &context);
 
     /**
-     * @brief Migrate object and optional stream metadata for one ordinary task.
-     * @param[in] context Fenced callback context.
-     * @return Migration status.
-     */
-    Status MigrateMetadata(const cluster::TopologyCallbackContext &context);
-
-    /**
      * @brief Run or join the member-wide local data drain for one ScaleIn batch.
      * @param[in] context Fenced callback context.
-     * @param[in] objectCacheService Late-bound Worker object-cache service.
      * @return Drain status or a bounded wait error.
      */
-    Status DrainScaleInData(const cluster::TopologyCallbackContext &context,
-                            object_cache::WorkerOCServiceImpl &objectCacheService);
+    Status DrainScaleInData(const cluster::TopologyCallbackContext &context);
 
     /**
      * @brief Acquire the member-wide drain leadership or observe a completed drain.
@@ -160,12 +209,6 @@ private:
     void CompleteScaleInDrain(const cluster::TopologyCallbackContext &context, const Status &status);
 
     /**
-     * @brief Resolve the late-bound object-cache service after Worker service construction.
-     * @return Worker-owned service pointer, or nullptr before construction or when object cache is disabled.
-     */
-    object_cache::WorkerOCServiceImpl *GetObjectCacheService() const;
-
-    /**
      * @brief Retain and log the first best-effort Failure step error.
      * @param[in] step Stable diagnostic step name.
      * @param[in] status Step status.
@@ -180,23 +223,9 @@ private:
      */
     Status RunFailureBestEffort(const cluster::TopologyCallbackContext &context);
 
-    /**
-     * @brief Run cleanup stages after metadata recovery has been attempted.
-     * @param[in] context Fenced callback context.
-     * @param[in] ocMetadata Optional local object metadata manager.
-     * @param[in] scMetadata Optional local stream metadata manager.
-     * @param[in,out] firstError First observed error.
-     */
-    void RunFailureCleanup(const cluster::TopologyCallbackContext &context,
-                           const std::shared_ptr<master::OCMetadataManager> &ocMetadata,
-                           const std::shared_ptr<master::SCMetadataManager> &scMetadata, Status &firstError);
-
-    const bool centralizedMetadata_;
-    const bool localMetadataMaster_;
-    const bool streamMetadataEnabled_;
-    MetadataManagerHolder &metadataManagers_;
-    ObjectCacheServiceProvider objectCacheServiceProvider_;
     TopologyReadinessCheck readinessCheck_;
+    std::shared_ptr<IWorkerTopologyMetadataActions> metadataActions_;
+    std::shared_ptr<IWorkerTopologyObjectCacheActions> objectCacheActions_;
     // Protects scaleInDrainState_; peer ScaleIn task callbacks wait on scaleInDrainChanged_.
     std::mutex scaleInDrainMutex_;
     std::condition_variable scaleInDrainChanged_;

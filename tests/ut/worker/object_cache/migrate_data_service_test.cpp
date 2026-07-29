@@ -24,6 +24,7 @@
 #include <functional>
 #include <future>
 #include <list>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -31,6 +32,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <bthread/bthread.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -39,10 +41,13 @@
 #include "ut/common.h"
 #include "../../../common/binmock/binmock.h"
 #include "cluster/test_port_allocator.h"
+#include "datasystem/cluster/coordination_backend/coordination_backend.h"
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/object_cache/shm_guard.h"
 #include "datasystem/common/flags/common_flags.h"
+#include "datasystem/common/kvstore/etcd/etcd_constants.h"
 #include "datasystem/common/shared_memory/allocator.h"
+#include "datasystem/common/util/hash_algorithm.h"
 #include "datasystem/common/util/format.h"
 #include "datasystem/common/util/raii.h"
 #include "datasystem/common/util/net_util.h"
@@ -51,11 +56,16 @@
 #include "datasystem/utils/status.h"
 #include "datasystem/worker/object_cache/obj_cache_shm_unit.h"
 #include "datasystem/worker/object_cache/object_endpoint_policy.h"
+#include "datasystem/worker/object_cache/object_metadata_coordination_reader.h"
+#include "datasystem/worker/runtime/worker_runtime_facade.h"
 #define private public
 #include "datasystem/worker/object_cache/service/worker_oc_service_get_impl.h"
 #undef private
+#define private public
 #include "datasystem/worker/object_cache/worker_oc_spill.h"
+#undef private
 #include "datasystem/worker/object_cache/worker_request_manager.h"
+#include "datasystem/worker/runtime/worker_runtime_state.h"
 #include "tests/ut/worker/object_cache/test_placement_facade.h"
 
 DS_DECLARE_string(spill_directory);
@@ -87,6 +97,166 @@ bool WaitForInjectPointExecuteCount(const std::string &name, uint64_t expectedCo
 }
 
 using MigrateTestPlacementFacade = TestPlacementFacade;
+
+namespace {
+Status UnsupportedCoordinationCall()
+{
+    return Status(K_NOT_SUPPORTED, "fake coordination backend only supports metadata get");
+}
+
+class FakeMetadataCoordinationBackend : public cluster::ICoordinationBackend {
+public:
+    Status GetAll(const std::string &, std::vector<std::pair<std::string, std::string>> &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status Get(const std::string &tableName, const std::string &key, std::string &value) override
+    {
+        RangeSearchResult res;
+        RETURN_IF_NOT_OK(Get(tableName, key, res));
+        value = std::move(res.value);
+        return Status::OK();
+    }
+
+    Status Get(const std::string &tableName, const std::string &key, RangeSearchResult &res,
+               int32_t timeoutMs = SEND_RPC_TIMEOUT_MS_DEFAULT) override
+    {
+        lastTable = tableName;
+        lastKey = key;
+        lastTimeoutMs = timeoutMs;
+        auto iter = values.find({ tableName, key });
+        if (iter == values.end()) {
+            RETURN_STATUS(K_NOT_FOUND, "metadata is absent");
+        }
+        res.key = key;
+        res.value = iter->second;
+        return Status::OK();
+    }
+
+    Status CreateTable(const std::string &, const std::string &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status CreateTableWithExactPrefix(const std::string &, const std::string &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status Put(const std::string &, const std::string &, const std::string &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status CAS(const std::string &, const std::string &, const ProcessFunction &, RangeSearchResult &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status CAS(const std::string &, const std::string &, const ProcessFunction &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status CAS(const std::string &, const std::string &, const std::string &, const std::string &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status Delete(const std::string &, const std::string &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status Delete(const std::string &, const std::string &, int) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status WatchEvents(const std::vector<cluster::WatchKey> &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status InitKeepAlive(const std::string &, const std::string &, bool, bool) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status ShutdownEventSources() override
+    {
+        return Status::OK();
+    }
+
+    Status ShutdownWatchEventSources() override
+    {
+        return Status::OK();
+    }
+
+    Status Shutdown() override
+    {
+        return Status::OK();
+    }
+
+    Status UpdateNodeState(cluster::MemberLifecycleState) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status GetStorePrefix(const std::string &, std::string &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    Status InformReconciliationDone(const HostPort &) override
+    {
+        return UnsupportedCoordinationCall();
+    }
+
+    bool IsKeepAliveTimeout() override
+    {
+        return keepAliveTimeout;
+    }
+
+    bool IsFirstKeepAliveSent() override
+    {
+        return true;
+    }
+
+    void SetEventHandler(EventHandler &&) override
+    {
+    }
+    void SetLocalIsolationHandler(LocalIsolationHandler) override
+    {
+    }
+    void SetLocalRecoveryHandler(LocalRecoveryHandler) override
+    {
+    }
+    void SetCheckStoreStateWhenNetworkFailedHandler(std::function<bool()>) override
+    {
+    }
+
+    bool keepAliveTimeout{ false };
+    int32_t lastTimeoutMs{ 0 };
+    std::string lastTable;
+    std::string lastKey;
+    std::map<std::pair<std::string, std::string>, std::string> values;
+};
+}  // namespace
+
+void ResetWorkerOcSpillForTest()
+{
+    auto *spill = WorkerOcSpill::Instance();
+    spill->stopCompaction_ = true;
+    spill->waitPost_.Set();
+    if (spill->spillCompactionThread_.joinable()) {
+        spill->spillCompactionThread_.join();
+    }
+    spill->fileMgr_.clear();
+    spill->totalActiveSpilledSize_ = 0;
+    spill->stopCompaction_ = false;
+}
 
 #define RETURN_UNSUPPORTED_MASTER_API(method, ...)                                      \
     Status method(__VA_ARGS__) override                                                \
@@ -131,11 +301,9 @@ public:
     RETURN_UNSUPPORTED_MASTER_API(GIncNestedRef, master::GIncNestedRefReqPb &, master::GIncNestedRefRspPb &)
     RETURN_UNSUPPORTED_MASTER_API(GDecNestedRef, master::GDecNestedRefReqPb &, master::GDecNestedRefRspPb &)
     RETURN_UNSUPPORTED_MASTER_API(UpdateMeta, master::UpdateMetaReqPb &, master::UpdateMetaRspPb &)
-    RETURN_UNSUPPORTED_MASTER_API(DeleteAllCopyMeta, master::DeleteAllCopyMetaReqPb &,
-                                  master::DeleteAllCopyMetaRspPb &)
+    RETURN_UNSUPPORTED_MASTER_API(DeleteAllCopyMeta, master::DeleteAllCopyMetaReqPb &, master::DeleteAllCopyMetaRspPb &)
     RETURN_UNSUPPORTED_MASTER_API(GDecreaseMasterRef, const std::vector<std::string> &,
-                                  std::unordered_set<std::string> &, std::vector<std::string> &,
-                                  const std::string &)
+                                  std::unordered_set<std::string> &, std::vector<std::string> &, const std::string &)
     RETURN_UNSUPPORTED_MASTER_API(ReleaseGRefs, master::ReleaseGRefsReqPb &, master::ReleaseGRefsRspPb &)
     RETURN_UNSUPPORTED_MASTER_API(GIncreaseMasterRef, master::GIncreaseReqPb &, master::GIncreaseRspPb &)
     RETURN_UNSUPPORTED_MASTER_API(GDecreaseMasterRef, master::GDecreaseReqPb &, master::GDecreaseRspPb &)
@@ -157,10 +325,10 @@ public:
     std::function<Status(master::RemoveMetaReqPb &, master::RemoveMetaRspPb &)> removeMeta_;
 
     RETURN_UNSUPPORTED_MASTER_API(PutP2PMeta, PutP2PMetaReqPb &, PutP2PMetaRspPb &)
-    RETURN_UNSUPPORTED_MASTER_API(SubscribeReceiveEvent, SubscribeReceiveEventReqPb &,
-                                  std::shared_ptr<ServerUnaryWriterReader<SubscribeReceiveEventRspPb,
-                                                                           SubscribeReceiveEventReqPb>>,
-                                  std::shared_ptr<AsyncRpcRequestManager> &)
+    RETURN_UNSUPPORTED_MASTER_API(
+        SubscribeReceiveEvent, SubscribeReceiveEventReqPb &,
+        std::shared_ptr<ServerUnaryWriterReader<SubscribeReceiveEventRspPb, SubscribeReceiveEventReqPb>>,
+        std::shared_ptr<AsyncRpcRequestManager> &)
     RETURN_UNSUPPORTED_MASTER_API(GetP2PMeta, GetP2PMetaReqPb &,
                                   std::shared_ptr<ServerUnaryWriterReader<GetP2PMetaRspPb, GetP2PMetaReqPb>>,
                                   std::shared_ptr<AsyncRpcRequestManager> &)
@@ -182,8 +350,7 @@ public:
     RETURN_UNSUPPORTED_MASTER_API(PureQueryMeta, master::PureQueryMetaReqPb &, master::PureQueryMetaRspPb &)
     RETURN_UNSUPPORTED_MASTER_API(CheckObjectDataLocation, master::CheckObjectDataLocationReqPb &,
                                   master::CheckObjectDataLocationRspPb &)
-    RETURN_UNSUPPORTED_MASTER_API(RollbackMultiMeta, master::RollbackMultiMetaReqPb &,
-                                  master::RollbackMultiMetaRspPb &)
+    RETURN_UNSUPPORTED_MASTER_API(RollbackMultiMeta, master::RollbackMultiMetaReqPb &, master::RollbackMultiMetaRspPb &)
     RETURN_UNSUPPORTED_MASTER_API(GetMetaInfo, GetMetaInfoReqPb &, GetMetaInfoRspPb &)
 
 private:
@@ -244,6 +411,7 @@ public:
         FLAGS_arena_per_tenant = 1;
         allocator_ = datasystem::memory::Allocator::Instance();
         allocator_->Init(memSize);
+        ResetWorkerOcSpillForTest();
         FLAGS_spill_directory = "./spill" + GetStringUuid();
         FLAGS_spill_size_limit = memSize;
         DS_ASSERT_OK(WorkerOcSpill::Instance()->Init());
@@ -251,10 +419,15 @@ public:
 
     void TearDown() override
     {
-        if (allocator_ != nullptr) {
-            allocator_->Shutdown();
-            allocator_ = nullptr;
-        }
+        impl_.reset();
+        rateController_.reset();
+        threadPool_.reset();
+        workerMasterApiManager_.reset();
+        objectTable_.reset();
+        evictionManager_.reset();
+        ResetWorkerOcSpillForTest();
+        RELEASE_STUBS
+        allocator_ = nullptr;
         CommonTest::TearDown();
     }
 
@@ -442,8 +615,7 @@ public:
         const bool requestAdmitted = WaitForInjectPointExecuteCount(injectPoint, 1, schedulingTimeout);
 
         auto closeFuture = std::async(std::launch::async, [this, closeBudget] {
-            return impl_->CloseIncomingMigrationAdmissionAndWait(
-                std::chrono::steady_clock::now() + closeBudget);
+            return impl_->CloseIncomingMigrationAdmissionAndWait(std::chrono::steady_clock::now() + closeBudget);
         });
         const auto closeStatus = closeFuture.get();
         EXPECT_EQ(closeStatus.GetCode(), StatusCode::K_RPC_DEADLINE_EXCEEDED);
@@ -592,6 +764,24 @@ TEST_F(MigrateDataServiceTest, DirectMigrationHoldsAdmissionUntilRequestReturns)
     });
 }
 
+TEST_F(MigrateDataServiceTest, DirectMigrationRejectsWhenRuntimeReconciliationIsIncomplete)
+{
+    worker::WorkerRuntimeFacade runtime;
+    worker::WorkerRunningEvidence evidence{ true, true, false, false, false, true };
+    ASSERT_TRUE(runtime.TryCompleteRecovery(evidence, "serving ready, reconciliation pending"));
+    impl_->SetRuntimeFacade(&runtime);
+
+    MigrateDataDirectReqPb req;
+    req.add_objects()->set_object_key("direct-reconciliation-pending");
+    MigrateDataDirectRspPb rsp;
+    const auto rc = impl_->MigrateDataDirect(req, rsp);
+
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(rc.GetMsg().find("MIGRATION_TARGET"), std::string::npos);
+    EXPECT_NE(rc.GetMsg().find("RECONCILIATION_INCOMPLETE"), std::string::npos);
+    EXPECT_THAT(rsp.failed_object_keys(), ElementsAre("direct-reconciliation-pending"));
+}
+
 TEST_F(MigrateDataServiceTest, CloseMigrationAdmissionReturnsDeadlineExceeded)
 {
     DS_ASSERT_OK(impl_->AcquireIncomingMigrationAdmission());
@@ -652,7 +842,9 @@ TEST_F(MigrateDataServiceTest, TestLockNeedMigrateObjects)
 
 TEST_F(MigrateDataServiceTest, TestLockNeedMigrateObjectsFailed)
 {
-    DS_ASSERT_OK(inject::Set("SafeTable.ReserveGetAndLock.return", "1*call()"));
+    const std::string injectPoint = "SafeTable.ReserveGetAndLock.return";
+    DS_ASSERT_OK(inject::Set(injectPoint, "1*call()"));
+    auto clearInject = Raii([&injectPoint]() { (void)inject::Clear(injectPoint); });
     uint64_t elderVersion = 0;
     uint64_t nowVersion = 1;
     uint64_t newerVersion = 2;
@@ -846,6 +1038,7 @@ TEST_F(MigrateDataServiceTest, TestAllocateAndAssignDataBasicFunction)
     uint64_t mmapSize;
     DS_ASSERT_OK(datasystem::memory::Allocator::Instance()->AllocateMemory(DEFAULT_TENANT_ID, size, false, pointer, fd,
                                                                            offset, mmapSize));
+    auto freeMemory = Raii([&pointer]() { (void)datasystem::memory::Allocator::Instance()->FreeMemory(pointer); });
     (void)memset_s((uint8_t *)pointer - offset, mmapSize, 0xff, mmapSize);
 
     std::string objectKey = "xxx";
@@ -926,11 +1119,129 @@ TEST_F(MigrateDataServiceTest, TestSaveDataWithSpillType)
     DS_ASSERT_OK(impl_->SaveDataWithObjectLocked(entry, info, payloads, MigrateType::SPILL, nullptr));
 }
 
+TEST_F(MigrateDataServiceTest, SlotAllocationReportsActualFailedCacheType)
+{
+    BINEXPECT_CALL(&WorkerOcServiceMigrateImpl::AllocateSlotObject, (_, _, _, _))
+        .Times(2)
+        .WillOnce(Return(Status::OK()))
+        .WillOnce(Return(Status(StatusCode::K_OUT_OF_MEMORY, "disk full")));
+    std::vector<memory::CacheType> failedCacheTypes;
+    impl_->SetOutOfMemoryHandler([&](const Status &, const std::string &, memory::CacheType cacheType) {
+        failedCacheTypes.emplace_back(cacheType);
+    });
+    MigrateDataReqPb req;
+    req.set_is_slot_migration(true);
+    auto *memoryObject = req.add_objects();
+    memoryObject->set_object_key("memory-object");
+    memoryObject->set_data_size(1);
+    memoryObject->set_cache_type(static_cast<int32_t>(memory::CacheType::MEMORY));
+    auto *diskObject = req.add_objects();
+    diskObject->set_object_key("disk-object");
+    diskObject->set_data_size(1);
+    diskObject->set_cache_type(static_cast<int32_t>(memory::CacheType::DISK));
+    MigrateDataRspPb rsp;
+    std::unordered_map<std::string, std::shared_ptr<ShmUnit>> units;
+
+    EXPECT_EQ(impl_->PrepareMigrateData(req, rsp, units).GetCode(), StatusCode::K_NO_SPACE);
+    EXPECT_TRUE(failedCacheTypes.empty());
+    impl_->FlushPendingOutOfMemory();
+    ASSERT_EQ(failedCacheTypes.size(), 1U);
+    EXPECT_EQ(failedCacheTypes.front(), memory::CacheType::DISK);
+}
+
+TEST_F(MigrateDataServiceTest, OutOfMemoryNotificationIsDeferredUntilMigrationReturns)
+{
+    const std::string objectKey = "deferred-oom-object";
+    SetMemoryAvailable(true);
+    BINEXPECT_CALL(&WorkerOcServiceMigrateImpl::IsResourceAvailable, (_, _, _)).WillRepeatedly(Return(false));
+    BINEXPECT_CALL(&WorkerOcServiceMigrateImpl::QueryMasterMetadata, (_, _, _))
+        .WillOnce(Invoke(
+            [&](const std::unordered_set<std::string> &, QueryMetaMap &metas, std::unordered_set<std::string> &) {
+                auto &meta = metas[objectKey];
+                meta.mutable_meta()->set_object_key(objectKey);
+                meta.mutable_meta()->set_version(1);
+                return Status::OK();
+            }));
+
+    size_t notificationCount = 0;
+    impl_->SetOutOfMemoryHandler([&](const Status &, const std::string &operation, memory::CacheType cacheType) {
+        EXPECT_EQ(operation, "MigrateData.SaveData");
+        EXPECT_EQ(cacheType, memory::CacheType::MEMORY);
+        std::shared_ptr<SafeObjType> entry;
+        DS_ASSERT_OK(objectTable_->Get(objectKey, entry));
+        DS_ASSERT_OK(entry->RLock());
+        entry->RUnlock();
+        ++notificationCount;
+    });
+
+    MigrateDataReqPb req;
+    req.set_type(MigrateType::SPILL);
+    auto *info = req.add_objects();
+    info->set_object_key(objectKey);
+    info->set_version(1);
+    info->set_data_size(1);
+    info->add_part_index(0);
+    std::vector<RpcMessage> payloads(1);
+    payloads.front().CopyString("x");
+    MigrateDataRspPb rsp;
+
+    EXPECT_EQ(impl_->MigrateData(req, rsp, std::move(payloads)).GetCode(), StatusCode::K_OUT_OF_MEMORY);
+    EXPECT_EQ(notificationCount, 1U);
+}
+
+TEST_F(MigrateDataServiceTest, OutOfMemoryNotificationsRemainBoundToTheirBthread)
+{
+    constexpr size_t requestCount = 256;
+    struct RequestArgs {
+        WorkerOcServiceMigrateImpl *impl;
+        size_t index;
+        std::atomic<size_t> *ready;
+        std::atomic<bool> *release;
+        std::vector<bthread_t> *owners;
+    };
+    std::atomic<size_t> ready{ 0 };
+    std::atomic<bool> release{ false };
+    std::atomic<size_t> wrongOwner{ 0 };
+    std::vector<bthread_t> owners(requestCount);
+    std::vector<RequestArgs> args;
+    std::vector<bthread_t> tids(requestCount);
+    args.reserve(requestCount);
+    impl_->SetOutOfMemoryHandler([&](const Status &, const std::string &operation, memory::CacheType) {
+        auto index = static_cast<size_t>(std::stoul(operation));
+        if (owners[index] != bthread_self()) {
+            ++wrongOwner;
+        }
+    });
+    auto runRequest = [](void *arg) -> void * {
+        auto *request = static_cast<RequestArgs *>(arg);
+        (*request->owners)[request->index] = bthread_self();
+        request->impl->RecordOutOfMemory(Status(StatusCode::K_OUT_OF_MEMORY, "allocation failed"),
+                                         std::to_string(request->index), memory::CacheType::MEMORY);
+        ++(*request->ready);
+        while (!request->release->load()) {
+            bthread_usleep(100);
+        }
+        request->impl->FlushPendingOutOfMemory();
+        return nullptr;
+    };
+    for (size_t i = 0; i < requestCount; ++i) {
+        args.push_back(RequestArgs{ impl_.get(), i, &ready, &release, &owners });
+        ASSERT_EQ(bthread_start_background(&tids[i], nullptr, runRequest, &args[i]), 0);
+    }
+    while (ready.load() != requestCount) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    release = true;
+    for (auto tid : tids) {
+        ASSERT_EQ(bthread_join(tid, nullptr), 0);
+    }
+    EXPECT_EQ(wrongOwner.load(), 0U);
+}
+
 class MigrateL2DataServiceTest : public MigrateDataServiceTest {};
 
 TEST_F(MigrateL2DataServiceTest, TestMigrateL2Data)
 {
-
 }
 
 TEST_F(MigrateDataServiceTest, UsesInjectedRateController)
@@ -977,7 +1288,8 @@ public:
         };
         rateController_ =
             std::make_shared<MigrateDataRateController>(FLAGS_data_migrate_rate_limit_mb * 1024ul * 1024ul);
-        impl_ = std::make_shared<WorkerOcServiceGetImpl>(param, nullptr, nullptr, nullptr, nullptr,
+        metadataReader_ = std::make_shared<ObjectMetadataCoordinationReader>(nullptr);
+        impl_ = std::make_shared<WorkerOcServiceGetImpl>(param, metadataReader_, nullptr, nullptr, nullptr,
                                                          HostPort("127.0.0.1:18888"), rateController_);
         TimerQueue::GetInstance()->Initialize();
     }
@@ -1007,9 +1319,56 @@ protected:
     std::shared_ptr<ObjectTable> objectTable_;
     std::shared_ptr<MigrateTestWorkerMasterApiManager> workerMasterApiManager_;
     WorkerRequestManager requestManager_;
+    std::shared_ptr<ObjectMetadataReader> metadataReader_;
     std::shared_ptr<WorkerOcServiceGetImpl> impl_;
     std::shared_ptr<MigrateDataRateController> rateController_;
 };
+
+TEST_F(NotifyRemoteGetMigrationTest, QueryMetadataUsesCoordinationStoreLogicalKey)
+{
+    constexpr int32_t timeoutMs = 1'000;
+    const std::string objectKey = "tenant/query_meta_object";
+    const std::string tableName = std::string(ETCD_META_TABLE_PREFIX) + ETCD_HASH_SUFFIX;
+    const std::string logicalKey = FormatString("%010u/%s", MurmurHash3_32(objectKey), objectKey);
+    ObjectMetaPb meta;
+    meta.set_object_key(objectKey);
+    meta.set_primary_address("127.0.0.1:18888");
+
+    FakeMetadataCoordinationBackend backend;
+    backend.values.emplace(std::make_pair(tableName, logicalKey), meta.SerializeAsString());
+    impl_->metadataReader_ = std::make_shared<ObjectMetadataCoordinationReader>(&backend);
+    ScopedRequestContext requestContext;
+    GetRequestContext()->reqTimeoutDuration.Init(timeoutMs);
+
+    std::vector<master::QueryMetaInfoPb> queryMetas;
+    std::vector<std::string> absentObjectKeys;
+    DS_ASSERT_OK(impl_->QueryMetadataFromCoordinationStore({ objectKey }, queryMetas, absentObjectKeys));
+
+    ASSERT_EQ(queryMetas.size(), 1ul);
+    EXPECT_EQ(queryMetas.front().meta().object_key(), objectKey);
+    EXPECT_EQ(queryMetas.front().address(), "127.0.0.1:18888");
+    EXPECT_TRUE(absentObjectKeys.empty());
+    EXPECT_EQ(backend.lastTable, tableName);
+    EXPECT_EQ(backend.lastKey, logicalKey);
+    EXPECT_GT(backend.lastTimeoutMs, 0);
+}
+
+TEST_F(NotifyRemoteGetMigrationTest, QueryMetadataRejectsUnavailableCoordinationBackend)
+{
+    FakeMetadataCoordinationBackend backend;
+    backend.keepAliveTimeout = true;
+    impl_->metadataReader_ = std::make_shared<ObjectMetadataCoordinationReader>(&backend);
+    ScopedRequestContext requestContext;
+    GetRequestContext()->reqTimeoutDuration.Init(1'000);
+
+    std::vector<master::QueryMetaInfoPb> queryMetas;
+    std::vector<std::string> absentObjectKeys;
+    auto rc = impl_->QueryMetadataFromCoordinationStore({ "tenant/unavailable_object" }, queryMetas, absentObjectKeys);
+
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_RPC_UNAVAILABLE);
+    EXPECT_TRUE(queryMetas.empty());
+    EXPECT_TRUE(absentObjectKeys.empty());
+}
 
 TEST_F(NotifyRemoteGetMigrationTest, PostProcessRemoteGetInNotificationClearsDeleteFlagWhenReplicationDisabled)
 {
@@ -1194,7 +1553,8 @@ TEST_F(NotifyRemoteGetMigrationTest, NotifyRemoteGetReturnsFailedKeyWhenMasterDo
         std::unordered_map<std::string,
                            std::list<std::pair<std::list<WorkerOcServiceGetImpl::GetObjectInfo>, uint64_t>>>;
     NotifyRemoteGetGroup groupedQueryMetas;
-    groupedQueryMetas.emplace("leaving-worker", std::list<std::pair<std::list<WorkerOcServiceGetImpl::GetObjectInfo>, uint64_t>>{});
+    groupedQueryMetas.emplace("leaving-worker",
+                              std::list<std::pair<std::list<WorkerOcServiceGetImpl::GetObjectInfo>, uint64_t>>{});
     std::vector<std::vector<std::string>> tempSuccessIds{ { objectKey } };
     std::vector<std::vector<ReadKey>> tempNeedRetryIds(1);
     std::vector<std::unordered_set<std::string>> tempFailedIds(1);
@@ -1361,11 +1721,11 @@ TEST_F(NotifyRemoteGetMigrationTest, NotifyRemoteGetShortCircuitsFailedConfirmat
     std::unordered_set<std::string> failedIds;
 
     impl_->ConfirmCopyMetaForNotifyRemoteGet({ objectKey }, queryMetas, confirmedIds, failedIds,
-                                              failedConfirmationOwners);
+                                             failedConfirmationOwners);
     confirmedIds.clear();
     failedIds.clear();
     impl_->ConfirmCopyMetaForNotifyRemoteGet({ objectKey }, queryMetas, confirmedIds, failedIds,
-                                              failedConfirmationOwners);
+                                             failedConfirmationOwners);
 
     EXPECT_EQ(requestCount, 1);
     EXPECT_TRUE(confirmedIds.empty());

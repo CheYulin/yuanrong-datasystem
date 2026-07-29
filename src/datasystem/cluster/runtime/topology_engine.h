@@ -26,7 +26,6 @@
 #include "datasystem/common/util/thread.h"
 
 namespace datasystem {
-class EtcdStore;
 class ICoordinatorServiceProxy;
 }
 
@@ -41,8 +40,7 @@ class TopologyRecoveryReporter;
  * @brief Bind and safely drain the Worker RPC ingress used by Coordinator-backed watches.
  */
 struct CoordinatorWatchIngress {
-    using Handler =
-        std::function<Status(const std::string &, int64_t, CoordinationEvent &&)>;
+    using Handler = std::function<Status(const std::string &, int64_t, CoordinationEvent &&)>;
 
     std::function<Status(Handler)> bind;
     std::function<Status(std::chrono::steady_clock::time_point)> unbindAndDrain;
@@ -93,11 +91,13 @@ public:
         Builder &SetLocalAddress(std::string localAddress);
 
         /**
-         * @brief Select ETCD using the Worker-owned Store and one unified watch stream.
-         * @param[in] store Shared non-owned Store.
+         * @brief Select unified member/controller backends using one externally composed coordination backend binding.
+         * @param[in] memberBackend Member-role backend.
+         * @param[in] controllerBackend Controller-role backend.
          * @return This Builder.
          */
-        Builder &UseEtcd(EtcdStore &store);
+        Builder &UseUnifiedCoordinationBackends(std::unique_ptr<ICoordinationBackend> memberBackend,
+                                                std::unique_ptr<ICoordinationBackend> controllerBackend);
 
         /**
          * @brief Select Coordinator and bind its Worker watch RPC ingress.
@@ -133,16 +133,35 @@ public:
          * @param[in] handler Restart sink to consume.
          * @return This Builder.
          */
-        Builder &SetMembershipRestartHandler(
-            std::function<Status(const std::string &, int64_t)> handler);
+        Builder &SetMembershipRestartHandler(std::function<Status(const std::string &, int64_t)> handler);
+
+        /**
+         * @brief Register the existing member-recovery cleanup sink.
+         * @param[in] handler Recovery sink to consume.
+         * @return This Builder.
+         */
+        Builder &SetMembershipRecoveryHandler(std::function<Status(const std::string &, int64_t)> handler);
+
+        /**
+         * @brief Register the worker-local control-backend isolation callback.
+         * @param[in] handler Callback to consume.
+         * @return This Builder.
+         */
+        Builder &SetLocalIsolationHandler(ICoordinationBackend::LocalIsolationHandler handler);
+
+        /**
+         * @brief Register the worker-local control-backend recovery callback.
+         * @param[in] handler Callback to consume.
+         * @return This Builder.
+         */
+        Builder &SetLocalRecoveryHandler(ICoordinationBackend::LocalRecoveryHandler handler);
 
         /**
          * @brief Register a non-blocking newly-published Snapshot callback.
          * @param[in] handler Callback that may only enqueue bounded work.
          * @return This Builder.
          */
-        Builder &SetSnapshotPublishedHandler(
-            std::function<void(std::shared_ptr<const TopologySnapshot>)> handler);
+        Builder &SetSnapshotPublishedHandler(std::function<void(std::shared_ptr<const TopologySnapshot>)> handler);
 
         /**
          * @brief Bind the configured confirmed-failure timeout.
@@ -230,6 +249,12 @@ public:
     Status MarkReady();
 
     /**
+     * @brief Publish the local membership as RECOVERING while recovery evidence is incomplete.
+     * @return K_OK on update; lifecycle or backend status otherwise.
+     */
+    Status MarkRecovering();
+
+    /**
      * @brief Publish the local membership as EXITING for graceful ScaleIn.
      * @return K_OK on update; lifecycle or backend status otherwise.
      */
@@ -279,6 +304,12 @@ public:
     TopologyAvailabilityLevel GetAvailability() const noexcept;
 
     /**
+     * @brief Reconcile authoritative topology after the local control-backend transport reconnects.
+     * @return K_OK when queued; K_TRY_AGAIN when a full resync is already required; K_NOT_READY after shutdown.
+     */
+    Status RequestRecoveryReconciliation(const std::function<void()> &suspendServing);
+
+    /**
      * @brief Return the foreground placement facade.
      * @return Stable facade reference valid for this Engine's lifetime.
      */
@@ -302,6 +333,12 @@ public:
      * @return Identity- and version-bound observation; stale or incomplete evidence is UNKNOWN.
      */
     ControlBackendObservation GetControlBackendObservation() const;
+
+    /**
+     * @brief Return fresh local backend evidence without peer-report availability filtering.
+     * @return Identity- and version-bound observation; stale or incomplete evidence is UNKNOWN.
+     */
+    ControlBackendObservation GetLocalControlBackendObservation() const;
 
     /**
      * @brief Return a read-only, no-IO aggregate diagnostic value.
@@ -346,12 +383,14 @@ private:
     /**
      * @brief Construct Controller Runtime and optional recovery reporter after core members exist.
      * @param[in] membershipRestartHandler Existing Controller restart cleanup sink.
+     * @param[in] membershipRecoveryHandler Existing Controller recovery cleanup sink.
      * @param[in] nodeDeadTimeout Existing confirmed-failure timeout.
      * @return K_OK on success or component construction status otherwise.
      */
-    Status InitializeOwnedComponents(
-        std::function<Status(const std::string &, int64_t)> membershipRestartHandler,
-        std::chrono::seconds nodeDeadTimeout, std::chrono::milliseconds scaleInCollectWindow);
+    Status InitializeOwnedComponents(std::function<Status(const std::string &, int64_t)> membershipRestartHandler,
+                                     std::function<Status(const std::string &, int64_t)> membershipRecoveryHandler,
+                                     std::chrono::seconds nodeDeadTimeout,
+                                     std::chrono::milliseconds scaleInCollectWindow);
 
     /**
      * @brief Route one Coordinator watch event to its unique role backend.
@@ -360,8 +399,7 @@ private:
      * @param[in] event Event to consume.
      * @return K_OK on delivery or identity/lifecycle status otherwise.
      */
-    Status RouteCoordinatorWatchEvent(const std::string &coordinatorId, int64_t watchId,
-                                      CoordinationEvent &&event);
+    Status RouteCoordinatorWatchEvent(const std::string &coordinatorId, int64_t watchId, CoordinationEvent &&event);
 
     /**
      * @brief Route one unified ETCD watch event to Worker and/or Controller consumers.
@@ -402,6 +440,13 @@ private:
      * @return K_OK on enqueue or coalescing; a bounded-queue or lifecycle error otherwise.
      */
     Status EnqueueCoordinationEvent(CoordinationEvent &&event);
+
+    /**
+     * @brief Re-publish unchanged serving availability after a successful authoritative recovery read.
+     * @param[in] generation Recovery generation observed before the read started.
+     * @param[in] previous Availability published before the read.
+     */
+    void CompleteRecoveryReconciliation(uint64_t generation, TopologyAvailabilityLevel previous);
 
     /**
      * @brief Worker serial event and tick loop.
@@ -447,6 +492,13 @@ private:
     Status GetRecoveryTopology(uint64_t &topologyVersion, std::string &canonicalTopology) const;
 
     /**
+     * @brief Run one state-thread exact read with recovery-generation fencing.
+     * @param[in] readNotify Whether to read and admit the local topology task notification.
+     * @return Read, publish, notify, or task admission status.
+     */
+    Status ReloadTopologyForRuntime(bool readNotify);
+
+    /**
      * @brief Publish identity-bound evidence after one successful exact read.
      * @param[in] snapshot Exact-read authoritative Snapshot used to derive the evidence.
      * @return K_OK on success; an identity or Snapshot validation error otherwise.
@@ -475,6 +527,21 @@ private:
     Status ReevaluateFailureScope();
 
     /**
+     * @brief Check whether committed peers still observe the control backend as reachable.
+     * @return True only when peer evidence confirms this member is locally isolated.
+     */
+    bool IsControlBackendReachableFromPeers();
+
+    bool CopyUnavailableLocalBackendObservation(ControlBackendObservation &local);
+
+    bool LoadControlBackendProbeTargets(std::vector<MemberIdentity> &targets);
+
+    bool ProbePeerBackendReachabilityOnce(const ControlBackendObservation &local,
+                                          const std::vector<MemberIdentity> &targets,
+                                          std::chrono::steady_clock::time_point deadline, size_t &observationCount,
+                                          bool &globalOutage, bool &probeFailed) const;
+
+    /**
      * @brief Periodically exact-read for recovery, otherwise refresh failure scope.
      * @return K_OK after recovery; the latest exact-read error while unavailable.
      */
@@ -491,13 +558,19 @@ private:
      * @brief Apply the Host admission hook without allowing exceptions to escape the state thread.
      * @param[in] level Availability level delivered to the Host.
      */
-    void NotifyAvailability(TopologyAvailabilityLevel level) noexcept;
+    void NotifyAvailability(TopologyAvailabilityLevel level) const noexcept;
 
     /**
      * @brief Invoke the non-blocking Snapshot publication hook.
      * @param[in] snapshot Newly published immutable Snapshot.
      */
-    void NotifySnapshotPublished(std::shared_ptr<const TopologySnapshot> snapshot);
+    void NotifySnapshotPublished(std::shared_ptr<const TopologySnapshot> snapshot) const;
+
+    /**
+     * @brief Notify at most once per published Snapshot version after the Engine is RUNNING.
+     * @param[in] snapshot Newly published or latest startup Snapshot.
+     */
+    void NotifySnapshotPublishedIfRunning(std::shared_ptr<const TopologySnapshot> snapshot);
 
     /**
      * @brief Record a runtime error without exposing high-cardinality payload.
@@ -544,10 +617,11 @@ private:
     std::atomic<TopologyAvailabilityLevel> publishedAvailability_{ TopologyAvailabilityLevel::NOT_READY };
     // Permanently fences this Engine lifetime after authoritative rollback or same-version content conflict.
     std::atomic<bool> authorityIsolated_{ false };
-    // Records whether the immediately previous processed Snapshot contained the local Worker.
-    std::atomic<bool> localMemberExistedInPreviousSnapshot_{ false };
-    // Records whether that local member was leaving voluntarily in the previous Snapshot.
-    std::atomic<bool> localMemberWasLeavingInPreviousSnapshot_{ false };
+    std::atomic<uint64_t> recoveryGenerationRequested_{ 0 };
+    std::atomic<uint64_t> recoveryGenerationCompleted_{ 0 };
+    std::atomic<uint64_t> activeReloadGeneration_{ 0 };
+    std::atomic<bool> runtimeReloadInProgress_{ false };
+    std::atomic<uint64_t> lastNotifiedSnapshotVersion_{ 0 };
     std::string isolationReason_;
     std::string lastError_;
     ControlBackendObservation backendObservation_;

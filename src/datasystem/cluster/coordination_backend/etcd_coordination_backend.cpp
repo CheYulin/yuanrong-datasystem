@@ -58,6 +58,24 @@ Status EtcdCoordinationBackend::Get(const std::string &tableName, const std::str
     return etcdStore_->Get(tableName, key, res, timeoutMs);
 }
 
+Status EtcdCoordinationBackend::CreateTable(const std::string &tableName, const std::string &tablePrefix)
+{
+    CHECK_FAIL_RETURN_STATUS(etcdStore_ != nullptr, K_RUNTIME_ERROR, "EtcdStore is null");
+    return etcdStore_->CreateTable(tableName, tablePrefix);
+}
+
+Status EtcdCoordinationBackend::CreateTableWithExactPrefix(const std::string &tableName, const std::string &tablePrefix)
+{
+    CHECK_FAIL_RETURN_STATUS(etcdStore_ != nullptr, K_RUNTIME_ERROR, "EtcdStore is null");
+    return etcdStore_->CreateTableWithExactPrefix(tableName, tablePrefix);
+}
+
+Status EtcdCoordinationBackend::Put(const std::string &tableName, const std::string &key, const std::string &value)
+{
+    CHECK_FAIL_RETURN_STATUS(etcdStore_ != nullptr, K_RUNTIME_ERROR, "EtcdStore is null");
+    return etcdStore_->Put(tableName, key, value);
+}
+
 Status EtcdCoordinationBackend::CAS(const std::string &tableName, const std::string &key,
                                     const ProcessFunction &processFunc, RangeSearchResult &res)
 {
@@ -121,6 +139,16 @@ Status EtcdCoordinationBackend::ShutdownEventSources()
     return rc;
 }
 
+Status EtcdCoordinationBackend::ShutdownWatchEventSources()
+{
+    if (etcdStore_ == nullptr) {
+        return Status::OK();
+    }
+    Status rc = etcdStore_->ShutdownWatchEventSources();
+    etcdStore_->SetEventHandler({});
+    return rc;
+}
+
 Status EtcdCoordinationBackend::Shutdown()
 {
     return etcdStore_ == nullptr ? Status::OK() : etcdStore_->Shutdown();
@@ -164,6 +192,20 @@ void EtcdCoordinationBackend::SetEventHandler(EventHandler &&eventHandler)
             handler(FromEtcdEvent(event));
         }
     });
+}
+
+void EtcdCoordinationBackend::SetLocalIsolationHandler(LocalIsolationHandler handler)
+{
+    if (etcdStore_ != nullptr) {
+        etcdStore_->SetLocalIsolationHandler(std::move(handler));
+    }
+}
+
+void EtcdCoordinationBackend::SetLocalRecoveryHandler(LocalRecoveryHandler handler)
+{
+    if (etcdStore_ != nullptr) {
+        etcdStore_->SetLocalRecoveryHandler(std::move(handler));
+    }
 }
 
 void EtcdCoordinationBackend::SetCheckStoreStateWhenNetworkFailedHandler(std::function<bool()> handler)

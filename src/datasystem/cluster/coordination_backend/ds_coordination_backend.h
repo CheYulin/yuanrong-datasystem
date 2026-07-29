@@ -15,6 +15,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -75,6 +76,31 @@ public:
      */
     Status Get(const std::string &tableName, const std::string &key, RangeSearchResult &res,
                int32_t timeoutMs = SEND_RPC_TIMEOUT_MS_DEFAULT) override;
+
+    /**
+     * @brief Register one logical table prefix.
+     * @param[in] tableName Logical table name.
+     * @param[in] tablePrefix Physical table prefix.
+     * @return Status of the call.
+     */
+    Status CreateTable(const std::string &tableName, const std::string &tablePrefix) override;
+
+    /**
+     * @brief Register one already-canonical logical table prefix.
+     * @param[in] tableName Logical table name.
+     * @param[in] tablePrefix Canonical physical table prefix.
+     * @return Status of the call.
+     */
+    Status CreateTableWithExactPrefix(const std::string &tableName, const std::string &tablePrefix) override;
+
+    /**
+     * @brief Put one value into a logical table.
+     * @param[in] tableName Logical table name.
+     * @param[in] key Relative key within the table.
+     * @param[in] value Stored value.
+     * @return Status of the call.
+     */
+    Status Put(const std::string &tableName, const std::string &key, const std::string &value) override;
 
     /**
      * @brief Atomically transform one value and return its committed metadata.
@@ -149,6 +175,12 @@ public:
     Status ShutdownEventSources() override;
 
     /**
+     * @brief Stop watches without touching membership keepalive.
+     * @return Status of the call.
+     */
+    Status ShutdownWatchEventSources() override;
+
+    /**
      * @brief Shut down this backend idempotently.
      * @return Status of the call.
      */
@@ -195,6 +227,18 @@ public:
     void SetEventHandler(EventHandler &&eventHandler) override;
 
     /**
+     * @brief Install the Coordinator member local-isolation callback.
+     * @param[in] handler Callback to consume.
+     */
+    void SetLocalIsolationHandler(LocalIsolationHandler handler) override;
+
+    /**
+     * @brief Install the Coordinator member local-recovery callback.
+     * @param[in] handler Callback to consume.
+     */
+    void SetLocalRecoveryHandler(LocalRecoveryHandler handler) override;
+
+    /**
      * @brief Install the local evidence callback used to classify Coordinator renewal failures.
      * @param[in] handler Callback returning whether the backing store remains reachable from peers.
      */
@@ -210,7 +254,7 @@ public:
      * @brief Install a callback for exact membership-operation CoordinatorIds.
      * @param[in] handler Callback invoked outside backend locks with identity and watch-invalidation state.
      */
-    void SetMembershipReadyHandler(MembershipReadyHandler handler);
+    void SetMembershipReadyHandler(const MembershipReadyHandler &handler) override;
 
     /**
      * @brief Check whether this backend owns one CoordinatorId/watch identity.
@@ -218,18 +262,18 @@ public:
      * @param[in] watchId Watch identity within that Coordinator lifetime.
      * @return True only for a committed current registration.
      */
-    bool OwnsWatchIdentity(const std::string &coordinatorId, int64_t watchId) const;
+    bool OwnsWatchIdentity(const std::string &coordinatorId, int64_t watchId) const override;
 
     /**
      * @brief Check whether a watch registration transaction is in progress.
      * @return True while an RPC may have created a channel not yet known by watch ID.
      */
-    bool IsWatchRegistrationInProgress() const;
+    bool IsWatchRegistrationInProgress() const override;
 
     /**
      * @brief Mark the saved watch plan stale and enqueue a non-blocking exact-read doorbell.
      */
-    void InvalidateWatches();
+    void InvalidateWatches() override;
 
     /**
      * @brief Deliver one identity-bound Coordinator watch event.
@@ -237,7 +281,7 @@ public:
      * @param[in] watchId Watch identity within that Coordinator lifetime.
      * @param[in] event Event delivered by the Worker watch RPC service.
      */
-    void HandleWatchEvent(const std::string &coordinatorId, int64_t watchId, CoordinationEvent &&event);
+    void HandleWatchEvent(const std::string &coordinatorId, int64_t watchId, CoordinationEvent &&event) override;
 
 private:
     struct KeepAliveFailureState;
@@ -349,10 +393,9 @@ private:
      * @param[out] coordinatorId Coordinator lifetime shared by the complete batch.
      * @return K_OK for a complete same-lifetime batch, otherwise an RPC or identity status.
      */
-    Status PrepareWatchPlan(const std::vector<WatchKey> &watchKeys,
-                            std::vector<WatchRegistration> &registrations,
-                            std::vector<int64_t> &registeredIds,
-                            std::vector<CoordinationEvent> &initialEvents, std::string &coordinatorId);
+    Status PrepareWatchPlan(const std::vector<WatchKey> &watchKeys, std::vector<WatchRegistration> &registrations,
+                            std::vector<int64_t> &registeredIds, std::vector<CoordinationEvent> &initialEvents,
+                            std::string &coordinatorId);
 
     /**
      * @brief Atomically replace the committed registrations after a complete batch succeeds.
@@ -391,6 +434,8 @@ private:
 
     ICoordinatorServiceProxy *proxy_;
     std::string watcherAddr_;
+    mutable std::mutex tableMutex_;
+    std::unordered_map<std::string, std::string> tableMap_;
     std::string pendingWatchRegistrationId_;
     // Serializes complete watch registration transactions without being held by callbacks or RPC helpers.
     std::mutex rewatchMutex_;
@@ -415,6 +460,8 @@ private:
     EventHandler eventHandler_;
     MembershipReadyHandler membershipReadyHandler_;
     std::string lastMembershipCoordinatorId_;
+    LocalIsolationHandler localIsolationHandler_;
+    LocalRecoveryHandler localRecoveryHandler_;
     std::function<bool()> checkStoreStateWhenNetworkFailedHandler_;
     size_t activeEventHandlers_{ 0 };
 
@@ -434,6 +481,15 @@ private:
     static constexpr int64_t MS_PER_SECOND = 1'000;
     int64_t keepAliveTtlMs_{ 0 };
 };
+
+/**
+ * @brief Create a Coordinator-backed coordination backend behind the backend interface.
+ * @param[in] proxy Coordinator proxy that must outlive the returned backend.
+ * @param[in] watcherAddr Canonical Worker address used to register watches.
+ * @return Coordinator-backed backend instance.
+ */
+std::unique_ptr<ICoordinationBackend> CreateDsCoordinationBackend(ICoordinatorServiceProxy *proxy,
+                                                                  std::string watcherAddr);
 
 }  // namespace datasystem::cluster
 #endif  // DATASYSTEM_CLUSTER_COORDINATION_BACKEND_DS_COORDINATION_BACKEND_H

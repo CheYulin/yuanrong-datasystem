@@ -17,6 +17,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -24,10 +25,17 @@
 
 #include "datasystem/cluster/repository/topology_key_helper.h"
 #include "datasystem/cluster/repository/topology_repository_codec.h"
+#include "datasystem/common/flags/common_flags.h"
+#include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/kvstore/etcd/etcd_store.h"
+#include "datasystem/common/metrics/kv_metrics.h"
+#include "datasystem/common/util/raii.h"
 #include "gtest/gtest.h"
+#include "ut/cluster/testing/fake_coordination_backend.h"
 #include "ut/cluster/testing/fake_coordinator_service_proxy.h"
 #include "ut/common.h"
+
+DS_DECLARE_string(log_dir);
 
 namespace datasystem::cluster {
 namespace {
@@ -217,6 +225,22 @@ std::unique_ptr<TopologyKeyHelper> MakeKeys(const std::string &clusterName)
     return keys;
 }
 
+void InitKvMetricsForTopologyEngineTest()
+{
+    FLAGS_log_dir = "/tmp";
+    metrics::ResetKvMetricsForTest();
+    ASSERT_TRUE(metrics::InitKvMetrics().IsOk());
+}
+
+std::string DumpMetricSummary()
+{
+    std::string summary;
+    for (const auto &part : metrics::DumpSummariesForTest()) {
+        summary += part;
+    }
+    return summary;
+}
+
 std::string TopologyStorageKey(const TopologyKeyHelper &keys)
 {
     return keys.TopologyTable() + "/" + TopologyKeyHelper::TopologyKey();
@@ -234,9 +258,9 @@ Status EmitTopologyEvent(testing::FakeCoordinatorServiceProxy &proxy, TestWatchI
                          const TopologyKeyHelper &keys, uint64_t version)
 {
     const auto key = TopologyStorageKey(keys);
-    return ingress.Emit("coordinator-test", FindWatchId(proxy, key),
-                        { CoordinationEventType::PUT, key, "", static_cast<int64_t>(version),
-                          static_cast<int64_t>(version) });
+    return ingress.Emit(
+        "coordinator-test", FindWatchId(proxy, key),
+        { CoordinationEventType::PUT, key, "", static_cast<int64_t>(version), static_cast<int64_t>(version) });
 }
 
 void PutTopology(testing::FakeCoordinatorServiceProxy &proxy, const std::string &clusterName,
@@ -250,8 +274,7 @@ void PutTopology(testing::FakeCoordinatorServiceProxy &proxy, const std::string 
 }
 
 void ConfigureBuilder(TopologyEngine::Builder &builder, testing::FakeCoordinatorServiceProxy &proxy,
-                      TestWatchIngress &ingress, NoopTopologyCallbacks &callbacks,
-                      const std::string &clusterName)
+                      TestWatchIngress &ingress, NoopTopologyCallbacks &callbacks, const std::string &clusterName)
 {
     builder.SetClusterName(clusterName)
         .SetLocalAddress(LOCAL_ADDRESS)
@@ -260,9 +283,8 @@ void ConfigureBuilder(TopologyEngine::Builder &builder, testing::FakeCoordinator
         .SetNodeDeadTimeout(std::chrono::seconds(30));
 }
 
-std::unique_ptr<TopologyEngine> BuildEngine(testing::FakeCoordinatorServiceProxy &proxy,
-                                            TestWatchIngress &ingress, NoopTopologyCallbacks &callbacks,
-                                            const std::string &clusterName)
+std::unique_ptr<TopologyEngine> BuildEngine(testing::FakeCoordinatorServiceProxy &proxy, TestWatchIngress &ingress,
+                                            NoopTopologyCallbacks &callbacks, const std::string &clusterName)
 {
     TopologyEngine::Builder builder;
     ConfigureBuilder(builder, proxy, ingress, callbacks, clusterName);
@@ -496,8 +518,7 @@ TEST(TopologyEngineTest, DrainTimeoutRetainsDependenciesAndShutdownCanRetry)
     DS_ASSERT_OK(engine->Start());
     ingress.FailNextUnbind();
 
-    EXPECT_EQ(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT).GetCode(),
-              K_RPC_DEADLINE_EXCEEDED);
+    EXPECT_EQ(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT).GetCode(), K_RPC_DEADLINE_EXCEEDED);
     EXPECT_EQ(engine->GetState(), TopologyEngineState::STOPPING);
     EXPECT_TRUE(ingress.IsBound());
     DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
@@ -564,6 +585,127 @@ TEST(TopologyEngineTest, WatchDoorbellExactReadRepairsMissingPayload)
     DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
 }
 
+TEST(TopologyEngineTest, RecoveryReconciliationRepublishesAuthoritativeAvailability)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    PutTopology(proxy, "recovery-reconcile", MakeTopology(1));
+    std::atomic<uint32_t> normalNotifications{ 0 };
+    TopologyEngine::Builder builder;
+    ConfigureBuilder(builder, proxy, ingress, callbacks, "recovery-reconcile");
+    builder.SetAvailabilityHandler([&normalNotifications](TopologyAvailabilityLevel level) {
+        if (level == TopologyAvailabilityLevel::NORMAL) {
+            ++normalNotifications;
+        }
+    });
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    ASSERT_EQ(normalNotifications.load(), 1U);
+
+    std::atomic<uint32_t> suspendCalls{ 0 };
+    DS_ASSERT_OK(engine->RequestRecoveryReconciliation([&suspendCalls] { ++suspendCalls; }));
+    ASSERT_TRUE(WaitFor([&] { return normalNotifications.load() == 2; }));
+    EXPECT_EQ(suspendCalls.load(), 1U);
+    EXPECT_EQ(engine->GetAvailability(), TopologyAvailabilityLevel::NORMAL);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, RecoveryRequestsSerializeSuspensionWithAvailabilityPublication)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    PutTopology(proxy, "recovery-generation", MakeTopology(1));
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool blockSecondNotification = false;
+    bool secondNotificationEntered = false;
+    bool releaseSecondNotification = false;
+    std::atomic<uint32_t> normalNotifications{ 0 };
+    TopologyEngine::Builder builder;
+    ConfigureBuilder(builder, proxy, ingress, callbacks, "recovery-generation");
+    builder.SetAvailabilityHandler([&](TopologyAvailabilityLevel level) {
+        if (level != TopologyAvailabilityLevel::NORMAL) {
+            return;
+        }
+        const auto count = ++normalNotifications;
+        std::unique_lock<std::mutex> lock(mutex);
+        if (count == 2 && blockSecondNotification) {
+            secondNotificationEntered = true;
+            cv.notify_all();
+            cv.wait(lock, [&releaseSecondNotification] { return releaseSecondNotification; });
+        }
+    });
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    ASSERT_EQ(normalNotifications.load(), 1U);
+
+    std::atomic<uint32_t> suspendCalls{ 0 };
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        blockSecondNotification = true;
+    }
+    DS_ASSERT_OK(engine->RequestRecoveryReconciliation([&suspendCalls] { ++suspendCalls; }));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(cv.wait_until(lock, std::chrono::steady_clock::now() + TEST_WAIT,
+                                  [&secondNotificationEntered] { return secondNotificationEntered; }));
+    }
+    auto secondRequest = std::async(
+        std::launch::async, [&] { return engine->RequestRecoveryReconciliation([&suspendCalls] { ++suspendCalls; }); });
+    EXPECT_EQ(secondRequest.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        releaseSecondNotification = true;
+        cv.notify_all();
+    }
+    DS_ASSERT_OK(secondRequest.get());
+    ASSERT_TRUE(WaitFor([&] { return normalNotifications.load() == 3; }));
+    EXPECT_EQ(suspendCalls.load(), 2U);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, RecoveryRequestSupersedesAnInFlightExactRead)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    const auto keys = MakeKeys("recovery-inflight");
+    PutTopology(proxy, "recovery-inflight", MakeTopology(1));
+    std::atomic<uint32_t> normalNotifications{ 0 };
+    TopologyEngine::Builder builder;
+    ConfigureBuilder(builder, proxy, ingress, callbacks, "recovery-inflight");
+    builder.SetAvailabilityHandler([&normalNotifications](TopologyAvailabilityLevel level) {
+        if (level == TopologyAvailabilityLevel::NORMAL) {
+            ++normalNotifications;
+        }
+    });
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    ASSERT_EQ(normalNotifications.load(), 1U);
+
+    const auto topologyKey = TopologyStorageKey(*keys);
+    proxy.BlockNextRangeForKey(topologyKey);
+    DS_ASSERT_OK(EmitTopologyEvent(proxy, ingress, *keys, 2));
+    ASSERT_TRUE(proxy.WaitUntilRangeBlocked(std::chrono::steady_clock::now() + TEST_WAIT));
+    std::atomic<uint32_t> suspendCalls{ 0 };
+    DS_ASSERT_OK(engine->RequestRecoveryReconciliation([&suspendCalls] { ++suspendCalls; }));
+
+    proxy.BlockNextRangeForKey(topologyKey);
+    proxy.ReleaseBlockedRange();
+    ASSERT_TRUE(proxy.WaitUntilRangeBlocked(std::chrono::steady_clock::now() + TEST_WAIT));
+    EXPECT_EQ(normalNotifications.load(), 1U);
+    EXPECT_EQ(suspendCalls.load(), 1U);
+
+    proxy.ReleaseBlockedRange();
+    ASSERT_TRUE(WaitFor([&] { return normalNotifications.load() == 2; }));
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
 TEST(TopologyEngineTest, MatchingPeerOutageEvidenceEntersControlDegraded)
 {
     testing::FakeCoordinatorServiceProxy proxy;
@@ -571,8 +713,18 @@ TEST(TopologyEngineTest, MatchingPeerOutageEvidenceEntersControlDegraded)
     NoopTopologyCallbacks callbacks;
     const auto keys = MakeKeys("global-outage");
     PutTopology(proxy, "global-outage", MakeTopologyWithPeer());
+    std::atomic<size_t> degradedNotifications{ 0 };
+    std::atomic<size_t> isolatedNotifications{ 0 };
     TopologyEngine::Builder builder;
     ConfigureBuilder(builder, proxy, ingress, callbacks, "global-outage");
+    builder.SetAvailabilityHandler([&](TopologyAvailabilityLevel level) {
+        if (level == TopologyAvailabilityLevel::CONTROL_DEGRADED) {
+            degradedNotifications.fetch_add(1);
+        }
+        if (level == TopologyAvailabilityLevel::ROLE_ISOLATED) {
+            isolatedNotifications.fetch_add(1);
+        }
+    });
     builder.SetControlBackendProbe([](const ControlBackendObservation &local, const auto &peers, auto) {
         auto peer = local;
         peer.reporter = peers.front();
@@ -584,10 +736,13 @@ TEST(TopologyEngineTest, MatchingPeerOutageEvidenceEntersControlDegraded)
     DS_ASSERT_OK(builder.Build(engine));
     DS_ASSERT_OK(engine->Start());
 
-    proxy.FailNextRangeForKey(TopologyStorageKey(*keys), K_RPC_UNAVAILABLE);
+    proxy.FailRangeForKeyTimes(TopologyStorageKey(*keys), K_RPC_UNAVAILABLE, 2);
     DS_ASSERT_OK(EmitTopologyEvent(proxy, ingress, *keys, 2));
     ASSERT_TRUE(WaitFor([&] { return engine->GetAvailability() == TopologyAvailabilityLevel::CONTROL_DEGRADED; }));
     EXPECT_EQ(engine->GetControlBackendObservation().state, ControlBackendState::UNAVAILABLE);
+    EXPECT_EQ(degradedNotifications.load(), 1U);
+    EXPECT_EQ(isolatedNotifications.load(), 0U);
+    EXPECT_EQ(proxy.DeleteRangeCount(), 0U);
     DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
 }
 
@@ -611,9 +766,15 @@ TEST(TopologyEngineTest, AsymmetricBackendOutageIsolatesThenRecovers)
     DS_ASSERT_OK(builder.Build(engine));
     DS_ASSERT_OK(engine->Start());
 
-    proxy.FailNextRangeForKey(TopologyStorageKey(*keys), K_RPC_UNAVAILABLE);
+    proxy.FailRangeForKeyTimes(TopologyStorageKey(*keys), K_RPC_UNAVAILABLE, 2);
     DS_ASSERT_OK(EmitTopologyEvent(proxy, ingress, *keys, 2));
     ASSERT_TRUE(WaitFor([&] { return engine->GetAvailability() == TopologyAvailabilityLevel::ROLE_ISOLATED; }));
+    EXPECT_EQ(engine->GetControlBackendObservation().state, ControlBackendState::UNKNOWN);
+    auto localEvidence = engine->GetLocalControlBackendObservation();
+    EXPECT_EQ(localEvidence.state, ControlBackendState::UNAVAILABLE);
+    EXPECT_EQ(localEvidence.reporter.address, "127.0.0.1:10001");
+    ASSERT_TRUE(WaitFor([&] { return proxy.RecoveryRequestCount() == 1; }));
+    ASSERT_TRUE(WaitFor([&] { return proxy.RemainingRangeFailures() == 0; }));
     DS_ASSERT_OK(EmitTopologyEvent(proxy, ingress, *keys, 3));
     ASSERT_TRUE(WaitFor([&] { return engine->GetAvailability() == TopologyAvailabilityLevel::NORMAL; }));
     DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
@@ -628,16 +789,336 @@ TEST(TopologyEngineTest, MissingPeerQuorumIsolatesBackendOutage)
     PutTopology(proxy, "missing-quorum", MakeTopologyWithPeer());
     TopologyEngine::Builder builder;
     ConfigureBuilder(builder, proxy, ingress, callbacks, "missing-quorum");
-    builder.SetControlBackendProbe([](const auto &, const auto &, auto) {
-        return std::vector<ControlBackendObservation>{};
-    });
+    builder.SetControlBackendProbe(
+        [](const auto &, const auto &, auto) { return std::vector<ControlBackendObservation>{}; });
     std::unique_ptr<TopologyEngine> engine;
     DS_ASSERT_OK(builder.Build(engine));
     DS_ASSERT_OK(engine->Start());
 
-    proxy.FailNextRangeForKey(TopologyStorageKey(*keys), K_RPC_UNAVAILABLE);
+    proxy.FailRangeForKeyTimes(TopologyStorageKey(*keys), K_RPC_UNAVAILABLE, 2);
     DS_ASSERT_OK(EmitTopologyEvent(proxy, ingress, *keys, 2));
     ASSERT_TRUE(WaitFor([&] { return engine->GetAvailability() == TopologyAvailabilityLevel::ROLE_ISOLATED; }));
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, KeepAliveScopeCheckConfirmsStableReachablePeerAfterWindow)
+{
+    Raii restoreMetrics([] {
+        FLAGS_log_dir = "/tmp";
+        metrics::ResetKvMetricsForTest();
+        (void)metrics::InitKvMetrics();
+    });
+    InitKvMetricsForTopologyEngineTest();
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "keepalive-scope-short";
+    const auto keys = MakeKeys(clusterName);
+    auto memberBackend = std::make_unique<FakeCoordinationBackend>();
+    auto controllerBackend = std::make_unique<FakeCoordinationBackend>();
+    auto *member = memberBackend.get();
+    member->PutRaw(keys->TopologyTable(), TopologyKeyHelper::TopologyKey(), MakeTopologyWithPeer());
+
+    std::atomic<size_t> probeCalls{ 0 };
+    TopologyEngine::Builder builder;
+    builder.SetClusterName(clusterName)
+        .SetLocalAddress(LOCAL_ADDRESS)
+        .UseUnifiedCoordinationBackends(std::move(memberBackend), std::move(controllerBackend))
+        .SetPhaseCallbacks(callbacks)
+        .SetNodeDeadTimeout(std::chrono::seconds(60))
+        .SetControlBackendProbe([&probeCalls](const ControlBackendObservation &local, const auto &peers, auto) {
+            probeCalls.fetch_add(1);
+            auto peer = local;
+            peer.reporter = peers.front();
+            peer.state = ControlBackendState::AVAILABLE;
+            peer.observedAt = std::chrono::steady_clock::now();
+            return std::vector<ControlBackendObservation>{ peer };
+        });
+
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    EXPECT_TRUE(member->CheckStoreStateWhenNetworkFailed());
+    EXPECT_GT(probeCalls.load(), 1U);
+    EXPECT_NE(
+        DumpMetricSummary().find("{\"name\":\"worker_control_backend_scope_local_total\",\"total\":1,\"delta\":1}"),
+        std::string::npos);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, KeepAliveScopeCheckLetsGlobalEvidenceOverrideTransientReachablePeer)
+{
+    Raii restoreMetrics([] {
+        FLAGS_log_dir = "/tmp";
+        metrics::ResetKvMetricsForTest();
+        (void)metrics::InitKvMetrics();
+    });
+    InitKvMetricsForTopologyEngineTest();
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "keepalive-scope-transient";
+    const auto keys = MakeKeys(clusterName);
+    auto memberBackend = std::make_unique<FakeCoordinationBackend>();
+    auto controllerBackend = std::make_unique<FakeCoordinationBackend>();
+    auto *member = memberBackend.get();
+    member->PutRaw(keys->TopologyTable(), TopologyKeyHelper::TopologyKey(), MakeTopologyWithPeer());
+
+    std::atomic<size_t> probeCalls{ 0 };
+    std::atomic<size_t> degradedNotifications{ 0 };
+    TopologyEngine::Builder builder;
+    builder.SetClusterName(clusterName)
+        .SetLocalAddress(LOCAL_ADDRESS)
+        .UseUnifiedCoordinationBackends(std::move(memberBackend), std::move(controllerBackend))
+        .SetPhaseCallbacks(callbacks)
+        .SetNodeDeadTimeout(std::chrono::seconds(60))
+        .SetAvailabilityHandler([&degradedNotifications](TopologyAvailabilityLevel level) {
+            if (level == TopologyAvailabilityLevel::CONTROL_DEGRADED) {
+                degradedNotifications.fetch_add(1);
+            }
+        })
+        .SetControlBackendProbe([&probeCalls](const ControlBackendObservation &local, const auto &peers, auto) {
+            auto peer = local;
+            peer.reporter = peers.front();
+            peer.state =
+                probeCalls.fetch_add(1) == 0 ? ControlBackendState::AVAILABLE : ControlBackendState::UNAVAILABLE;
+            peer.observedAt = std::chrono::steady_clock::now();
+            return std::vector<ControlBackendObservation>{ peer };
+        });
+
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    EXPECT_FALSE(member->CheckStoreStateWhenNetworkFailed());
+    EXPECT_GT(probeCalls.load(), 1U);
+    EXPECT_EQ(engine->GetAvailability(), TopologyAvailabilityLevel::CONTROL_DEGRADED);
+    EXPECT_EQ(degradedNotifications.load(), 1U);
+    const auto summary = DumpMetricSummary();
+    EXPECT_NE(summary.find("{\"name\":\"worker_control_backend_scope_global_total\",\"total\":1,\"delta\":1}"),
+              std::string::npos);
+    EXPECT_EQ(summary.find("{\"name\":\"worker_control_backend_scope_local_total\",\"total\":1,\"delta\":1}"),
+              std::string::npos);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, KeepAliveScopeCheckInvalidatesCandidateAfterPeerIdentityMismatch)
+{
+    Raii restoreMetrics([] {
+        FLAGS_log_dir = "/tmp";
+        metrics::ResetKvMetricsForTest();
+        (void)metrics::InitKvMetrics();
+    });
+    InitKvMetricsForTopologyEngineTest();
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "keepalive-scope-peer-replaced";
+    const auto keys = MakeKeys(clusterName);
+    auto memberBackend = std::make_unique<FakeCoordinationBackend>();
+    auto controllerBackend = std::make_unique<FakeCoordinationBackend>();
+    auto *member = memberBackend.get();
+    member->PutRaw(keys->TopologyTable(), TopologyKeyHelper::TopologyKey(), MakeTopologyWithPeer());
+
+    std::atomic<size_t> probeCalls{ 0 };
+    TopologyEngine::Builder builder;
+    builder.SetClusterName(clusterName)
+        .SetLocalAddress(LOCAL_ADDRESS)
+        .UseUnifiedCoordinationBackends(std::move(memberBackend), std::move(controllerBackend))
+        .SetPhaseCallbacks(callbacks)
+        .SetNodeDeadTimeout(std::chrono::seconds(60))
+        .SetControlBackendProbe([&probeCalls](const ControlBackendObservation &local, const auto &peers, auto) {
+            auto peer = local;
+            peer.reporter = peers.front();
+            peer.state = ControlBackendState::AVAILABLE;
+            if (probeCalls.fetch_add(1) != 0) {
+                peer.reporter.id = std::string(16, 'c');
+            }
+            peer.observedAt = std::chrono::steady_clock::now();
+            return std::vector<ControlBackendObservation>{ peer };
+        });
+
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    EXPECT_FALSE(member->CheckStoreStateWhenNetworkFailed());
+    EXPECT_EQ(probeCalls.load(), 2U);
+    const auto summary = DumpMetricSummary();
+    EXPECT_NE(summary.find("{\"name\":\"worker_control_backend_scope_inconclusive_total\",\"total\":1,\"delta\":1}"),
+              std::string::npos);
+    EXPECT_EQ(summary.find("{\"name\":\"worker_control_backend_scope_local_total\",\"total\":1,\"delta\":1}"),
+              std::string::npos);
+    EXPECT_EQ(summary.find("{\"name\":\"worker_control_backend_scope_global_total\",\"total\":1,\"delta\":1}"),
+              std::string::npos);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, KeepAliveScopeCheckCountsGlobalBackendOutage)
+{
+    Raii restoreMetrics([] {
+        FLAGS_log_dir = "/tmp";
+        metrics::ResetKvMetricsForTest();
+        (void)metrics::InitKvMetrics();
+    });
+    InitKvMetricsForTopologyEngineTest();
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "keepalive-scope-global";
+    const auto keys = MakeKeys(clusterName);
+    auto memberBackend = std::make_unique<FakeCoordinationBackend>();
+    auto controllerBackend = std::make_unique<FakeCoordinationBackend>();
+    auto *member = memberBackend.get();
+    member->PutRaw(keys->TopologyTable(), TopologyKeyHelper::TopologyKey(), MakeTopologyWithPeer());
+
+    std::atomic<size_t> degradedNotifications{ 0 };
+    TopologyEngine::Builder builder;
+    builder.SetClusterName(clusterName)
+        .SetLocalAddress(LOCAL_ADDRESS)
+        .UseUnifiedCoordinationBackends(std::move(memberBackend), std::move(controllerBackend))
+        .SetPhaseCallbacks(callbacks)
+        .SetNodeDeadTimeout(std::chrono::seconds(60))
+        .SetAvailabilityHandler([&degradedNotifications](TopologyAvailabilityLevel level) {
+            if (level == TopologyAvailabilityLevel::CONTROL_DEGRADED) {
+                degradedNotifications.fetch_add(1);
+            }
+        })
+        .SetControlBackendProbe([](const ControlBackendObservation &local, const auto &peers, auto) {
+            auto peer = local;
+            peer.reporter = peers.front();
+            peer.state = ControlBackendState::UNAVAILABLE;
+            peer.observedAt = std::chrono::steady_clock::now();
+            return std::vector<ControlBackendObservation>{ peer };
+        });
+
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    EXPECT_FALSE(member->CheckStoreStateWhenNetworkFailed());
+    EXPECT_EQ(engine->GetAvailability(), TopologyAvailabilityLevel::CONTROL_DEGRADED);
+    EXPECT_EQ(degradedNotifications.load(), 1U);
+    EXPECT_NE(
+        DumpMetricSummary().find("{\"name\":\"worker_control_backend_scope_global_total\",\"total\":1,\"delta\":1}"),
+        std::string::npos);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, KeepAliveScopeCheckCountsInconclusiveProbeFailure)
+{
+    Raii restoreMetrics([] {
+        FLAGS_log_dir = "/tmp";
+        metrics::ResetKvMetricsForTest();
+        (void)metrics::InitKvMetrics();
+    });
+    InitKvMetricsForTopologyEngineTest();
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "keepalive-scope-inconclusive";
+    const auto keys = MakeKeys(clusterName);
+    auto memberBackend = std::make_unique<FakeCoordinationBackend>();
+    auto controllerBackend = std::make_unique<FakeCoordinationBackend>();
+    auto *member = memberBackend.get();
+    member->PutRaw(keys->TopologyTable(), TopologyKeyHelper::TopologyKey(), MakeTopologyWithPeer());
+
+    TopologyEngine::Builder builder;
+    builder.SetClusterName(clusterName)
+        .SetLocalAddress(LOCAL_ADDRESS)
+        .UseUnifiedCoordinationBackends(std::move(memberBackend), std::move(controllerBackend))
+        .SetPhaseCallbacks(callbacks)
+        .SetNodeDeadTimeout(std::chrono::seconds(60))
+        .SetControlBackendProbe([](const auto &, const auto &, auto) -> std::vector<ControlBackendObservation> {
+            throw std::runtime_error("injected probe failure");
+        });
+
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    EXPECT_FALSE(member->CheckStoreStateWhenNetworkFailed());
+    EXPECT_NE(DumpMetricSummary().find(
+                  "{\"name\":\"worker_control_backend_scope_inconclusive_total\",\"total\":1,\"delta\":1}"),
+              std::string::npos);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, UnifiedBackendLocalRecoveryHandlerTriggersInjectedCallback)
+{
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "unified-local-recovery";
+    const auto keys = MakeKeys(clusterName);
+    auto memberBackend = std::make_unique<FakeCoordinationBackend>();
+    auto controllerBackend = std::make_unique<FakeCoordinationBackend>();
+    auto *member = memberBackend.get();
+    member->PutRaw(keys->TopologyTable(), TopologyKeyHelper::TopologyKey(), MakeTopology());
+
+    std::atomic<size_t> recoveryCallbacks{ 0 };
+    TopologyEngine::Builder builder;
+    builder.SetClusterName(clusterName)
+        .SetLocalAddress(LOCAL_ADDRESS)
+        .UseUnifiedCoordinationBackends(std::move(memberBackend), std::move(controllerBackend))
+        .SetPhaseCallbacks(callbacks)
+        .SetNodeDeadTimeout(std::chrono::seconds(60))
+        .SetLocalRecoveryHandler([&recoveryCallbacks] { recoveryCallbacks.fetch_add(1); });
+
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    member->EmitLocalRecovery();
+    EXPECT_EQ(recoveryCallbacks.load(), 1U);
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, CoordinatorBackendLocalRecoveryHandlerIsRegisteredThroughBuilder)
+{
+    ASSERT_TRUE(inject::Set("CoordinationBackend.KeepAlive.intervalMs", "call(10)").IsOk());
+    ASSERT_TRUE(inject::Set("CoordinationBackend.KeepAlive.confirmTimes", "call(1)").IsOk());
+    ASSERT_TRUE(inject::Set("CoordinationBackend.KeepAlive.returnError", "2*return(K_RPC_UNAVAILABLE)").IsOk());
+    Raii clearInject([] {
+        (void)inject::Clear("CoordinationBackend.KeepAlive.intervalMs");
+        (void)inject::Clear("CoordinationBackend.KeepAlive.confirmTimes");
+        (void)inject::Clear("CoordinationBackend.KeepAlive.returnError");
+    });
+
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    PutTopology(proxy, "coordinator-local-recovery", MakeTopologyWithPeer());
+    std::atomic<size_t> isolationCallbacks{ 0 };
+    std::atomic<size_t> recoveryCallbacks{ 0 };
+    TopologyEngine::Builder builder;
+    ConfigureBuilder(builder, proxy, ingress, callbacks, "coordinator-local-recovery");
+    builder.SetLocalIsolationHandler(
+        [&isolationCallbacks](const Status &) { isolationCallbacks.fetch_add(1, std::memory_order_relaxed); });
+    builder.SetLocalRecoveryHandler(
+        [&recoveryCallbacks] { recoveryCallbacks.fetch_add(1, std::memory_order_relaxed); });
+    builder.SetControlBackendProbe([](const ControlBackendObservation &local, const auto &peers, auto) {
+        auto peer = local;
+        peer.reporter = peers.front();
+        peer.state = ControlBackendState::AVAILABLE;
+        peer.observedAt = std::chrono::steady_clock::now();
+        return std::vector<ControlBackendObservation>{ peer };
+    });
+
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+
+    ASSERT_TRUE(WaitFor([&] { return isolationCallbacks.load(std::memory_order_relaxed) >= 1; }));
+    ASSERT_TRUE(WaitFor([&] { return recoveryCallbacks.load(std::memory_order_relaxed) >= 1; }));
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, MarkRecoveringPublishesRecoveringMembershipState)
+{
+    NoopTopologyCallbacks callbacks;
+    const std::string clusterName = "mark-recovering";
+    auto memberBackend = std::make_unique<FakeCoordinationBackend>();
+    auto controllerBackend = std::make_unique<FakeCoordinationBackend>();
+    auto *member = memberBackend.get();
+
+    TopologyEngine::Builder builder;
+    builder.SetClusterName(clusterName)
+        .SetLocalAddress(LOCAL_ADDRESS)
+        .UseUnifiedCoordinationBackends(std::move(memberBackend), std::move(controllerBackend))
+        .SetPhaseCallbacks(callbacks)
+        .SetNodeDeadTimeout(std::chrono::seconds(60));
+
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    DS_ASSERT_OK(engine->MarkRecovering());
+    const auto lifecycleCalls = member->LifecycleCalls();
+    ASSERT_FALSE(lifecycleCalls.empty());
+    EXPECT_EQ(lifecycleCalls.back(), "RECOVERING");
     DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
 }
 
@@ -720,6 +1201,31 @@ TEST(TopologyEngineTest, ShutdownRejectsConcurrentStartWithoutCorruptingLifecycl
     EXPECT_EQ(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT).GetCode(), K_TRY_AGAIN);
     ingress.ReleaseBind();
     DS_ASSERT_OK(start.get());
+    DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
+}
+
+TEST(TopologyEngineTest, IsolatesWhenCommittedLocalMemberDisappearsFromAuthoritativeTopology)
+{
+    testing::FakeCoordinatorServiceProxy proxy;
+    TestWatchIngress ingress;
+    NoopTopologyCallbacks callbacks;
+    const auto keys = MakeKeys("local-disappears");
+    PutTopology(proxy, "local-disappears", MakeTopologyWithPeer(1));
+    std::atomic<TopologyAvailabilityLevel> admittedLevel{ TopologyAvailabilityLevel::NOT_READY };
+    TopologyEngine::Builder builder;
+    ConfigureBuilder(builder, proxy, ingress, callbacks, "local-disappears");
+    builder.SetAvailabilityHandler([&admittedLevel](TopologyAvailabilityLevel level) { admittedLevel.store(level); });
+    std::unique_ptr<TopologyEngine> engine;
+    DS_ASSERT_OK(builder.Build(engine));
+    DS_ASSERT_OK(engine->Start());
+    ASSERT_EQ(engine->GetAvailability(), TopologyAvailabilityLevel::NORMAL);
+
+    auto withoutLocal = MakeTopologyWithPeer(2);
+    withoutLocal.members.erase(withoutLocal.members.begin());
+    PutTopology(proxy, "local-disappears", withoutLocal);
+    DS_ASSERT_OK(EmitTopologyEvent(proxy, ingress, *keys, 2));
+    ASSERT_TRUE(WaitFor([&] { return engine->GetAvailability() == TopologyAvailabilityLevel::ROLE_ISOLATED; }));
+    EXPECT_EQ(admittedLevel.load(), TopologyAvailabilityLevel::ROLE_ISOLATED);
     DS_ASSERT_OK(engine->Shutdown(std::chrono::steady_clock::now() + TEST_WAIT));
 }
 

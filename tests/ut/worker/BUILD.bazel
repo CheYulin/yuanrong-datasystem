@@ -31,6 +31,7 @@ ds_cc_test_library(
     deps = [
         "//src/datasystem/cluster:cluster_topology",
         "//src/datasystem/worker:metadata_route_resolver",
+        "//src/datasystem/worker/runtime:worker_topology_runtime",
         "//tests/ut/cluster/testing:fake_coordinator_service_proxy",
     ],
 )
@@ -43,6 +44,57 @@ ds_cc_test(
         "//src/datasystem/worker:metadata_route_resolver",
         "//src/datasystem/worker/object_cache:object_endpoint_policy",
         "//tests/ut:ut_common",
+    ],
+)
+
+ds_cc_test(
+    name = "central_metadata_address_resolver_test",
+    srcs = ["object_cache/central_metadata_address_resolver_test.cpp"],
+    deps = [
+        "//src/datasystem/common/kvstore:kv_store",
+        "//src/datasystem/worker/object_cache:central_metadata_address_resolver",
+        "//tests/ut:ut_common",
+        "//tests/ut/cluster/testing:fake_coordination_backend",
+    ],
+)
+
+ds_cc_test(
+    name = "object_cache_ownership_reconciliation_test",
+    srcs = ["object_cache/object_cache_ownership_reconciliation_test.cpp"],
+    deps = [
+        "//src/datasystem/common/log:common_log",
+        "//src/datasystem/worker/object_cache:object_cache_ownership_reconciliation",
+    ],
+)
+
+ds_cc_test(
+    name = "object_cache_recovery_state_test",
+    srcs = ["object_cache/object_cache_recovery_state_test.cpp"],
+    deps = [
+        "//src/datasystem/worker/object_cache:object_cache_recovery_evidence",
+        "//src/datasystem/worker/object_cache:object_cache_recovery_state",
+        "//src/datasystem/worker/object_cache:object_cache_recovery_startup",
+        "//src/datasystem/worker/runtime:worker_runtime_facade",
+        "//tests/ut:ut_common",
+    ],
+)
+
+ds_cc_test(
+    name = "topology_phase_callbacks_test",
+    srcs = ["object_cache/topology_phase_callbacks_test.cpp"],
+    deps = [
+        "//src/datasystem/cluster:cluster_topology",
+        "//src/datasystem/cluster:cluster_topology_keyspace",
+        "//src/datasystem/cluster:cluster_topology_scope",
+        "//src/datasystem/master/object_cache:oc_metadata_manager",
+        "//src/datasystem/master/object_cache:oc_migrate_metadata_manager",
+        "//src/datasystem/master/object_cache/store:object_meta_store",
+        "//src/datasystem/master/stream_cache:sc_metadata_manager",
+        "//src/datasystem/master/stream_cache:sc_migrate_metadata_manager",
+        "//src/datasystem/worker/object_cache:worker_oc_service_impl",
+        "//src/datasystem/worker/object_cache/service:worker_oc_service_clear_data_flow",
+        "//src/datasystem/worker/runtime:worker_topology_phase_callbacks",
+        "//tests/ut/cluster/testing:fake_coordination_backend",
     ],
 )
 
@@ -145,9 +197,12 @@ ds_cc_test(
     deps = [
         "//src/datasystem/worker:metadata_route_resolver",
         "//src/datasystem/cluster:cluster_topology",
+        "//src/datasystem/common/eventloop:common_event_loop",
         "//src/datasystem/common/inject:common_inject",
         "//src/datasystem/worker:add_miss_libs_fixme",
+        "//src/datasystem/worker/object_cache:master_worker_oc_service_impl",
         "//src/datasystem/worker/object_cache:worker_oc_service_impl",
+        "//src/datasystem/worker/runtime:worker_runtime_facade",
         "//tests/common/binmock:binmock",
         "//tests/ut:ut_common",
         "//tests/ut/worker:test_metadata_route",
@@ -179,6 +234,24 @@ ds_cc_test(
         "//src/datasystem/worker/object_cache:metadata_recovery_selector",
         "//src/datasystem/worker/object_cache:object_kv",
         "//src/datasystem/worker/object_cache:worker_master_oc_api_header",
+        "//tests/ut:ut_common",
+        "//tests/ut/worker:test_metadata_route",
+    ],
+)
+
+ds_cc_test(
+    name = "slot_recovery_manager_test",
+    srcs = ["object_cache/slot_recovery_manager_test.cpp"],
+    deps = [
+        "//src/datasystem/common/inject:common_inject",
+        "//src/datasystem/common/l2cache:persistence_api_header",
+        "//src/datasystem/common/l2cache:slot_client",
+        "//src/datasystem/common/shared_memory:common_shared_memory",
+        "//src/datasystem/protos:slot_recovery_cc_proto",
+        "//src/datasystem/worker/object_cache:metadata_recovery_manager",
+        "//src/datasystem/worker/object_cache/slot_recovery:slot_recovery_manager",
+        "//src/datasystem/worker/object_cache/slot_recovery:slot_recovery_store",
+        "//tests/common/binmock",
         "//tests/ut:ut_common",
         "//tests/ut/worker:test_metadata_route",
     ],
@@ -448,6 +521,28 @@ ds_cc_test(
     ],
 )
 
+ds_cc_test(
+    name = "client_worker_sc_service_admission_test",
+    srcs = ["stream_cache/client_worker_sc_service_admission_test.cpp"],
+    deps = [
+        "//src/datasystem/cluster:cluster_topology",
+        "//src/datasystem/common/flags:dynamic_flag_config_header",
+        "//src/datasystem/common/inject:common_inject",
+        "//src/datasystem/common/rpc:rpc_server_stream_base",
+        "//src/datasystem/common/util:raii",
+        "//src/datasystem/common/util:request_context",
+        "//src/datasystem/worker:authenticate",
+        "//src/datasystem/worker:metadata_route_resolver",
+        "//src/datasystem/worker:worker_health_check",
+        "//src/datasystem/worker:worker_master_api_manager_base",
+        "//src/datasystem/worker/runtime:worker_runtime_facade",
+        "//src/datasystem/worker/stream_cache:client_worker_sc_service_impl",
+        "//src/datasystem/worker/stream_cache:stream_manager_header",
+        "//src/datasystem/worker/stream_cache:worker_master_sc_api",
+        "//tests/ut:ut_common",
+    ],
+)
+
 # Stream Buffer Pool 测试
 ds_cc_test(
     name = "stream_bufferpool_test",
@@ -532,7 +627,96 @@ ds_cc_test(
     srcs = ["topology_recovery_reporter_test.cpp"],
     deps = [
         "//src/datasystem/cluster/coordination_backend:topology_recovery_reporter",
-        "//tests/ut:ut_common",
+        "//src/datasystem/common/rdma:fast_transport_base_test_stub",
+    ],
+)
+
+ds_cc_test(
+    name = "worker_control_backend_probe_test",
+    srcs = ["worker_control_backend_probe_test.cpp"],
+    deps = [
+        "//src/datasystem/worker/runtime:worker_control_backend_probe",
+    ],
+)
+
+ds_cc_test(
+    name = "worker_runtime_state_test",
+    srcs = ["worker_runtime_state_test.cpp"],
+    deps = [
+        "//src/datasystem/worker/runtime:worker_runtime_state",
+    ],
+)
+
+ds_cc_test(
+    name = "worker_service_admission_test",
+    srcs = ["worker_service_admission_test.cpp"],
+    deps = [
+        "//src/datasystem/common/rdma:fast_transport_base_test_stub",
+        "//src/datasystem/worker:metadata_route_resolver",
+        "//src/datasystem/worker/runtime:worker_service_admission",
+        "//tests/ut:ut_common_header",
+    ],
+)
+
+ds_cc_test(
+    name = "worker_admission_facade_test",
+    srcs = ["worker_admission_facade_test.cpp"],
+    deps = [
+        "//src/datasystem/worker/runtime:worker_admission_facade",
+    ],
+)
+
+ds_cc_test(
+    name = "worker_runtime_facade_test",
+    srcs = ["worker_runtime_facade_test.cpp"],
+    deps = [
+        "//src/datasystem/worker/runtime:worker_runtime_facade",
+    ],
+)
+
+ds_cc_test(
+    name = "worker_runtime_facade_topology_availability_test",
+    srcs = ["worker_runtime_facade_topology_availability_test.cpp"],
+    deps = [
+        "//src/datasystem/common/inject:common_inject",
+        "//src/datasystem/common/rdma:fast_transport_base_test_stub",
+        "//src/datasystem/worker:worker_health_check",
+        "//src/datasystem/worker/runtime:worker_runtime_facade",
+    ],
+)
+
+ds_cc_test(
+    name = "worker_oc_server_recovery_evidence_test",
+    srcs = ["worker_oc_server_recovery_evidence_test.cpp"],
+    deps = [
+        "//src/datasystem/worker:worker_health_check",
+        "//src/datasystem/worker:worker_oc_server",
+        "//src/datasystem/worker/object_cache:object_cache_recovery_state",
+    ],
+)
+
+ds_cc_test(
+    name = "worker_recovery_controller_test",
+    srcs = ["worker_recovery_controller_test.cpp"],
+    deps = [
+        "//src/datasystem/worker/runtime:worker_recovery_controller",
+    ],
+)
+
+ds_cc_test(
+    name = "worker_recovery_evidence_tracker_test",
+    srcs = ["worker_recovery_evidence_tracker_test.cpp"],
+    deps = [
+        "//src/datasystem/worker/runtime:worker_recovery_evidence_tracker",
+    ],
+)
+
+ds_cc_test(
+    name = "worker_isolation_coordinator_test",
+    srcs = ["worker_isolation_coordinator_test.cpp"],
+    deps = [
+        "//src/datasystem/common/rdma:fast_transport_base_test_stub",
+        "//src/datasystem/worker/runtime:worker_isolation_coordinator",
     ],
 )
 
@@ -544,6 +728,7 @@ test_suite(
         "async_updatelocation_test",
         "authenticate_test",
         "client_manager_test",
+        "client_worker_sc_service_admission_test",
         "coordinator_watch_service_test",
         "topology_recovery_reporter_test",
         "kv_event_publisher_test",
@@ -554,10 +739,13 @@ test_suite(
         "migrate_data_handler_test",
         "migrate_data_service_test",
         "node_selector_test",
+        "object_cache_ownership_reconciliation_test",
+        "object_cache_recovery_state_test",
         "object_endpoint_policy_test",
         "rebalance_worker_test",
         "shared_page_queue_group_test",
         "shared_page_queue_test",
+        "slot_recovery_manager_test",
         "stream_bufferpool_test",
         "stream_cursor_test",
         "stream_data_page_test",
@@ -569,6 +757,15 @@ test_suite(
         "worker_oc_service_impl_test",
         "worker_oc_spill_eviction_test",
         "worker_oc_spill_test",
+        "worker_control_backend_probe_test",
+        "worker_runtime_state_test",
+        "worker_isolation_coordinator_test",
+        "worker_recovery_controller_test",
+        "worker_recovery_evidence_tracker_test",
+        "worker_service_admission_test",
+        "worker_admission_facade_test",
+        "worker_runtime_facade_test",
+        "worker_runtime_facade_topology_availability_test",
         "worker_worker_peer_state_codec_test",
         "worker_worker_oc_gather_layout_test",
         "worker_worker_oc_api_test",

@@ -44,6 +44,7 @@
 #include "datasystem/worker/stream_cache/worker_sc_allocate_memory.h"
 #include "datasystem/worker/object_cache/worker_master_oc_api.h"
 #include "datasystem/worker/metadata_route_resolver.h"
+#include "datasystem/worker/runtime/worker_runtime_facade.h"
 
 namespace datasystem {
 namespace worker {
@@ -534,7 +535,14 @@ public:
      */
     void RemoveStreamNo(uint64_t streamNo);
 
+    /**
+     * @brief Assign borrowed Worker runtime dependency.
+     * @param[in] runtime Runtime facade owned by WorkerOCServer.
+     */
+    void SetRuntimeFacade(const worker::WorkerRuntimeFacade *runtime);
+
 private:
+    Status CommitMemoryWriteAdmission(const std::string &operation) const;
 
     /**
      * @brief Get the stream name list.
@@ -1049,6 +1057,7 @@ private:
     void EraseFromStreamMgrDictWithoutLck(const std::string &namespaceUri, StreamManagerMap::accessor *accessor);
 
     friend class MasterWorkerSCServiceImpl;  // They share the stream data on local worker node
+    friend class StreamManager;
     friend class StreamManagerWithLock;
 
     std::unique_ptr<RemoteWorkerManager> remoteWorkerManager_{ nullptr };
@@ -1086,6 +1095,7 @@ private:
     std::future<void> autoAck_;
     const worker::MetadataRouteResolver &metadataRoute_;       // Immutable owner-routing dependency.
     const cluster::MembershipEndpointView &membership_;        // Immutable topology plus local endpoint evidence.
+    const worker::WorkerRuntimeFacade *runtime_{ nullptr };
 };
 
 template <>

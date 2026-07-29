@@ -31,8 +31,6 @@
 #include "datasystem/common/flags/flags.h"
 #include "datasystem/common/iam/tenant_auth_manager.h"
 #include "datasystem/common/inject/inject_point.h"
-#include "datasystem/common/kvstore/etcd/etcd_constants.h"
-#include "datasystem/common/kvstore/etcd/etcd_store.h"
 #include "datasystem/common/l2cache/l2_storage.h"
 #include "datasystem/common/log/access_recorder.h"
 #include "datasystem/common/log/latency_phase.h"
@@ -87,7 +85,6 @@ using namespace datasystem::master;
 namespace datasystem {
 namespace object_cache {
 
-static constexpr int DEBUG_LOG_LEVEL = 2;
 static constexpr uint32_t K_URMA_WARNING_LOG_EVERY_N = 100;
 static constexpr double EXIST_LOCAL_CHECK_TIMEOUT_US = 50.0;
 static const char *const EXIST_REDIRECTS_FIELD = "exist_redirects";
@@ -99,7 +96,7 @@ static constexpr double US_PER_MS = 1000.0;
 
 namespace {
 Status ValidateRemoteGetResult(bool workerConnected, const Status &status, SafeObjType &entry,
-    const std::string &objectKey, const std::string &address)
+                               const std::string &objectKey, const std::string &address)
 {
     if (workerConnected && status.GetCode() == K_NOT_FOUND && entry->GetShmUnit() == nullptr) {
         RETURN_STATUS(K_RUNTIME_ERROR,
@@ -113,6 +110,7 @@ Status ValidateRemoteGetResult(bool workerConnected, const Status &status, SafeO
     }
     return Status::OK();
 }
+
 }  // namespace
 
 std::string BuildExistRedirectExtra(const google::protobuf::RepeatedPtrField<RedirectMetaInfo> &infos)
@@ -150,13 +148,13 @@ std::string BuildExistRedirectExtra(const google::protobuf::RepeatedPtrField<Red
 }
 
 WorkerOcServiceGetImpl::WorkerOcServiceGetImpl(WorkerOcServiceCrudParam &initParam,
-                                               EtcdStore *etcdStore,
+                                               std::shared_ptr<ObjectMetadataReader> metadataReader,
                                                std::shared_ptr<ThreadPool> memCpyThreadPool,
                                                std::shared_ptr<ThreadPool> threadPool,
                                                std::shared_ptr<AkSkManager> akSkManager, HostPort localAddress,
                                                std::shared_ptr<MigrateDataRateController> rateController)
     : WorkerOcServiceCrudCommonApi(initParam),
-      etcdStore_(etcdStore),
+      metadataReader_(std::move(metadataReader)),
       memCpyThreadPool_(std::move(memCpyThreadPool)),
       threadPool_(std::move(threadPool)),
       akSkManager_(std::move(akSkManager)),
@@ -199,7 +197,8 @@ Status WorkerOcServiceGetImpl::Get(std::shared_ptr<ServerUnaryWriterReader<GetRs
         remainingUs = changedRemainingUs;
         return Status::OK();
     });
-    CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(remainingUs > 0, K_RPC_DEADLINE_EXCEEDED,
+    CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(
+        remainingUs > 0, K_RPC_DEADLINE_EXCEEDED,
         FormatString("RPC deadline exceeded before dispatch, remaining %ld us.", remainingUs));
     CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(Validator::IsInNonNegativeInt32(subTimeout), K_RUNTIME_ERROR,
                                          "SubTimeout is out of range.");
@@ -1276,8 +1275,8 @@ Status WorkerOcServiceGetImpl::TryReconnectRemoteWorker(const std::string &endPo
     LOG_IF(INFO, elapsedMs > logThresholdMs)
         << "[URMA_NEED_CONNECT] TryReconnectRemoteWorker finished, remoteAddress=" << endPoint
         << ", remoteWorkerId=" << remoteWorkerId << ", elapsed ms: " << elapsedMs
-        << ", realRemainingTimeMs="
-        << GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime() << ", status=" << rc.ToString();
+        << ", realRemainingTimeMs=" << GetRequestContext()->reqTimeoutDuration.CalcRealRemainingTime()
+        << ", status=" << rc.ToString();
     RETURN_IF_NOT_OK(rc);
     RETURN_STATUS(K_TRY_AGAIN, "Reconnect success");
 }
@@ -1658,18 +1657,18 @@ void WorkerOcServiceGetImpl::ProcessQueryMetaFailedObjsWhenMetaStoredInEtcd(
     }
 
     std::stringstream msg;
-    msg << "Try get some miss objs from etcd:" << VectorToString(objectKeysPuzzled);
+    msg << "Try get some miss objs from coordination store:" << VectorToString(objectKeysPuzzled);
     msg << ", route failed objs:";
     msg << VectorToString(routeFailedObjectKeys);
     LOG(INFO) << msg.str();
 
     if (!objectKeysPuzzled.empty()) {
-        LOG_IF_ERROR(QueryMetaDataFromEtcd(objectKeysPuzzled, queryMetas, absentObjectKeys),
-                     "Query metadata from etcd for puzzled keys failed.");
+        LOG_IF_ERROR(QueryMetadataFromCoordinationStore(objectKeysPuzzled, queryMetas, absentObjectKeys),
+                     "Query metadata from coordination store for puzzled keys failed.");
     }
     if (!routeFailedObjectKeys.empty()) {
-        LOG_IF_ERROR(QueryMetaDataFromEtcd(routeFailedObjectKeys, queryMetas, absentObjectKeys),
-                     "Query metadata from etcd for route failed keys failed.");
+        LOG_IF_ERROR(QueryMetadataFromCoordinationStore(routeFailedObjectKeys, queryMetas, absentObjectKeys),
+                     "Query metadata from coordination store for route failed keys failed.");
     }
 }
 
@@ -1853,45 +1852,26 @@ Status WorkerOcServiceGetImpl::QueryMetadataFromRedirectMaster(master::QueryMeta
     return Status::OK();
 }
 
-/*
- * Query missing metadata from ETCD by complete object-key hash.
- */
-Status WorkerOcServiceGetImpl::QueryMetaDataFromEtcd(const std::unordered_set<std::string> &objectKeys,
-                                                     std::vector<master::QueryMetaInfoPb> &queryMetas,
-                                                     std::vector<std::string> &absentObjectKeys)
+Status WorkerOcServiceGetImpl::QueryMetadataFromCoordinationStore(const std::unordered_set<std::string> &objectKeys,
+                                                                  std::vector<master::QueryMetaInfoPb> &queryMetas,
+                                                                  std::vector<std::string> &absentObjectKeys)
 {
-    INJECT_POINT("worker.QueryMetaDataFromEtcd_failure");
+    INJECT_POINT("worker.QueryMetadataFromCoordinationStore_failure");
+    CHECK_FAIL_RETURN_STATUS(metadataReader_ != nullptr, K_NOT_READY, "object metadata reader is not initialized");
     for (const std::string &objKey : objectKeys) {
-        std::string etcdTableName = std::string(ETCD_META_TABLE_PREFIX) + ETCD_HASH_SUFFIX;
-        std::string hashValue = FormatString("%010u", MurmurHash3_32(objKey));
-        std::string tablePrefix;
-        if (!FLAGS_cluster_name.empty()) {
-            tablePrefix = FormatString("/%s", FLAGS_cluster_name);
-        }
-        std::string etcdKey = tablePrefix + FormatString("%s/%zu/%s", etcdTableName, hashValue, objKey);
         LOG(INFO) << "Query objKey: " << objKey << ", AZ name: " << FLAGS_cluster_name
-                  << ", query ETCD key: " << etcdKey;
-
-        auto metaPb = std::make_unique<ObjectMetaPb>();
-        CHECK_FAIL_RETURN_STATUS(!etcdStore_->IsKeepAliveTimeout(), K_RPC_UNAVAILABLE, "etcd is unavailable");
-        RangeSearchResult res;
-        Status rc = etcdStore_->RawGet(etcdKey, res, 0, GetRequestContext()->reqTimeoutDuration.CalcRemainingTime());
+                  << ", query coordination metadata key: " << objKey;
+        master::QueryMetaInfoPb queryMeta;
+        int64_t remainingTime = GetRequestContext()->reqTimeoutDuration.CalcRemainingTime();
+        CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(Validator::IsInNonNegativeInt32(remainingTime), K_RUNTIME_ERROR,
+                                             "Remaining time is out of range.");
+        Status rc = metadataReader_->QueryObjectMetadata(objKey, static_cast<int32_t>(remainingTime), queryMeta);
         if (rc.IsError()) {
             LOG(ERROR) << "Can not get meta: " << rc.ToString();
+            RETURN_IF_NOT_OK_EXCEPT(rc, K_NOT_FOUND);
             absentObjectKeys.emplace_back(objKey);
             continue;
         }
-        CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(
-            metaPb->ParseFromString(res.value), StatusCode::K_RUNTIME_ERROR,
-            FormatString("Parse string to ObjectMetaPb failed. String is: %s", res.value));
-        master::QueryMetaInfoPb queryMeta;
-        VLOG(DEBUG_LOG_LEVEL) << "Success to get ObjectKey " << objKey << ", metadata primary addr "
-                              << queryMeta.meta().primary_address() << " loadbalance addr " << queryMeta.address()
-                              << " from ETCD";
-        queryMeta.set_allocated_meta(metaPb.release());
-        // Using the primary address to indicate the worker that holds the Object, and the address will be checked
-        // before getting Object from the worker.
-        queryMeta.set_address(queryMeta.meta().primary_address());
         queryMetas.emplace_back(std::move(queryMeta));
     }
     return Status::OK();
@@ -2196,11 +2176,11 @@ Status WorkerOcServiceGetImpl::GetObjectFromRemoteOnLock(const ObjectMetaPb &met
     const std::string &objKey = meta.object_key();
 
     /*
-     * 1. If we can't connect with the remote worker: The meta must be gotten from ETCD, and the worker may belong to
-     *    local or others' AZ, then we just get Object from storage and no need to keep the copy.
+     * 1. If we can't connect with the remote worker: The meta must be gotten from coordination store, and the worker
+     *    may belong to local or others' AZ, then we just get Object from storage and no need to keep the copy.
      * 2. If we connect with the remote worker: In this situation, we can't judge whether the meta is gotten from the
-     *    master or ETCD. So before send copy to master, check the connection between worker and master, if it's
-     *    connected, then it's gotten from master, otherwise from ETCD.
+     *    master or coordination store. So before send copy to master, check the connection between worker and master,
+     *    if it's connected, then it's gotten from master, otherwise from coordination store.
      */
     RETURN_IF_NOT_OK_PRINT_ERROR_MSG(objectKV.CheckReadOffset(), "Read offset verify failed");
     Status status(K_RUNTIME_ERROR, FormatString("Fail to get object %s from remote worker, addr: %s", objKey, address));

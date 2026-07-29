@@ -83,6 +83,9 @@ using CoordinationStoreResult = RangeSearchResult;
 class ICoordinationBackend {
 public:
     using EventHandler = std::function<void(CoordinationEvent &&event)>;
+    using LocalIsolationHandler = std::function<void(const Status &)>;
+    using LocalRecoveryHandler = std::function<void()>;
+    using MembershipReadyHandler = std::function<void(const std::string &, bool)>;
     using ProcessFunction = std::function<Status(const std::string &, std::unique_ptr<std::string> &, bool &)>;
 
     /**
@@ -118,6 +121,31 @@ public:
      */
     virtual Status Get(const std::string &tableName, const std::string &key, RangeSearchResult &res,
                        int32_t timeoutMs = SEND_RPC_TIMEOUT_MS_DEFAULT) = 0;
+
+    /**
+     * @brief Idempotently create one logical table.
+     * @param[in] tableName Logical table name.
+     * @param[in] tablePrefix Physical table prefix.
+     * @return Backend operation status.
+     */
+    virtual Status CreateTable(const std::string &tableName, const std::string &tablePrefix) = 0;
+
+    /**
+     * @brief Idempotently create one logical table using an already-canonical physical prefix.
+     * @param[in] tableName Logical table name.
+     * @param[in] tablePrefix Canonical physical table prefix.
+     * @return Backend operation status.
+     */
+    virtual Status CreateTableWithExactPrefix(const std::string &tableName, const std::string &tablePrefix) = 0;
+
+    /**
+     * @brief Put one exact key/value pair.
+     * @param[in] tableName Logical table name.
+     * @param[in] key Exact relative key.
+     * @param[in] value Value bytes.
+     * @return Backend operation status.
+     */
+    virtual Status Put(const std::string &tableName, const std::string &key, const std::string &value) = 0;
 
     /**
      * @brief Execute callback-form single-key CAS and return revision information.
@@ -192,6 +220,12 @@ public:
     virtual Status ShutdownEventSources() = 0;
 
     /**
+     * @brief Idempotently stop watch event sources without stopping the membership keepalive.
+     * @return Backend operation status.
+     */
+    virtual Status ShutdownWatchEventSources() = 0;
+
+    /**
      * @brief Shut down all runtime resources owned by this backend instance.
      * @return Backend operation status.
      */
@@ -236,6 +270,51 @@ public:
      * @param[in] eventHandler Event callback to consume.
      */
     virtual void SetEventHandler(EventHandler &&eventHandler) = 0;
+
+    /**
+     * @brief Install the worker/member keepalive local-isolation callback owned by this backend role.
+     * @param[in] handler Callback invoked when this member backend confirms local control-backend isolation.
+     */
+    virtual void SetLocalIsolationHandler(LocalIsolationHandler handler) = 0;
+
+    /**
+     * @brief Install the worker/member keepalive local-recovery callback owned by this backend role.
+     * @param[in] handler Callback invoked when this member backend renews membership after local isolation.
+     */
+    virtual void SetLocalRecoveryHandler(LocalRecoveryHandler handler) = 0;
+
+    /**
+     * @brief Install the optional exact membership-operation callback for Coordinator-backed watches.
+     * @param[in] handler Callback invoked with the Coordinator identity and whether existing watches were invalidated.
+     */
+    virtual void SetMembershipReadyHandler(const MembershipReadyHandler &handler);
+
+    /**
+     * @brief Check whether this backend owns one Coordinator watch identity.
+     * @param[in] coordinatorId Coordinator process-lifetime identity.
+     * @param[in] watchId Watch identity within that Coordinator lifetime.
+     * @return True when this backend owns the identity.
+     */
+    virtual bool OwnsWatchIdentity(const std::string &coordinatorId, int64_t watchId) const;
+
+    /**
+     * @brief Check whether a watch registration transaction is still in progress.
+     * @return True when ownership may not be visible yet.
+     */
+    virtual bool IsWatchRegistrationInProgress() const;
+
+    /**
+     * @brief Invalidate cached watch identity state and trigger a best-effort rewatch.
+     */
+    virtual void InvalidateWatches();
+
+    /**
+     * @brief Deliver one identity-bound Coordinator watch event.
+     * @param[in] coordinatorId Coordinator process-lifetime identity.
+     * @param[in] watchId Watch identity within that Coordinator lifetime.
+     * @param[in] event Event delivered by the Worker watch RPC service.
+     */
+    virtual void HandleWatchEvent(const std::string &coordinatorId, int64_t watchId, CoordinationEvent &&event);
 
     /**
      * @brief Install the current bool store-state callback without changing its interface.

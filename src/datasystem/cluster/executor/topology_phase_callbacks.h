@@ -9,83 +9,18 @@
 #ifndef DATASYSTEM_CLUSTER_EXECUTOR_TOPOLOGY_PHASE_CALLBACKS_H
 #define DATASYSTEM_CLUSTER_EXECUTOR_TOPOLOGY_PHASE_CALLBACKS_H
 
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <functional>
 #include <memory>
-#include <mutex>
 #include <utility>
 
+#include "datasystem/cluster/executor/cancellation_token.h"
 #include "datasystem/cluster/executor/key_filter.h"
 #include "datasystem/cluster/executor/storage_scan_plan.h"
-#include "datasystem/cluster/model/topology_types.h"
+#include "datasystem/cluster/executor/topology_cleanup_effect.h"
+#include "datasystem/cluster/executor/topology_phase_action.h"
 #include "datasystem/utils/status.h"
 
 namespace datasystem::cluster {
-
-class TopologyTaskExecutor;
-
-/**
- * @brief Executor-owned cooperative cancellation signal.
- */
-class CancellationToken final {
-public:
-    /**
-     * @brief Destroy the token.
-     */
-    ~CancellationToken() = default;
-
-    /**
-     * @brief Return true after cancellation.
-     * @return Cooperative cancellation state.
-     */
-    bool IsCancelled() const noexcept
-    {
-        return cancelled_.load();
-    }
-
-    /**
-     * @brief Wait until cancellation or deadline.
-     * @param[in] deadline Absolute deadline.
-     * @return True when cancelled; false on deadline.
-     */
-    bool WaitUntil(std::chrono::steady_clock::time_point deadline) const
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        return changed_.wait_until(lock, deadline, [this] { return cancelled_.load(); });
-    }
-
-private:
-    friend class TopologyTaskExecutor;
-
-    /**
-     * @brief Request cooperative cancellation and wake waiters.
-     */
-    void Cancel() noexcept
-    {
-        cancelled_.store(true);
-        changed_.notify_all();
-    }
-    std::atomic<bool> cancelled_{ false };
-    // Coordinates changed_ waiters with cancelled_; cancelled_ remains the authoritative atomic state.
-    mutable std::mutex mutex_;
-    // Uses mutex_ to wake WaitUntil() when cancelled_ becomes true.
-    mutable std::condition_variable changed_;
-};
-
-/**
- * @brief Algorithm-neutral callback participant facts.
- */
-struct TopologyPhaseAction {
-    std::string taskId;
-    uint64_t topologyVersion{ 0 };
-    uint64_t batchEpoch{ 0 };
-    MemberIdentity executor;
-    std::optional<MemberIdentity> source;
-    std::optional<MemberIdentity> target;
-    std::optional<MemberIdentity> failed;
-};
 
 /**
  * @brief Fully copied callback facts plus invocation-lifetime opaque scope references.
@@ -98,12 +33,6 @@ struct TopologyCallbackContext {
     const IKeyFilter &keyFilter;
     const StorageScanPlan &storageScanPlan;
 };
-
-/**
- * @brief Bounded cleanup effect executed on the callback pool after Snapshot-gated authorization.
- */
-using TopologyCleanupEffect =
-    std::function<Status(std::chrono::steady_clock::time_point, const CancellationToken &)>;
 
 /**
  * @brief Move-only prepared cleanup authorized behind a fence gate and applied outside it.

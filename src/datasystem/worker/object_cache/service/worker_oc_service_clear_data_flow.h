@@ -18,14 +18,20 @@
 #define DATASYSTEM_WORKER_OBJECT_CACHE_SERVICE_WORKER_OC_SERVICE_CLEAR_DATA_FLOW_H
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#include "datasystem/cluster/executor/topology_phase_callbacks.h"
+#include "datasystem/cluster/executor/cancellation_token.h"
+#include "datasystem/cluster/executor/key_filter.h"
+#include "datasystem/cluster/executor/topology_phase_action.h"
 #include "datasystem/common/object_cache/object_ref_info.h"
 #include "datasystem/common/util/thread.h"
 #include "datasystem/protos/worker_object.pb.h"
@@ -42,6 +48,17 @@ namespace datasystem {
 namespace object_cache {
 class WorkerOcServiceClearDataFlow {
 public:
+    /**
+     * @brief Outcome of retrying failed restart metadata recovery before local cleanup.
+     */
+    struct RetryMetadataRecoveryResult {
+        // Objects neither rebuilt through retry nor successfully cleared locally.
+        size_t recoveredCount{ 0 };
+        size_t clearedCount{ 0 };
+        size_t unresolvedCount{ 0 };
+        std::unordered_set<std::string> unresolvedIds;
+        Status status{ Status::OK() };
+    };
 
     /**
      * @brief Failed object ids grouped by clear-data workflow stage.
@@ -75,8 +92,7 @@ public:
      * @param[in] localAddress Current worker address string.
      */
     WorkerOcServiceClearDataFlow(
-        std::shared_ptr<ObjectTable> objectTable,
-        std::shared_ptr<ObjectGlobalRefTable<ClientKey>> globalRefTable,
+        std::shared_ptr<ObjectTable> objectTable, std::shared_ptr<ObjectGlobalRefTable<ClientKey>> globalRefTable,
         std::shared_ptr<worker::WorkerMasterApiManagerBase<worker::WorkerMasterOCApi>> workerMasterApiManager,
         std::shared_ptr<WorkerOcServiceGlobalReferenceImpl> gRefProc,
         std::shared_ptr<WorkerOcServiceDeleteImpl> deleteProc, MetaDataRecoveryManager *metadataRecoveryManager,
@@ -91,10 +107,9 @@ public:
     /**
      * @brief Submit the full clear-data workflow asynchronously.
      * @param[in] req Clear-data request used for initial object selection.
-     * @param[in] clearRanges Range markers that remain in-progress until the workflow fully finishes.
-     * @param[in] retryTimes Current retry round number.
+     * @param[in] completedRetryRounds Number of retry rounds already completed.
      */
-    void SubmitClearDataAsync(const ClearDataReqPb &req, uint64_t retryTimes = 0);
+    void SubmitClearDataAsync(const ClearDataReqPb &req, uint64_t completedRetryRounds = 0);
 
     /**
      * @brief Execute the full clear-data workflow synchronously.
@@ -110,6 +125,14 @@ public:
     void ClearObject(const std::vector<std::string> &objectKeys);
 
     /**
+     * @brief Retry metadata recovery once for exact restart-recovery failures, then clear only retry failures.
+     * @param[in] failedObjectKeys Exact object keys from the failed restart metadata recovery attempt.
+     * @return Counts for recovered, cleared, and neither-recovered-nor-cleared objects.
+     */
+    RetryMetadataRecoveryResult RetryFailedMetadataRecoveryAndClearUnrecoverable(
+        const std::vector<std::string> &failedObjectKeys);
+
+    /**
      * @brief Materialize one failure scope and submit owned asynchronous cleanup work.
      * @param[in] action Validated Failure participants and task identity.
      * @param[in] filter Final object-key predicate for the task scope.
@@ -118,12 +141,25 @@ public:
      * @param[in] cancellation Executor-owned cooperative cancellation signal.
      * @return K_OK after owned work is accepted; an error otherwise.
      */
-    Status SubmitTopologyFailureCleanup(
-        const cluster::TopologyPhaseAction &action, const cluster::IKeyFilter &filter,
-        const std::string &businessOperationId, std::chrono::steady_clock::time_point deadline,
-        const cluster::CancellationToken &cancellation);
+    Status SubmitTopologyFailureCleanup(const cluster::TopologyPhaseAction &action, const cluster::IKeyFilter &filter,
+                                        const std::string &businessOperationId,
+                                        std::chrono::steady_clock::time_point deadline,
+                                        const cluster::CancellationToken &cancellation);
 
 private:
+    struct AsyncRetryLifetime {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool stopping{ false };
+        size_t activeCallbacks{ 0 };
+    };
+
+    struct ClearObjectSummary {
+        size_t clearedCount{ 0 };
+        size_t unresolvedCount{ 0 };
+        std::unordered_set<std::string> unresolvedIds;
+    };
+
     struct OwnedTopologyClearRequest {
         cluster::TopologyPhaseAction action;
         std::string businessOperationId;
@@ -139,22 +175,19 @@ private:
     /**
      * @brief Submit retry execution for failed workflow stages.
      * @param[in] req Original clear-data request.
-     * @param[in] clearRanges Range markers that remain in-progress until the workflow fully finishes.
-     * @param[in] retryTimes Current retry round number.
+     * @param[in] retryRound Retry round being submitted.
      * @param[in] retryIds Failed object ids grouped by workflow stage.
      */
-    void SubmitRetryClearDataAsync(const ClearDataReqPb &req, uint64_t retryTimes,
-                                   const ClearDataRetryIds &retryIds);
+    void SubmitRetryClearDataAsync(const ClearDataReqPb &req, uint64_t retryRound, const ClearDataRetryIds &retryIds);
 
     /**
      * @brief Schedule the next retry round for failed workflow stages.
      * @param[in] req Original clear-data request.
-     * @param[in] clearRanges Range markers that remain in-progress until the workflow fully finishes.
      * @param[in] retryIds Failed object ids grouped by workflow stage.
-     * @param[in] retryTimes Next retry round number.
+     * @param[in] completedRetryRounds Number of retry rounds already completed.
      */
     void RetryClearDataAsync(const ClearDataReqPb &req, const ClearDataRetryIds &retryIds,
-                             uint64_t retryTimes);
+                             uint64_t completedRetryRounds);
 
     /**
      * @brief Select local objects matched by ranges or worker ids in the request.
@@ -191,7 +224,8 @@ private:
     void FillCheckObjectDataLocationReq(const std::vector<std::string> &objectKeys,
                                         master::CheckObjectDataLocationReqPb &req,
                                         std::vector<std::string> &requestObjectKeys,
-                                        std::unordered_set<std::string> &failedIds) const;
+                                        std::unordered_set<std::string> &failedIds,
+                                        std::unordered_map<std::string, uint64_t> &queriedVersions) const;
 
     /**
      * @brief Query one master's batches to decide which local objects still need clearing.
@@ -203,7 +237,8 @@ private:
     void CheckNeedClearObjectsByMasterInBatches(const std::shared_ptr<worker::WorkerMasterOCApi> &workerMasterApi,
                                                 const std::vector<std::string> &objectKeys,
                                                 std::vector<std::string> &needClearObjectKeys,
-                                                std::unordered_set<std::string> &failedIds) const;
+                                                std::unordered_set<std::string> &failedIds,
+                                                std::unordered_map<std::string, uint64_t> &queriedVersions) const;
 
     /**
      * @brief Ask masters which matched objects still need local cleanup.
@@ -213,7 +248,20 @@ private:
      */
     void FilterObjectsNeedClearByMaster(const std::vector<std::string> &objectKeys,
                                         std::vector<std::string> &needClearObjectKeys,
-                                        std::unordered_set<std::string> &failedIds);
+                                        std::unordered_set<std::string> &failedIds,
+                                        std::unordered_map<std::string, uint64_t> &queriedVersions);
+
+    /**
+     * @brief Validate the retry summary and materialize unique retry-failed ids.
+     * @param[in] requestedIds Unique ids submitted to the retry.
+     * @param[in] retrySummary Summary returned by metadata recovery retry.
+     * @param[in] expectedCount Number of unique ids submitted to the retry.
+     * @param[out] retryFailedIds Unique retry-failed object ids.
+     * @return True when the summary is self-consistent.
+     */
+    bool BuildValidRetryFailedIds(const std::unordered_set<std::string> &requestedIds,
+                                  const MetaDataRecoveryManager::RecoverySummary &retrySummary, size_t expectedCount,
+                                  std::unordered_set<std::string> &retryFailedIds) const;
 
     /**
      * @brief Clear the subset of matched objects that masters require to be removed locally.
@@ -252,10 +300,30 @@ private:
     void RetryRecoverMasterAppRef(const std::vector<std::string> &objectKeys, ClearDataRetryIds &retryIds);
 
     /**
-     * @brief Recover metadata if needed and then clear local object data.
+     * @brief Recover metadata, re-prove failures with the master, and clear only version-matched local data.
      * @param[in] needClearObjIds Object ids that should be removed locally.
+     * @param[out] retryIds Exact unresolved object ids for the existing retry workflow.
      */
-    void ClearNeedClearObjects(const std::vector<std::string> &needClearObjIds);
+    void ClearNeedClearObjects(const std::vector<std::string> &needClearObjIds, ClearDataRetryIds &retryIds);
+
+    /**
+     * @brief Clear local objects through the existing reserve-lock-delete path and collect aggregate outcomes.
+     * @param[in] objectKeys Object ids that should be removed from the local worker.
+     * @param[in] logObjectKeys Whether legacy per-object failure logs should be emitted.
+     * @return Aggregate successful-clear and unresolved counts.
+     */
+    ClearObjectSummary ClearObjectsWithSummary(const std::vector<std::string> &objectKeys, bool logObjectKeys);
+
+    ClearObjectSummary ClearObjectsWithSummary(const std::vector<std::string> &objectKeys, bool logObjectKeys,
+                                               const std::unordered_map<std::string, uint64_t> &expectedVersions);
+
+    ClearObjectSummary ClearObjectsWithSummaryImpl(const std::vector<std::string> &objectKeys, bool logObjectKeys,
+                                                   const std::unordered_map<std::string, uint64_t> *expectedVersions);
+
+    void FinalizeRetryMetadataRecoveryResult(const std::vector<std::string> &uniqueFailedObjectKeys,
+                                             const std::unordered_set<std::string> &authorityCheckFailedIds,
+                                             const ClearObjectSummary &clearSummary,
+                                             RetryMetadataRecoveryResult &result) const;
 
     std::shared_ptr<ObjectTable> objectTable_{ nullptr };
     std::shared_ptr<ObjectGlobalRefTable<ClientKey>> globalRefTable_{ nullptr };
@@ -268,6 +336,7 @@ private:
     std::string localAddress_;
     std::shared_ptr<ThreadPool> clearDataThreadPool_{ nullptr };
     std::shared_ptr<std::atomic_bool> exitFlag_{ nullptr };
+    std::shared_ptr<AsyncRetryLifetime> asyncRetryLifetime_{ std::make_shared<AsyncRetryLifetime>() };
 };
 }  // namespace object_cache
 }  // namespace datasystem

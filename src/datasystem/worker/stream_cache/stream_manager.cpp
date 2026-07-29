@@ -18,6 +18,7 @@
 
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "datasystem/common/eventloop/timer_queue.h"
@@ -674,6 +675,21 @@ Status StreamManager::HandleBlockedRequestImpl(std::shared_ptr<BlockedCreateRequ
     // If this elapsed time was more than the initial sub-time, then return now with timeout error.
     if (retryCount > 0) {
         RETURN_IF_NOT_OK(blockedReq->HandleBlockedCreateTimeout());
+    }
+    const bool bigElement = std::is_same<W, CreateLobPageRspPb>::value;
+    const bool reclaimBeforeAlloc = !(bigElement || CheckHadEnoughMem(blockedReq->reqSize_));
+    auto scSvc = scSvc_.lock();
+    CHECK_FAIL_RETURN_STATUS_PRINT_ERROR(scSvc != nullptr, K_SHUTTING_DOWN, "worker shutting down.");
+    const char *operation = bigElement ? "AllocBigShmMemoryCommit" : "CreateShmPageCommit";
+    Status admissionRc = scSvc->CommitMemoryWriteAdmission(operation);
+    if (admissionRc.IsError()) {
+        return blockedReq->SendStatus(admissionRc);
+    }
+    // Admission is committed at the guard boundary; do not hold the runtime lock or service lifetime over side effects.
+    scSvc.reset();
+    if (reclaimBeforeAlloc) {
+        VLOG(SC_NORMAL_LOG_LEVEL) << FormatString("[%s] Most likely OOM. Reclaim memory", LogPrefix());
+        AckCursors();
     }
     // Invoke the call back to allocate the memory
     rc = (*blockedReq)();

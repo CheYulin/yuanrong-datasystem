@@ -16,8 +16,13 @@
  */
 
 #include <gtest/gtest.h>
+#include <chrono>
 #include <memory>
+#include <netdb.h>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <unistd.h>
 #include <vector>
 #include "client/kv_cache/kv_client_scale_common.h"
 #include "cluster/base_cluster.h"
@@ -31,6 +36,78 @@
 
 namespace datasystem {
 namespace st {
+namespace {
+constexpr int kEventuallyWaitTimeoutMs = 15'000;
+constexpr int kEventuallyPollIntervalMs = 100;
+constexpr char kKeepAliveFailureInject[] = "EtcdKeepAlive.SendKeepAliveMessage";
+constexpr char kKeepAliveQuickLoopInject[] = "EtcdStore.LaunchKeepAliveThreads.loopQuickly";
+constexpr char kLeaseExpiredInject[] = "GetLeaseExpiredMs";
+constexpr char kLocalIsolatedInject[] = "WorkerOCServer.AfterMarkLocalIsolated";
+constexpr char kBeforeMarkRunningInject[] = "WorkerRecoveryController.BeforeMarkRunning";
+
+Status TryConnectTcpPort(const HostPort &addr)
+{
+    struct addrinfo hints = {};
+    hints.ai_family = addr.IsIPv6() ? AF_INET6 : AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+
+    struct addrinfo *rawResult = nullptr;
+    auto port = std::to_string(addr.Port());
+    auto ret = getaddrinfo(addr.Host().c_str(), port.c_str(), &hints, &rawResult);
+    CHECK_FAIL_RETURN_STATUS(ret == 0, K_RUNTIME_ERROR,
+                             FormatString("Resolve address %s failed: %s", addr.ToString(), gai_strerror(ret)));
+    std::unique_ptr<struct addrinfo, decltype(&freeaddrinfo)> result(rawResult, freeaddrinfo);
+
+    for (auto *item = result.get(); item != nullptr; item = item->ai_next) {
+        auto fd = socket(item->ai_family, item->ai_socktype, item->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        auto connRet = connect(fd, item->ai_addr, item->ai_addrlen);
+        close(fd);
+        if (connRet == 0) {
+            return Status::OK();
+        }
+    }
+    RETURN_STATUS(K_NOT_READY, FormatString("Address %s is not listening", addr.ToString()));
+}
+
+bool WaitForTcpPortListening(const HostPort &addr, std::chrono::milliseconds timeout)
+{
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+        if (TryConnectTcpPort(addr).IsOk()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+template <typename Operation>
+void AssertEventuallyOk(Operation operation, const std::string &operationName)
+{
+    Status rc;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kEventuallyWaitTimeoutMs);
+    do {
+        rc = operation();
+        if (rc.IsOk()) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kEventuallyPollIntervalMs));
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(rc.IsOk()) << operationName << " stayed non-OK for " << kEventuallyWaitTimeoutMs
+                           << " ms, last status: " << rc.ToString();
+}
+
+void ExpectAdmissionRejected(const Status &rc, const std::string &mode, const std::string &operation)
+{
+    ASSERT_EQ(rc.GetCode(), K_NOT_READY) << operation << " status: " << rc.ToString();
+    EXPECT_NE(rc.GetMsg().find(mode), std::string::npos) << operation << " status: " << rc.ToString();
+}
+}  // namespace
+
 class KVClientEtcdDfxTest : public KVClientScaleCommon {
 public:
     void SetUp() override
@@ -152,6 +229,139 @@ TEST_F(KVClientEtcdDfxTest, LEVEL1_TestEtcdRestart)
     client.reset();
 }
 
+TEST_F(KVClientEtcdDfxTest, LEVEL1_TestStartingWorkerRejectsClientSetupBeforeReady)
+{
+    const int workerIndex = 0;
+    DS_ASSERT_OK(externalCluster_->StartWorker(
+        workerIndex, HostPort(),
+        " -inject_actions=test.start.notWait:call(0);worker.PreShutDown.skip:return(K_OK);"
+        "master.disableRocksDb:1*call();WorkerRecoveryController.BeforeMarkRunning:1*sleep(6000)"));
+
+    HostPort workerAddress;
+    DS_ASSERT_OK(cluster_->GetWorkerAddr(workerIndex, workerAddress));
+    ASSERT_TRUE(WaitForTcpPortListening(workerAddress, std::chrono::seconds(5)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+
+    ConnectOptions blockedOptions;
+    InitConnectOpt(workerIndex, blockedOptions, 500);
+    auto blockedClient = std::make_shared<KVClient>(blockedOptions);
+    auto blockedRc = blockedClient->Init();
+    EXPECT_EQ(blockedRc.GetCode(), StatusCode::K_NOT_READY) << blockedRc.ToString();
+
+    WaitAllMembersJoinClusterTopology(1, 20);
+    WaitTopologyTasksDrained({ workerIndex }, 20);
+
+    std::shared_ptr<KVClient> readyClient;
+    Status readyRc(StatusCode::K_NOT_READY, "ready client init has not been attempted");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    do {
+        ConnectOptions readyOptions;
+        InitConnectOpt(workerIndex, readyOptions, 2000);
+        readyClient = std::make_shared<KVClient>(readyOptions);
+        readyRc = readyClient->Init();
+        if (readyRc.IsOk()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    } while (std::chrono::steady_clock::now() < deadline);
+    DS_ASSERT_OK(readyRc);
+
+    const std::string key = "startup_admission_" + GetStringUuid();
+    const std::string value = "ready";
+    DS_ASSERT_OK(readyClient->Set(key, value));
+    std::string got;
+    DS_ASSERT_OK(readyClient->Get(key, got));
+    EXPECT_EQ(got, value);
+}
+
+TEST_F(KVClientEtcdDfxTest, LEVEL1_KVClientRejectsReadWriteDuringIsolationAndRecovering)
+{
+    constexpr int workerIndex = 0;
+    DS_ASSERT_OK(externalCluster_->StartWorkerAndWaitReady(
+        { workerIndex, 1 },
+        " -client_reconnect_wait_s=1 -ipc_through_shared_memory=true -heartbeat_interval_ms=1000"
+        " -auto_del_dead_node=false"));
+
+    std::shared_ptr<KVClient> client;
+    InitTestKVClient(workerIndex, client);
+    InitTestEtcdInstance();
+    std::unordered_map<HostPort, std::string> uuidMap;
+    GetWorkerUuids(db_.get(), uuidMap);
+    const std::string key = ObjectKeyWithOwner(workerIndex, uuidMap);
+    const std::string value = "value";
+    DS_ASSERT_OK(client->Set(key, value));
+    std::string got;
+    DS_ASSERT_OK(client->Get(key, got));
+    ASSERT_EQ(got, value);
+
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, workerIndex, kLocalIsolatedInject, "call()"));
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, workerIndex, kKeepAliveFailureInject, "return(K_RPC_UNAVAILABLE)"));
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, workerIndex, kLeaseExpiredInject, "call(1000)"));
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, workerIndex, kKeepAliveQuickLoopInject, "call(0)"));
+    bool keepAliveFailureActive = true;
+    bool recoveryPauseActive = false;
+    Raii clearFaults([&]() {
+        if (recoveryPauseActive) {
+            LOG_IF_ERROR(cluster_->ClearInjectAction(WORKER, workerIndex, kBeforeMarkRunningInject),
+                         "clear kv recovery pause");
+        }
+        if (keepAliveFailureActive) {
+            LOG_IF_ERROR(cluster_->ClearInjectAction(WORKER, workerIndex, kKeepAliveFailureInject),
+                         "clear kv keepalive failure");
+            LOG_IF_ERROR(cluster_->ClearInjectAction(WORKER, workerIndex, kLeaseExpiredInject),
+                         "clear kv lease override");
+            LOG_IF_ERROR(cluster_->ClearInjectAction(WORKER, workerIndex, kKeepAliveQuickLoopInject),
+                         "clear kv quick keepalive loop");
+        }
+    });
+
+    AssertEventuallyOk(
+        [&]() {
+            uint64_t count = 0;
+            RETURN_IF_NOT_OK(cluster_->GetInjectActionExecuteCount(WORKER, workerIndex, kLocalIsolatedInject, count));
+            CHECK_FAIL_RETURN_STATUS(count > 0, K_NOT_READY, "worker has not entered local isolation");
+            return Status::OK();
+        },
+        "kv client target enters local isolation");
+
+    got.clear();
+    ExpectAdmissionRejected(client->Get(key, got, 1'000), "LOCAL_ISOLATED", "kv get during local isolation");
+    ExpectAdmissionRejected(client->Set("kv_admission_isolated_" + GetStringUuid(), value), "LOCAL_ISOLATED",
+                            "kv set during local isolation");
+
+    DS_ASSERT_OK(cluster_->SetInjectAction(WORKER, workerIndex, kBeforeMarkRunningInject, "pause"));
+    recoveryPauseActive = true;
+    DS_ASSERT_OK(cluster_->ClearInjectAction(WORKER, workerIndex, kKeepAliveFailureInject));
+    DS_ASSERT_OK(cluster_->ClearInjectAction(WORKER, workerIndex, kLeaseExpiredInject));
+    DS_ASSERT_OK(cluster_->ClearInjectAction(WORKER, workerIndex, kKeepAliveQuickLoopInject));
+    keepAliveFailureActive = false;
+    AssertEventuallyOk(
+        [&]() {
+            uint64_t count = 0;
+            RETURN_IF_NOT_OK(
+                cluster_->GetInjectActionExecuteCount(WORKER, workerIndex, kBeforeMarkRunningInject, count));
+            CHECK_FAIL_RETURN_STATUS(count > 0, K_NOT_READY, "worker has not entered the recovery evidence gate");
+            return Status::OK();
+        },
+        "kv client target enters recovering mode");
+
+    got.clear();
+    ExpectAdmissionRejected(client->Get(key, got, 1'000), "RECOVERING", "kv get during recovery");
+    ExpectAdmissionRejected(client->Set("kv_admission_recovering_" + GetStringUuid(), value), "RECOVERING",
+                            "kv set during recovery");
+
+    DS_ASSERT_OK(cluster_->ClearInjectAction(WORKER, workerIndex, kBeforeMarkRunningInject));
+    recoveryPauseActive = false;
+    AssertEventuallyOk(
+        [&]() {
+            std::string recovered;
+            RETURN_IF_NOT_OK(client->Get(key, recovered, 1'000));
+            CHECK_FAIL_RETURN_STATUS(recovered == value, K_NOT_READY, "kv value mismatch after recovery");
+            return Status::OK();
+        },
+        "kv client reopens after recovery evidence completes");
+}
+
 TEST_F(KVClientEtcdDfxTest, DISABLED_TestWatchEventLost)
 {
     DS_ASSERT_OK(externalCluster_->StartWorkerAndWaitReady(
@@ -234,8 +444,8 @@ TEST_F(KVClientEtcdDfxTestAdjustNodeTimeout, TestSetHealthProbe)
 {
     DS_ASSERT_OK(externalCluster_->StartWorkerAndWaitReady({ 0, 1, 2 }));
     DS_ASSERT_OK(externalCluster_->ShutdownNode(WORKER, 1));
-    DS_ASSERT_OK(externalCluster_->StartWorker(
-        1, HostPort(), " -inject_actions=worker.RunKeepAliveTask:3*return(K_RPC_UNAVAILABLE)"));
+    DS_ASSERT_OK(externalCluster_->StartWorker(1, HostPort(),
+                                               " -inject_actions=worker.RunKeepAliveTask:3*return(K_RPC_UNAVAILABLE)"));
     constexpr int recoveryWindowSec = 15;
     DS_ASSERT_OK(externalCluster_->WaitNodeReady(WORKER, 1, recoveryWindowSec));
 }

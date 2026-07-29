@@ -20,8 +20,10 @@
 #include <condition_variable>
 #include <cstdint>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -35,8 +37,11 @@
 #include "datasystem/cluster/membership/membership_endpoint_view.h"
 #include "datasystem/cluster/routing/placement_facade.h"
 #include "datasystem/cluster/runtime/topology_snapshot_state.h"
+#include "datasystem/common/eventloop/timer_queue.h"
 #include "datasystem/common/inject/inject_point.h"
 #include "datasystem/common/kvstore/coordination_keys.h"
+#include "datasystem/common/inject/inject_point.h"
+#include "datasystem/common/metrics/kv_metrics.h"
 #include "datasystem/common/object_cache/safe_table.h"
 #include "datasystem/common/rpc/rpc_message.h"
 #include "datasystem/common/util/raii.h"
@@ -48,14 +53,25 @@
 #include "datasystem/worker/cluster_event_type.h"
 #include "datasystem/worker/object_cache/obj_cache_shm_unit.h"
 #include "datasystem/worker/object_cache/worker_master_oc_api.h"
+#include "datasystem/worker/object_cache/worker_worker_oc_service_impl.h"
+#include "datasystem/worker/worker_health_check.h"
+#include "datasystem/worker/runtime/worker_runtime_facade.h"
+#include "datasystem/worker/runtime/worker_runtime_state.h"
 #include "tests/ut/worker/object_cache/test_metadata_route.h"
 #include "tests/ut/worker/object_cache/test_placement_facade.h"
 #include "ut/common.h"
+
+DS_DECLARE_bool(enable_reconciliation);
+DS_DECLARE_bool(enable_metadata_recovery);
+DS_DECLARE_string(l2_cache_type);
+
 #define private public
 #include "datasystem/worker/object_cache/worker_oc_service_impl.h"
 #undef private
+#include "datasystem/worker/object_cache/master_worker_oc_service_impl.h"
+#include "datasystem/worker/object_cache/recovery/object_cache_recovery_state.h"
 
-using namespace ::testing;
+using namespace testing;
 
 using namespace datasystem::object_cache;
 
@@ -68,6 +84,19 @@ constexpr int64_t K_META_MOVING_RETRY_TIMEOUT_MS = 1'000;
 constexpr size_t K_EXPECTED_META_MOVING_RPC_CALLS = 2;
 constexpr uint64_t K_META_MOVING_SUCCESS_VERSION = 7;
 using WorkerMasterOCApiManager = worker::WorkerMasterApiManagerBase<worker::WorkerMasterOCApi>;
+using RecoverMetadataWithSummaryMethod = MetaDataRecoveryManager::RecoverySummary (MetaDataRecoveryManager::*)(
+    const std::vector<std::string> &, std::string);
+using RecoverMetadataOfDataMethod = Status (WorkerOCServiceImpl::*)(worker::WorkerRecoveryGeneration,
+                                                                    const std::vector<std::string> &,
+                                                                    std::vector<std::string> &, std::string);
+using RetryFailedMetadataRecoveryMethod = WorkerOcServiceClearDataFlow::RetryMetadataRecoveryResult (
+    WorkerOcServiceClearDataFlow::*)(const std::vector<std::string> &);
+using GetObjectFromAnywhereMethod = Status (WorkerOCServiceImpl::*)(const ReadKey &, const master::QueryMetaInfoPb &,
+                                                                    std::vector<RpcMessage> &);
+using GetExpectedReconciliationCountMethod = Status (WorkerOCServiceImpl::*)(int &) const;
+using FilterObjectsNeedClearByMasterMethod = void (WorkerOcServiceClearDataFlow::*)(
+    const std::vector<std::string> &, std::vector<std::string> &, std::unordered_set<std::string> &,
+    std::unordered_map<std::string, uint64_t> &);
 
 constexpr const char *K_REF_MOVING_RETRY_BEFORE_SLEEP_INJECT_POINT =
     "WorkerOcServiceGlobalReferenceImpl.SleepForRefMovingRetry.beforeSleep";
@@ -80,8 +109,7 @@ constexpr int64_t K_WAIT_FIRST_MOVING_CALL_TIMEOUT_MS = 1000;
 constexpr int64_t K_WAIT_RETRY_SLEEP_INJECT_TIMEOUT_MS = 1000;
 constexpr int64_t K_LOCK_PROBE_TIMEOUT_MS = 1000;
 
-bool WaitForInjectPointExecuteCount(const std::string &name, uint64_t expectedCount,
-                                    std::chrono::milliseconds timeout)
+bool WaitForInjectPointExecuteCount(const std::string &name, uint64_t expectedCount, std::chrono::milliseconds timeout)
 {
     auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -91,6 +119,22 @@ bool WaitForInjectPointExecuteCount(const std::string &name, uint64_t expectedCo
         std::this_thread::sleep_for(std::chrono::milliseconds(K_INJECT_WAIT_POLL_MS));
     }
     return inject::GetExecuteCount(name) >= expectedCount;
+}
+
+bool MarkRuntimeRunning(worker::WorkerRuntimeFacade &runtime, const std::string &detail = "ready")
+{
+    worker::WorkerRunningEvidence evidence{ true, true, true, true, true, true };
+    return runtime.TryCompleteRecovery(evidence, detail);
+}
+
+bool ApplyTopologyAvailability(worker::WorkerRuntimeFacade &runtime)
+{
+    worker::WorkerRecoveryEvidenceReport report{ { true, true, true, true, true, true },
+                                                 "fixture topology and recovery evidence ready" };
+    bool serving = false;
+    const auto token = runtime.ObserveTopologyAvailability(cluster::TopologyAvailabilityLevel::NORMAL,
+                                                           [&serving](bool open) { serving = open; });
+    return runtime.CommitTopologyAvailability(token, &report, [&serving](bool open) { serving = open; }) && serving;
 }
 
 class FakeWorkerMasterOCApi final : public worker::WorkerLocalMasterOCApi {
@@ -156,6 +200,30 @@ public:
         return Status::OK();
     }
 
+    Status CheckObjectDataLocation(master::CheckObjectDataLocationReqPb &req,
+                                   master::CheckObjectDataLocationRspPb &rsp) override
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            requestedObjectKeys_.clear();
+            for (const auto &objectVersion : req.object_versions()) {
+                requestedObjectKeys_.emplace_back(objectVersion.object_key());
+            }
+        }
+        rsp = locationResponse_;
+        return locationStatus_;
+    }
+
+    Status ReconcileMembershipChange(master::ReconciliationQueryPb &, master::ReconciliationRspPb &) override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++reconciliationCallCount_;
+        if (throwReconciliation_) {
+            throw std::runtime_error("reconciliation failed");
+        }
+        return reconciliationStatus_;
+    }
+
     void SetResponse(const master::GIncreaseRspPb &response)
     {
         response_ = response;
@@ -164,6 +232,29 @@ public:
     void SetDecreaseResponse(const master::GDecreaseRspPb &response)
     {
         decreaseResponse_ = response;
+    }
+
+    void SetLocationResponse(const master::CheckObjectDataLocationRspPb &response)
+    {
+        locationResponse_ = response;
+    }
+
+    void SetReconciliationStatus(Status status)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        reconciliationStatus_ = std::move(status);
+    }
+
+    void SetThrowReconciliation()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        throwReconciliation_ = true;
+    }
+
+    int ReconciliationCallCount() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return reconciliationCallCount_;
     }
 
     std::vector<std::string> RequestedObjectKeys() const
@@ -202,12 +293,17 @@ private:
     std::condition_variable cv_;
     master::GIncreaseRspPb response_;
     master::GDecreaseRspPb decreaseResponse_;
+    master::CheckObjectDataLocationRspPb locationResponse_;
     Status status_{ Status::OK() };
+    Status locationStatus_{ Status::OK() };
+    Status reconciliationStatus_{ Status::OK() };
+    bool throwReconciliation_{ false };
     std::vector<std::string> requestedObjectKeys_;
     bool returnRefMovingOnce_{ false };
     bool firstRefMovingCallSeen_{ false };
     int increaseCallCount_{ 0 };
     int decreaseCallCount_{ 0 };
+    int reconciliationCallCount_{ 0 };
 };
 
 class FakeWorkerMasterApiManager final : public worker::WorkerMasterApiManagerBase<worker::WorkerMasterOCApi> {
@@ -238,6 +334,94 @@ public:
 
 private:
     std::shared_ptr<worker::WorkerMasterOCApi> api_;
+};
+
+class EmptySlotRecoveryStore final : public SlotRecoveryStore {
+public:
+    EmptySlotRecoveryStore() = default;
+
+    Status Init() override
+    {
+        return Status::OK();
+    }
+
+    Status ListIncidents(std::vector<std::pair<std::string, SlotRecoveryInfoPb>> &incidents) override
+    {
+        incidents.clear();
+        return Status::OK();
+    }
+};
+
+class RecordingPersistenceApi final : public PersistenceApi {
+public:
+    Status Init() override
+    {
+        return Status::OK();
+    }
+
+    Status Save(const std::string &, uint64_t, int64_t, const std::shared_ptr<std::iostream> &, uint64_t, WriteMode,
+                uint32_t) override
+    {
+        return Status::OK();
+    }
+
+    Status Get(const std::string &, uint64_t, int64_t, std::shared_ptr<std::stringstream> &) override
+    {
+        return Status::OK();
+    }
+
+    Status GetWithoutVersion(const std::string &, int64_t, uint64_t, std::shared_ptr<std::stringstream> &) override
+    {
+        return Status::OK();
+    }
+
+    Status Del(const std::string &objectKey, uint64_t maxVerToDelete, bool deleteAllVersion, uint64_t,
+               const uint64_t *const objectVersion, bool listIncompleteVersions) override
+    {
+        deletedObjectKey = objectKey;
+        deletedMaxVersion = maxVerToDelete;
+        deletedObjectVersion = objectVersion == nullptr ? 0 : *objectVersion;
+        deleteAll = deleteAllVersion;
+        listIncomplete = listIncompleteVersions;
+        ++deleteCount;
+        return deleteStatus;
+    }
+
+    Status PreloadSlot(const std::string &, uint32_t, const SlotPreloadCallback &) override
+    {
+        return Status::OK();
+    }
+
+    Status MergeSlot(const std::string &, uint32_t) override
+    {
+        return Status::OK();
+    }
+
+    Status CleanupLocalSlots() override
+    {
+        return Status::OK();
+    }
+
+    std::string GetL2CacheRequestSuccessRate() const override
+    {
+        return {};
+    }
+
+    Status deleteStatus{ Status::OK() };
+    std::string deletedObjectKey;
+    uint64_t deletedMaxVersion{ 0 };
+    uint64_t deletedObjectVersion{ 0 };
+    size_t deleteCount{ 0 };
+    bool deleteAll{ false };
+    bool listIncomplete{ false };
+};
+
+class TestSlotRecoveryManager final : public SlotRecoveryManager {
+public:
+    explicit TestSlotRecoveryManager(std::shared_ptr<SlotRecoveryStore> store)
+    {
+        store_ = std::move(store);
+    }
 };
 
 class TestDistributedTopology final {
@@ -289,9 +473,11 @@ private:
         topology.version = TOPOLOGY_VERSION;
         topology.members = {
             cluster::Member{ { std::string(MEMBER_ID_SIZE, LOCAL_MEMBER_ID_FILL), localAddress.ToString() },
-                             cluster::MemberState::ACTIVE, { LOCAL_MEMBER_TOKEN } },
+                             cluster::MemberState::ACTIVE,
+                             { LOCAL_MEMBER_TOKEN } },
             cluster::Member{ { std::string(MEMBER_ID_SIZE, PEER_MEMBER_ID_FILL), peerAddress.ToString() },
-                             cluster::MemberState::ACTIVE, { PEER_MEMBER_TOKEN } }
+                             cluster::MemberState::ACTIVE,
+                             { PEER_MEMBER_TOKEN } }
         };
         std::shared_ptr<const cluster::TopologySnapshot> snapshot;
         RETURN_IF_NOT_OK(cluster::TopologySnapshot::Create(std::move(topology), TOPOLOGY_VERSION,
@@ -324,8 +510,8 @@ public:
         globalRefTable_ = std::make_shared<ObjectGlobalRefTable<ClientKey>>();
         localAddress_ = HostPort("127.0.0.1", 18481);
         DS_ASSERT_OK(topologyRuntime_.Init(localAddress_));
-        endpointPolicy_ = std::make_unique<ObjectEndpointPolicy>(metadataRoute_,
-                                                                 topologyRuntime_.Engine()->Membership());
+        endpointPolicy_ =
+            std::make_unique<ObjectEndpointPolicy>(metadataRoute_, topologyRuntime_.Engine()->Membership());
         evictionManager_ = std::make_shared<WorkerOcEvictionManager>(objectTable_, localAddress_, localAddress_,
                                                                      metadataRoute_, nullptr);
         WorkerOcServiceCrudParam param = MakeCrudParam();
@@ -333,12 +519,12 @@ public:
         gRefProc_ =
             std::make_shared<WorkerOcServiceGlobalReferenceImpl>(param, globalRefTable_, nullptr, localAddress_);
         impl_ = std::make_shared<WorkerOCServiceImpl>(
-            localAddress_, localAddress_, objectTable_, nullptr, evictionManager_, nullptr, nullptr, nullptr,
-            topologyRuntime_.Engine(), metadataRoute_, topologyRuntime_.Engine()->Membership(), &exitRequested_,
-            topologyRuntime_.Engine()->IsRestart(), false);
-        dataClearImpl_ = std::make_shared<WorkerOcServiceClearDataFlow>(
-            objectTable_, globalRefTable_, nullptr, gRefProc_, deleteProc_, nullptr, metadataRoute_, *endpointPolicy_,
-            localAddress_.ToString());
+            localAddress_, localAddress_, objectTable_, nullptr, evictionManager_, nullptr,
+            ObjectCacheRecoveryDependencies{}, nullptr, topologyRuntime_.Runtime(), metadataRoute_,
+            topologyRuntime_.Engine()->Membership(), &exitRequested_, topologyRuntime_.Engine()->IsRestart(), false);
+        dataClearImpl_ = std::make_shared<WorkerOcServiceClearDataFlow>(objectTable_, globalRefTable_, nullptr,
+                                                                        gRefProc_, deleteProc_, nullptr, metadataRoute_,
+                                                                        *endpointPolicy_, localAddress_.ToString());
         impl_->InitServiceImpl();
     }
 
@@ -354,16 +540,53 @@ public:
         CommonTest::TearDown();
     }
 
-    void AddObject(const std::string &objectKey, uint64_t version = 1, uint64_t dataSize = 1024)
+    void AddObject(const std::string &objectKey, uint64_t version = 1, uint64_t dataSize = 1024,
+                   WriteMode writeMode = WriteMode::NONE_L2_CACHE)
     {
         auto obj = std::make_unique<ObjCacheShmUnit>();
         obj->SetDataSize(dataSize);
         obj->SetCreateTime(version);
         obj->SetLifeState(ObjectLifeState::OBJECT_SEALED);
-        obj->modeInfo.SetWriteMode(WriteMode::NONE_L2_CACHE);
+        obj->modeInfo.SetWriteMode(writeMode);
         obj->stateInfo.SetDataFormat(DataFormat::BINARY);
         obj->stateInfo.SetPrimaryCopy(true);
         DS_ASSERT_OK(objectTable_->Insert(objectKey, std::move(obj)));
+    }
+
+    std::shared_ptr<WorkerOcServiceDeleteImpl> CreateDeleteProc(const std::shared_ptr<PersistenceApi> &persistenceApi)
+    {
+        WorkerOcServiceCrudParam param{
+            .workerMasterApiManager = nullptr,
+            .workerRequestManager = requestManager_,
+            .memoryRefTable = nullptr,
+            .objectTable = objectTable_,
+            .evictionManager = evictionManager_,
+            .workerDevOcManager = nullptr,
+            .asyncPersistenceDelManager = nullptr,
+            .asyncSendManager = nullptr,
+            .metadataSize = 0,
+            .persistenceApi = persistenceApi,
+            .metadataRouteResolver = &metadataRoute_,
+            .endpointPolicy = endpointPolicy_.get(),
+            .exitRequested = &exitRequested_,
+            .allowDirectoryLag = false,
+        };
+        return std::make_shared<WorkerOcServiceDeleteImpl>(param, nullptr, localAddress_, nullptr);
+    }
+
+    std::shared_ptr<WorkerOCServiceImpl> CreateWorkerOCService(const std::shared_ptr<AkSkManager> &akSkManager)
+    {
+        return std::make_shared<WorkerOCServiceImpl>(
+            localAddress_, localAddress_, objectTable_, akSkManager, evictionManager_, nullptr,
+            ObjectCacheRecoveryDependencies{}, nullptr, topologyRuntime_.Runtime(), metadataRoute_,
+            topologyRuntime_.Engine()->Membership(), &exitRequested_, topologyRuntime_.Engine()->IsRestart(), false);
+    }
+
+    WorkerWorkerOCServiceImpl CreateWorkerWorkerOCService(std::shared_ptr<AkSkManager> akSkManager = nullptr)
+    {
+        return WorkerWorkerOCServiceImpl(
+            impl_, std::move(akSkManager), topologyRuntime_.Engine()->Membership(), [] { return true; },
+            [] { return cluster::ControlBackendObservation{}; });
     }
 
     void AddWorkerRef(const std::string &objectKey, const std::string &clientId = "client-id")
@@ -397,6 +620,112 @@ public:
         };
     }
 
+    Status Reconcile(const PushMetaToWorkerReqPb &req)
+    {
+        return impl_->Reconciliation(req);
+    }
+
+    uint16_t ReconciliationCount() const
+    {
+        return impl_->numRecon_;
+    }
+
+    static bool HasCompleteReconciliationSet(const std::set<std::string> &expected,
+                                             const std::unordered_set<std::string> &completed)
+    {
+        return WorkerOCServiceImpl::HasCompleteReconciliationSet(expected, completed);
+    }
+
+    struct BestEffortRetryCase {
+        std::string recoveredKey;
+        std::string clearedKey;
+        std::string unresolvedKey;
+        uint64_t clearedVersion;
+    };
+
+    BestEffortRetryCase PrepareBestEffortRetryCase()
+    {
+        BestEffortRetryCase retryCase{
+            .recoveredKey = "batch-recovered-on-retry",
+            .clearedKey = "batch-cleared-after-retry",
+            .unresolvedKey = "batch-unresolved-after-retry",
+            .clearedVersion = 0,
+        };
+        AddObject(retryCase.recoveredKey);
+        AddObject(retryCase.clearedKey);
+        AddObject(retryCase.unresolvedKey);
+        std::shared_ptr<SafeObjType> clearedEntry;
+        auto status = objectTable_->Get(retryCase.clearedKey, clearedEntry);
+        EXPECT_TRUE(status.IsOk());
+        if (status.IsError()) {
+            return retryCase;
+        }
+        status = clearedEntry->RLock();
+        EXPECT_TRUE(status.IsOk());
+        if (status.IsError()) {
+            return retryCase;
+        }
+        retryCase.clearedVersion = clearedEntry->Get()->GetCreateTime();
+        clearedEntry->RUnlock();
+        return retryCase;
+    }
+
+    std::unique_ptr<MetaDataRecoveryManager> UseMetadataRecoveryManager()
+    {
+        auto metadataRecoveryManager = std::make_unique<MetaDataRecoveryManager>(
+            localAddress_, objectTable_, MetaDataRecoveryManager::ClusterAccess{}, nullptr, metadataRoute_);
+        dataClearImpl_->metadataRecoveryManager_ = metadataRecoveryManager.get();
+        return metadataRecoveryManager;
+    }
+
+    static void ExpectBestEffortRecoverySummary(const BestEffortRetryCase &retryCase)
+    {
+        BINEXPECT_CALL((RecoverMetadataWithSummaryMethod)&MetaDataRecoveryManager::RecoverMetadataWithSummary,
+                       (ElementsAre(retryCase.recoveredKey, retryCase.clearedKey, retryCase.unresolvedKey), ""))
+            .Times(1)
+            .WillOnce(Invoke([&retryCase](const std::vector<std::string> &objectKeys, const std::string &) {
+                MetaDataRecoveryManager::RecoverySummary summary;
+                summary.requestedCount = objectKeys.size();
+                summary.recoveredCount = 1;
+                summary.failedIds = { retryCase.clearedKey, retryCase.unresolvedKey };
+                return summary;
+            }));
+    }
+
+    static void ExpectBestEffortClearCheck(const BestEffortRetryCase &retryCase)
+    {
+        BINEXPECT_CALL(
+            (FilterObjectsNeedClearByMasterMethod)&WorkerOcServiceClearDataFlow::FilterObjectsNeedClearByMaster,
+            (_, _, _, _))
+            .WillOnce(
+                Invoke([&retryCase](const std::vector<std::string> &objectKeys, std::vector<std::string> &needClear,
+                                    std::unordered_set<std::string> &failedIds,
+                                    std::unordered_map<std::string, uint64_t> &versions) {
+                    EXPECT_THAT(objectKeys, UnorderedElementsAre(retryCase.clearedKey, retryCase.unresolvedKey));
+                    needClear.emplace_back(retryCase.clearedKey);
+                    failedIds.emplace(retryCase.unresolvedKey);
+                    versions.emplace(retryCase.clearedKey, retryCase.clearedVersion);
+                }));
+    }
+
+    static void AssertBestEffortRetryCounters(const BestEffortRetryCase &retryCase,
+                                              const WorkerOcServiceClearDataFlow::RetryMetadataRecoveryResult &result)
+    {
+        EXPECT_EQ(result.recoveredCount, 1U);
+        EXPECT_EQ(result.clearedCount, 1U);
+        EXPECT_EQ(result.unresolvedCount, 1U);
+        EXPECT_THAT(result.unresolvedIds, UnorderedElementsAre(retryCase.unresolvedKey));
+        EXPECT_TRUE(result.status.IsError());
+    }
+
+    void AssertBestEffortRetryObjects(const BestEffortRetryCase &retryCase)
+    {
+        std::shared_ptr<SafeObjType> entry;
+        EXPECT_TRUE(objectTable_->Get(retryCase.recoveredKey, entry).IsOk());
+        EXPECT_EQ(objectTable_->Get(retryCase.clearedKey, entry).GetCode(), StatusCode::K_NOT_FOUND);
+        EXPECT_TRUE(objectTable_->Get(retryCase.unresolvedKey, entry).IsOk());
+    }
+
 protected:
     static constexpr const char *kRecoverMasterAppRefSubscriber = "WorkerOcServiceImplTest.RecoverMasterAppRef";
 
@@ -414,6 +743,29 @@ protected:
     std::shared_ptr<WorkerOcServiceGlobalReferenceImpl> gRefProc_;
     std::shared_ptr<WorkerOcServiceDeleteImpl> deleteProc_;
     std::shared_ptr<WorkerOcServiceClearDataFlow> dataClearImpl_;
+};
+
+class WorkerOcServiceImplReadyTopologyTest : public WorkerOcServiceImplTest {
+public:
+    void SetUp() override
+    {
+        WorkerOcServiceImplTest::SetUp();
+        DS_ASSERT_OK(topologyRuntime_.StartReadySingleMember(localAddress_));
+        ASSERT_TRUE(impl_->SetRuntimeFacade(&runtime_));
+        ASSERT_TRUE(ApplyTopologyAvailability(runtime_));
+        EXPECT_EQ(runtime_.GetSnapshot().mode, worker::WorkerServiceMode::RUNNING);
+        DS_EXPECT_OK(runtime_.CheckAdmission(worker::WorkerAdmissionKind::NORMAL_WRITE, "ObjectCacheFixture"));
+    }
+
+    void TearDown() override
+    {
+        WorkerOcServiceImplTest::TearDown();
+        endpointPolicy_.reset();
+        DS_EXPECT_OK(topologyRuntime_.Shutdown());
+    }
+
+protected:
+    worker::WorkerRuntimeFacade runtime_;
 };
 
 TEST_F(WorkerOcServiceImplTest, SingleMetaMovingWithoutRedirectInfoRetries)
@@ -506,6 +858,1660 @@ TEST_F(WorkerOcServiceImplTest, TestParallelClearData)
     }
 }
 
+TEST_F(WorkerOcServiceImplTest, RetryFailedMetadataRecoveryRetainsObjectRecoveredOnRetry)
+{
+    const std::string objectKey = "recovered-on-retry";
+    AddObject(objectKey);
+    MetaDataRecoveryManager metadataRecoveryManager(localAddress_, objectTable_,
+                                                    MetaDataRecoveryManager::ClusterAccess{}, nullptr, metadataRoute_);
+    dataClearImpl_->metadataRecoveryManager_ = &metadataRecoveryManager;
+
+    BINEXPECT_CALL((RecoverMetadataWithSummaryMethod)&MetaDataRecoveryManager::RecoverMetadataWithSummary,
+                   (ElementsAre(objectKey), ""))
+        .Times(1)
+        .WillOnce(Invoke([&objectKey](const std::vector<std::string> &objectKeys, std::string standbyAddr) {
+            EXPECT_THAT(objectKeys, ElementsAre(objectKey));
+            EXPECT_TRUE(standbyAddr.empty());
+            MetaDataRecoveryManager::RecoverySummary summary;
+            summary.requestedCount = objectKeys.size();
+            summary.recoveredCount = objectKeys.size();
+            return summary;
+        }));
+
+    auto result = dataClearImpl_->RetryFailedMetadataRecoveryAndClearUnrecoverable({ objectKey });
+
+    EXPECT_EQ(result.recoveredCount, 1U);
+    EXPECT_EQ(result.clearedCount, 0U);
+    EXPECT_EQ(result.unresolvedCount, 0U);
+    EXPECT_TRUE(result.status.IsOk());
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_TRUE(objectTable_->Get(objectKey, entry).IsOk());
+}
+
+TEST_F(WorkerOcServiceImplTest, RetryFailedMetadataRecoveryClearsObjectStillUnrecoverableAfterRetry)
+{
+    constexpr const char *kInjectPoint = "WorkerOcServiceClearDataFlow.BeforeClearUnrecoverableObjects";
+    const std::string objectKey = "unrecoverable-after-retry";
+    AddObject(objectKey);
+    MetaDataRecoveryManager metadataRecoveryManager(localAddress_, objectTable_,
+                                                    MetaDataRecoveryManager::ClusterAccess{}, nullptr, metadataRoute_);
+    dataClearImpl_->metadataRecoveryManager_ = &metadataRecoveryManager;
+    std::shared_ptr<SafeObjType> entry;
+    DS_ASSERT_OK(objectTable_->Get(objectKey, entry));
+    DS_ASSERT_OK(entry->RLock());
+    const auto objectVersion = entry->Get()->GetCreateTime();
+    entry->RUnlock();
+    ASSERT_TRUE(inject::Set(kInjectPoint, "call()").IsOk());
+    Raii clearInject([kInjectPoint] { (void)inject::Clear(kInjectPoint); });
+
+    BINEXPECT_CALL((RecoverMetadataWithSummaryMethod)&MetaDataRecoveryManager::RecoverMetadataWithSummary,
+                   (ElementsAre(objectKey), ""))
+        .Times(1)
+        .WillOnce(Invoke([&objectKey](const std::vector<std::string> &objectKeys, std::string standbyAddr) {
+            EXPECT_THAT(objectKeys, ElementsAre(objectKey));
+            EXPECT_TRUE(standbyAddr.empty());
+            MetaDataRecoveryManager::RecoverySummary summary;
+            summary.requestedCount = objectKeys.size();
+            summary.failedIds = objectKeys;
+            return summary;
+        }));
+    BINEXPECT_CALL((FilterObjectsNeedClearByMasterMethod)&WorkerOcServiceClearDataFlow::FilterObjectsNeedClearByMaster,
+                   (ElementsAre(objectKey), _, _, _))
+        .WillOnce(Invoke([&objectKey, objectVersion](
+                             const std::vector<std::string> &, std::vector<std::string> &needClear,
+                             std::unordered_set<std::string> &, std::unordered_map<std::string, uint64_t> &versions) {
+            needClear.emplace_back(objectKey);
+            versions.emplace(objectKey, objectVersion);
+        }));
+
+    auto result = dataClearImpl_->RetryFailedMetadataRecoveryAndClearUnrecoverable({ objectKey });
+
+    EXPECT_EQ(result.recoveredCount, 0U);
+    EXPECT_EQ(result.clearedCount, 1U);
+    EXPECT_EQ(result.unresolvedCount, 0U);
+    EXPECT_TRUE(result.status.IsOk());
+    EXPECT_EQ(inject::GetExecuteCount(kInjectPoint), 1U);
+    EXPECT_EQ(objectTable_->Get(objectKey, entry).GetCode(), StatusCode::K_NOT_FOUND);
+}
+
+TEST_F(WorkerOcServiceImplTest, RetryFailedMetadataRecoveryKeepsObjectWhenMasterProofIsUnavailable)
+{
+    const std::string objectKey = "unresolved-master-proof";
+    AddObject(objectKey);
+    MetaDataRecoveryManager metadataRecoveryManager(localAddress_, objectTable_,
+                                                    MetaDataRecoveryManager::ClusterAccess{}, nullptr, metadataRoute_);
+    dataClearImpl_->metadataRecoveryManager_ = &metadataRecoveryManager;
+
+    BINEXPECT_CALL((RecoverMetadataWithSummaryMethod)&MetaDataRecoveryManager::RecoverMetadataWithSummary,
+                   (ElementsAre(objectKey), ""))
+        .Times(1)
+        .WillOnce(Invoke([&objectKey](const std::vector<std::string> &objectKeys, std::string) {
+            MetaDataRecoveryManager::RecoverySummary summary;
+            summary.requestedCount = objectKeys.size();
+            summary.failedIds = objectKeys;
+            return summary;
+        }));
+    BINEXPECT_CALL((FilterObjectsNeedClearByMasterMethod)&WorkerOcServiceClearDataFlow::FilterObjectsNeedClearByMaster,
+                   (ElementsAre(objectKey), _, _, _))
+        .WillOnce(Invoke([&objectKey](const std::vector<std::string> &, std::vector<std::string> &,
+                                      std::unordered_set<std::string> &failedIds,
+                                      std::unordered_map<std::string, uint64_t> &) { failedIds.emplace(objectKey); }));
+
+    auto result = dataClearImpl_->RetryFailedMetadataRecoveryAndClearUnrecoverable({ objectKey });
+
+    EXPECT_EQ(result.recoveredCount, 0U);
+    EXPECT_EQ(result.clearedCount, 0U);
+    EXPECT_EQ(result.unresolvedCount, 1U);
+    EXPECT_THAT(result.unresolvedIds, UnorderedElementsAre(objectKey));
+    EXPECT_TRUE(result.status.IsError());
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_TRUE(objectTable_->Get(objectKey, entry).IsOk());
+}
+
+TEST_F(WorkerOcServiceImplTest, RetryFailedMetadataRecoveryRejectsUnknownFailureWithoutCleanup)
+{
+    const std::string objectKey = "original-failed-object";
+    AddObject(objectKey);
+    MetaDataRecoveryManager metadataRecoveryManager(localAddress_, objectTable_,
+                                                    MetaDataRecoveryManager::ClusterAccess{}, nullptr, metadataRoute_);
+    dataClearImpl_->metadataRecoveryManager_ = &metadataRecoveryManager;
+
+    BINEXPECT_CALL((RecoverMetadataWithSummaryMethod)&MetaDataRecoveryManager::RecoverMetadataWithSummary,
+                   (ElementsAre(objectKey), ""))
+        .Times(1)
+        .WillOnce(Invoke([](const std::vector<std::string> &objectKeys, std::string) {
+            MetaDataRecoveryManager::RecoverySummary summary;
+            summary.requestedCount = objectKeys.size();
+            summary.failedIds.emplace_back("unknown-failed-object");
+            return summary;
+        }));
+    BINEXPECT_CALL((FilterObjectsNeedClearByMasterMethod)&WorkerOcServiceClearDataFlow::FilterObjectsNeedClearByMaster,
+                   (_, _, _, _))
+        .Times(0);
+
+    auto result = dataClearImpl_->RetryFailedMetadataRecoveryAndClearUnrecoverable({ objectKey });
+
+    EXPECT_EQ(result.clearedCount, 0U);
+    EXPECT_EQ(result.unresolvedCount, 1U);
+    EXPECT_THAT(result.unresolvedIds, UnorderedElementsAre(objectKey));
+    EXPECT_TRUE(result.status.IsError());
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_TRUE(objectTable_->Get(objectKey, entry).IsOk());
+}
+
+TEST_F(WorkerOcServiceImplTest, RetryFailedMetadataRecoveryRejectsInconsistentCountsWithoutCleanup)
+{
+    const std::string objectKey = "inconsistently-counted-object";
+    AddObject(objectKey);
+    MetaDataRecoveryManager metadataRecoveryManager(localAddress_, objectTable_,
+                                                    MetaDataRecoveryManager::ClusterAccess{}, nullptr, metadataRoute_);
+    dataClearImpl_->metadataRecoveryManager_ = &metadataRecoveryManager;
+
+    BINEXPECT_CALL((RecoverMetadataWithSummaryMethod)&MetaDataRecoveryManager::RecoverMetadataWithSummary,
+                   (ElementsAre(objectKey), ""))
+        .Times(1)
+        .WillOnce(Invoke([&objectKey](const std::vector<std::string> &objectKeys, std::string) {
+            MetaDataRecoveryManager::RecoverySummary summary;
+            summary.requestedCount = objectKeys.size();
+            summary.recoveredCount = 1;
+            summary.failedIds.emplace_back(objectKey);
+            return summary;
+        }));
+    BINEXPECT_CALL((FilterObjectsNeedClearByMasterMethod)&WorkerOcServiceClearDataFlow::FilterObjectsNeedClearByMaster,
+                   (_, _, _, _))
+        .Times(0);
+
+    auto result = dataClearImpl_->RetryFailedMetadataRecoveryAndClearUnrecoverable({ objectKey });
+
+    EXPECT_EQ(result.clearedCount, 0U);
+    EXPECT_EQ(result.unresolvedCount, 1U);
+    EXPECT_THAT(result.unresolvedIds, UnorderedElementsAre(objectKey));
+    EXPECT_TRUE(result.status.IsError());
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_TRUE(objectTable_->Get(objectKey, entry).IsOk());
+}
+
+TEST_F(WorkerOcServiceImplTest, RetryFailedMetadataRecoveryBestEffortDoesNotBlockRecoveredEntries)
+{
+    auto retryCase = PrepareBestEffortRetryCase();
+    auto metadataRecoveryManager = UseMetadataRecoveryManager();
+    ExpectBestEffortRecoverySummary(retryCase);
+    ExpectBestEffortClearCheck(retryCase);
+
+    auto result = dataClearImpl_->RetryFailedMetadataRecoveryAndClearUnrecoverable(
+        { retryCase.recoveredKey, retryCase.clearedKey, retryCase.unresolvedKey });
+
+    AssertBestEffortRetryCounters(retryCase, result);
+    AssertBestEffortRetryObjects(retryCase);
+}
+
+TEST_F(WorkerOcServiceImplTest, CheckObjectDataLocationRejectsIncompleteOrForeignPartition)
+{
+    const std::string objectKey = "requested-object";
+    AddObject(objectKey);
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+
+    auto verifyRejectedResponse = [this, &api, &objectKey](const master::CheckObjectDataLocationRspPb &response) {
+        api->SetLocationResponse(response);
+        std::vector<std::string> needClearObjectKeys;
+        std::unordered_set<std::string> failedIds;
+        std::unordered_map<std::string, uint64_t> queriedVersions;
+
+        dataClearImpl_->CheckNeedClearObjectsByMasterInBatches(api, { objectKey }, needClearObjectKeys, failedIds,
+                                                               queriedVersions);
+
+        EXPECT_TRUE(needClearObjectKeys.empty());
+        EXPECT_THAT(failedIds, UnorderedElementsAre(objectKey));
+    };
+
+    master::CheckObjectDataLocationRspPb incompleteResponse;
+    verifyRejectedResponse(incompleteResponse);
+
+    master::CheckObjectDataLocationRspPb foreignResponse;
+    foreignResponse.add_no_need_clear_object_keys(objectKey);
+    foreignResponse.add_need_clear_object_keys("foreign-object");
+    verifyRejectedResponse(foreignResponse);
+}
+
+TEST_F(WorkerOcServiceImplTest, AuthoritativeClearDoesNotDeleteNewerSameKeyVersion)
+{
+    const std::string objectKey = "newer-same-key-version";
+    AddObject(objectKey);
+    std::shared_ptr<SafeObjType> entry;
+    DS_ASSERT_OK(objectTable_->Get(objectKey, entry));
+    DS_ASSERT_OK(entry->RLock());
+    const auto currentVersion = entry->Get()->GetCreateTime();
+    entry->RUnlock();
+    std::unordered_map<std::string, uint64_t> queriedVersions{ { objectKey, currentVersion - 1 } };
+
+    auto result = dataClearImpl_->ClearObjectsWithSummary({ objectKey }, false, queriedVersions);
+
+    EXPECT_EQ(result.clearedCount, 0U);
+    EXPECT_EQ(result.unresolvedCount, 1U);
+    EXPECT_THAT(result.unresolvedIds, UnorderedElementsAre(objectKey));
+    EXPECT_TRUE(objectTable_->Get(objectKey, entry).IsOk());
+}
+
+TEST_F(WorkerOcServiceImplTest, AuthoritativeClearDeletesExactL2VersionBeforeRemovingLocalObject)
+{
+    metrics::ResetKvMetricsForTest();
+    Raii restoreMetrics([] {
+        metrics::ResetKvMetricsForTest();
+        (void)metrics::InitKvMetrics();
+    });
+    ASSERT_TRUE(metrics::InitKvMetrics().IsOk());
+    const std::string oldL2CacheType = FLAGS_l2_cache_type;
+    FLAGS_l2_cache_type = "distributed_disk";
+    Raii restoreL2CacheType([oldL2CacheType] { FLAGS_l2_cache_type = oldL2CacheType; });
+    constexpr uint64_t objectVersion = 7;
+    const std::string objectKey = "authoritative-l2-orphan";
+    auto persistenceApi = std::make_shared<RecordingPersistenceApi>();
+    auto deleteProc = CreateDeleteProc(persistenceApi);
+    WorkerOcServiceClearDataFlow clearDataFlow(objectTable_, globalRefTable_, nullptr, gRefProc_, deleteProc, nullptr,
+                                               metadataRoute_, *endpointPolicy_, localAddress_.ToString());
+    AddObject(objectKey, objectVersion, 1024, WriteMode::WRITE_THROUGH_L2_CACHE);
+    std::unordered_map<std::string, uint64_t> queriedVersions{ { objectKey, objectVersion } };
+
+    auto result = clearDataFlow.ClearObjectsWithSummary({ objectKey }, false, queriedVersions);
+
+    EXPECT_EQ(result.clearedCount, 1U);
+    EXPECT_EQ(result.unresolvedCount, 0U);
+    EXPECT_EQ(persistenceApi->deleteCount, 1U);
+    EXPECT_EQ(persistenceApi->deletedObjectKey, objectKey);
+    EXPECT_EQ(persistenceApi->deletedMaxVersion, objectVersion);
+    EXPECT_EQ(persistenceApi->deletedObjectVersion, objectVersion);
+    EXPECT_FALSE(persistenceApi->deleteAll);
+    EXPECT_TRUE(persistenceApi->listIncomplete);
+    std::string summary;
+    for (const auto &part : metrics::DumpSummariesForTest()) {
+        summary += part;
+    }
+    EXPECT_EQ(summary.find("\"name\":\"worker_cleanup_batch_latency\""), std::string::npos);
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_EQ(objectTable_->Get(objectKey, entry).GetCode(), K_NOT_FOUND);
+}
+
+TEST_F(WorkerOcServiceImplTest, AuthoritativeObjectPersistenceKeepsExistingDeleteAllContract)
+{
+    const std::string oldL2CacheType = FLAGS_l2_cache_type;
+    FLAGS_l2_cache_type = "sfs";
+    Raii restoreL2CacheType([oldL2CacheType] { FLAGS_l2_cache_type = oldL2CacheType; });
+    constexpr uint64_t objectVersion = 10;
+    const std::string objectKey = "authoritative-object-persistence-orphan";
+    auto persistenceApi = std::make_shared<RecordingPersistenceApi>();
+    auto deleteProc = CreateDeleteProc(persistenceApi);
+    WorkerOcServiceClearDataFlow clearDataFlow(objectTable_, globalRefTable_, nullptr, gRefProc_, deleteProc, nullptr,
+                                               metadataRoute_, *endpointPolicy_, localAddress_.ToString());
+    AddObject(objectKey, objectVersion, 1024, WriteMode::WRITE_THROUGH_L2_CACHE);
+    std::unordered_map<std::string, uint64_t> queriedVersions{ { objectKey, objectVersion } };
+
+    auto result = clearDataFlow.ClearObjectsWithSummary({ objectKey }, false, queriedVersions);
+
+    EXPECT_EQ(result.clearedCount, 1U);
+    EXPECT_EQ(result.unresolvedCount, 0U);
+    EXPECT_EQ(persistenceApi->deleteCount, 1U);
+    EXPECT_TRUE(persistenceApi->deleteAll);
+}
+
+TEST_F(WorkerOcServiceImplTest, AsyncL2CancellationWaitsForInFlightObjectBeforeAuthoritativeDelete)
+{
+    BlockingList queue;
+    const std::string objectKey = "in-flight-write-back-orphan";
+    auto element = std::make_shared<Element>();
+    element->key = objectKey;
+    DS_ASSERT_OK(queue.Offer(element));
+    std::shared_ptr<Element> active;
+    DS_ASSERT_OK(queue.Poll(active, 0, true));
+    ASSERT_TRUE(queue.BeginPersistence(objectKey));
+    std::atomic<bool> cancellationFinished{ false };
+
+    std::thread cancellation([&] {
+        EXPECT_TRUE(queue.CancelAndWait(objectKey, 1'000).IsOk());
+        cancellationFinished = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_FALSE(cancellationFinished.load());
+    EXPECT_TRUE(queue.IsCancelled(objectKey));
+
+    queue.FinishPersistence(objectKey);
+    cancellation.join();
+    queue.Finish(objectKey);
+    EXPECT_TRUE(cancellationFinished.load());
+}
+
+TEST_F(WorkerOcServiceImplTest, AsyncL2CancellationRemovesQueuedObjectBeforeAuthoritativeDelete)
+{
+    BlockingList queue;
+    const std::string objectKey = "queued-write-back-orphan";
+    auto element = std::make_shared<Element>();
+    element->key = objectKey;
+    DS_ASSERT_OK(queue.Offer(element));
+
+    DS_ASSERT_OK(queue.CancelAndWait(objectKey, 10));
+
+    std::shared_ptr<Element> active;
+    EXPECT_EQ(queue.Poll(active, 0).GetCode(), K_TRY_AGAIN);
+}
+
+TEST_F(WorkerOcServiceImplTest, QueueCapacityEvictionDoesNotReplaceActivePersistenceFence)
+{
+    BlockingList queue(1);
+    const std::string activeKey = "active-write-back";
+    auto activeElement = std::make_shared<Element>();
+    activeElement->key = activeKey;
+    DS_ASSERT_OK(queue.Offer(activeElement));
+    std::shared_ptr<Element> active;
+    DS_ASSERT_OK(queue.Poll(active, 0, true));
+    ASSERT_TRUE(queue.BeginPersistence(activeKey));
+
+    auto queuedElement = std::make_shared<Element>();
+    queuedElement->key = "capacity-evicted";
+    DS_ASSERT_OK(queue.Offer(queuedElement));
+    auto replacement = std::make_shared<Element>();
+    replacement->key = "capacity-replacement";
+    DS_ASSERT_OK(queue.EnsureOffer(replacement));
+
+    EXPECT_EQ(queue.CancelAndWait(activeKey, 1).GetCode(), K_TRY_AGAIN);
+    queue.FinishPersistence(activeKey);
+    queue.Finish(activeKey);
+}
+
+TEST_F(WorkerOcServiceImplTest, AsyncL2CancellationTimeoutKeepsInFlightObjectCancelled)
+{
+    BlockingList queue;
+    const std::string objectKey = "timed-out-write-back-orphan";
+    auto element = std::make_shared<Element>();
+    element->key = objectKey;
+    DS_ASSERT_OK(queue.Offer(element));
+    std::shared_ptr<Element> active;
+    DS_ASSERT_OK(queue.Poll(active, 0, true));
+    ASSERT_TRUE(queue.BeginPersistence(objectKey));
+
+    EXPECT_EQ(queue.CancelAndWait(objectKey, 1).GetCode(), K_TRY_AGAIN);
+    EXPECT_TRUE(queue.IsCancelled(objectKey));
+    queue.FinishPersistence(objectKey);
+    queue.Finish(objectKey);
+}
+
+TEST_F(WorkerOcServiceImplTest, AuthoritativeClearRetainsLocalObjectWhenExactL2DeleteFails)
+{
+    const std::string oldL2CacheType = FLAGS_l2_cache_type;
+    FLAGS_l2_cache_type = "distributed_disk";
+    Raii restoreL2CacheType([oldL2CacheType] { FLAGS_l2_cache_type = oldL2CacheType; });
+    constexpr uint64_t objectVersion = 8;
+    const std::string objectKey = "unresolved-l2-orphan";
+    auto persistenceApi = std::make_shared<RecordingPersistenceApi>();
+    persistenceApi->deleteStatus = Status(K_RUNTIME_ERROR, "L2 delete failed");
+    auto deleteProc = CreateDeleteProc(persistenceApi);
+    WorkerOcServiceClearDataFlow clearDataFlow(objectTable_, globalRefTable_, nullptr, gRefProc_, deleteProc, nullptr,
+                                               metadataRoute_, *endpointPolicy_, localAddress_.ToString());
+    AddObject(objectKey, objectVersion, 1024, WriteMode::WRITE_THROUGH_L2_CACHE);
+    std::unordered_map<std::string, uint64_t> queriedVersions{ { objectKey, objectVersion } };
+
+    auto result = clearDataFlow.ClearObjectsWithSummary({ objectKey }, false, queriedVersions);
+
+    EXPECT_EQ(result.clearedCount, 0U);
+    EXPECT_EQ(result.unresolvedCount, 1U);
+    EXPECT_THAT(result.unresolvedIds, UnorderedElementsAre(objectKey));
+    EXPECT_EQ(persistenceApi->deleteCount, 1U);
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_TRUE(objectTable_->Get(objectKey, entry).IsOk());
+}
+
+TEST_F(WorkerOcServiceImplTest, OrdinaryClearKeepsExistingL2DeletionFlowUnchanged)
+{
+    const std::string oldL2CacheType = FLAGS_l2_cache_type;
+    FLAGS_l2_cache_type = "distributed_disk";
+    Raii restoreL2CacheType([oldL2CacheType] { FLAGS_l2_cache_type = oldL2CacheType; });
+    constexpr uint64_t objectVersion = 9;
+    const std::string objectKey = "ordinary-l2-clear";
+    auto persistenceApi = std::make_shared<RecordingPersistenceApi>();
+    auto deleteProc = CreateDeleteProc(persistenceApi);
+    AddObject(objectKey, objectVersion, 1024, WriteMode::WRITE_THROUGH_L2_CACHE);
+    std::shared_ptr<SafeObjType> entry;
+    DS_ASSERT_OK(objectTable_->GetAndLock(objectKey, entry));
+    Raii unlock([&entry] { entry->WUnlock(); });
+    ObjectKV objectKV(objectKey, *entry);
+
+    DS_ASSERT_OK(deleteProc->ClearObject(objectKV));
+
+    EXPECT_EQ(persistenceApi->deleteCount, 0U);
+    EXPECT_EQ(objectTable_->Get(objectKey, entry).GetCode(), K_NOT_FOUND);
+}
+
+TEST_F(WorkerOcServiceImplTest, AuthoritativeClearFailureRemainsUnresolved)
+{
+    constexpr const char *kClearInjectPoint = "worker.clear_object_failure";
+    const std::string objectKey = "authoritative-clear-failure";
+    AddObject(objectKey);
+    std::shared_ptr<SafeObjType> entry;
+    DS_ASSERT_OK(objectTable_->Get(objectKey, entry));
+    DS_ASSERT_OK(entry->RLock());
+    const auto currentVersion = entry->Get()->GetCreateTime();
+    entry->RUnlock();
+    std::unordered_map<std::string, uint64_t> queriedVersions{ { objectKey, currentVersion } };
+    ASSERT_TRUE(inject::Set(kClearInjectPoint, "return(K_RUNTIME_ERROR)").IsOk());
+    Raii clearInject([kClearInjectPoint] { (void)inject::Clear(kClearInjectPoint); });
+
+    auto result = dataClearImpl_->ClearObjectsWithSummary({ objectKey }, false, queriedVersions);
+
+    EXPECT_EQ(result.clearedCount, 0U);
+    EXPECT_EQ(result.unresolvedCount, 1U);
+    EXPECT_THAT(result.unresolvedIds, UnorderedElementsAre(objectKey));
+    EXPECT_TRUE(objectTable_->Get(objectKey, entry).IsOk());
+}
+
+TEST_F(WorkerOcServiceImplTest, RestartRecoveryRetriesInitialFailureAndMarksMetadataEvidenceReadyWhenResolved)
+{
+    const HostPort restartedWorker("127.0.0.1", 18482);
+    const std::string objectKey = "restart-retry-resolved";
+    placement_.SetOwner(objectKey, restartedWorker);
+    AddObject(objectKey);
+    bool handlerCalled = false;
+    impl_->RegisterRecoveryEvidenceReadyHandler([&handlerCalled] { handlerCalled = true; });
+    impl_->metadataRecoveryManager_ = std::make_unique<MetaDataRecoveryManager>(
+        localAddress_, objectTable_, MetaDataRecoveryManager::ClusterAccess{}, nullptr, metadataRoute_);
+    impl_->clearDataFlow_ = std::make_unique<WorkerOcServiceClearDataFlow>(
+        objectTable_, globalRefTable_, nullptr, gRefProc_, deleteProc_, impl_->metadataRecoveryManager_.get(),
+        metadataRoute_, *endpointPolicy_, localAddress_.ToString());
+
+    BINEXPECT_CALL((RecoverMetadataOfDataMethod)&WorkerOCServiceImpl::RecoverMetadataOfData, (_, _, _, _))
+        .WillOnce(Invoke([&objectKey](worker::WorkerRecoveryGeneration, const std::vector<std::string> &objectKeys,
+                                      std::vector<std::string> &failedIds, std::string) {
+            EXPECT_THAT(objectKeys, ElementsAre(objectKey));
+            failedIds = objectKeys;
+            return Status(K_RUNTIME_ERROR, "initial recovery failed");
+        }));
+    BINEXPECT_CALL((RetryFailedMetadataRecoveryMethod)&WorkerOcServiceClearDataFlow::
+                       RetryFailedMetadataRecoveryAndClearUnrecoverable,
+                   (ElementsAre(objectKey)))
+        .WillOnce(Invoke([](const std::vector<std::string> &) {
+            WorkerOcServiceClearDataFlow::RetryMetadataRecoveryResult result;
+            result.recoveredCount = 1;
+            return result;
+        }));
+
+    auto rc = impl_->RecoverMetadataOfRestartedWorker(impl_->BeginRecoveryEvidenceGeneration("restart"),
+                                                      restartedWorker.ToString());
+
+    EXPECT_TRUE(rc.IsOk());
+    auto report = impl_->GetLastMetadataRecoveryEvidenceReport();
+    EXPECT_TRUE(handlerCalled);
+    EXPECT_TRUE(report.evidence.metadataReady);
+    EXPECT_NE(report.detail.find("metadata_recovered=1/1"), std::string::npos);
+    EXPECT_NE(report.detail.find("unresolved=0"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, ReconciliationNotificationWithoutMasterSourceDoesNotAdvanceProgress)
+{
+    const bool oldEnableReconciliation = FLAGS_enable_reconciliation;
+    FLAGS_enable_reconciliation = true;
+    Raii restoreFlag([oldEnableReconciliation] { FLAGS_enable_reconciliation = oldEnableReconciliation; });
+    PushMetaToWorkerReqPb req;
+    req.set_event_timestamp(1);
+    req.set_is_restart(false);
+    req.add_gref_object_keys("notification_without_master_source");
+
+    auto rc = Reconcile(req);
+
+    EXPECT_EQ(rc.GetCode(), K_INVALID);
+    EXPECT_EQ(ReconciliationCount(), 0);
+
+    req.set_event_timestamp(2);
+    req.set_source_address("invalid-master-address");
+    rc = Reconcile(req);
+
+    EXPECT_EQ(rc.GetCode(), K_INVALID);
+    EXPECT_EQ(ReconciliationCount(), 0);
+}
+
+TEST_F(WorkerOcServiceImplTest, ReconciliationRequiresEveryCurrentMetadataMaster)
+{
+    const std::set<std::string> expected{ "127.0.0.1:900", "127.0.0.1:901" };
+
+    EXPECT_FALSE(HasCompleteReconciliationSet(expected, { "127.0.0.1:900", "127.0.0.1:902" }));
+    EXPECT_TRUE(HasCompleteReconciliationSet(expected, { "127.0.0.1:900", "127.0.0.1:901" }));
+    EXPECT_TRUE(HasCompleteReconciliationSet(expected, { "127.0.0.1:900", "127.0.0.1:901", "127.0.0.1:902" }));
+}
+
+TEST_F(WorkerOcServiceImplTest, RestartReconciliationMarksMetadataEvidenceReadyWhenComplete)
+{
+    worker::WorkerRuntimeFacade runtime;
+    ASSERT_TRUE(MarkRuntimeRunning(runtime));
+    impl_->SetRuntimeFacade(&runtime);
+    bool handlerCalled = false;
+    impl_->RegisterRecoveryEvidenceReadyHandler([&handlerCalled] { handlerCalled = true; });
+
+    impl_->MarkRestartReconciliationEvidenceReady(impl_->BeginRecoveryEvidenceGeneration("restart"),
+                                                  "restart_reconciliation metadata owners completed");
+
+    const auto report = impl_->BuildObjectCacheRecoveryEvidenceReport();
+    EXPECT_TRUE(handlerCalled);
+    EXPECT_TRUE(report.evidence.metadataReady);
+    EXPECT_TRUE(report.evidence.ownershipReady);
+    EXPECT_NE(report.detail.find("restart_reconciliation"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, NetworkRecoveryReconciliationNotifiesEvidenceReadyWhenComplete)
+{
+    bool handlerCalled = false;
+    impl_->RegisterRecoveryEvidenceReadyHandler([&handlerCalled] { handlerCalled = true; });
+
+    impl_->MarkReconciliationEvidenceReady(impl_->BeginRecoveryEvidenceGeneration("network recovery"),
+                                           "network_recovery metadata owners completed");
+
+    const auto report = impl_->BuildObjectCacheRecoveryEvidenceReport();
+    EXPECT_TRUE(handlerCalled);
+    EXPECT_TRUE(report.evidence.metadataReady);
+    EXPECT_TRUE(report.evidence.ownershipReady);
+    EXPECT_NE(report.detail.find("network_recovery"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, RuntimeAdmissionGuardRejectsWhenRuntimeIsNotRunning)
+{
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkLocalIsolated(worker::WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION, "local isolation");
+    impl_->SetRuntimeFacade(&runtime);
+    DS_ASSERT_OK(SetHealthProbe());
+    SetTopologyServingAdmission(true);
+    Raii reset([]() {
+        SetTopologyServingAdmission(true);
+        SetUnhealthy();
+    });
+
+    worker::WorkerRuntimeFacade::AdmissionGuard admissionGuard;
+    auto rc =
+        runtime.AcquireAdmissionGuard(worker::WorkerAdmissionKind::NORMAL_WRITE, "ObjectCacheService", admissionGuard);
+
+    ASSERT_NE(rc.GetCode(), StatusCode::K_OK);
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(rc.GetMsg().find("LOCAL_ISOLATED"), std::string::npos);
+
+    ReadLock noRecon;
+    DS_ASSERT_OK(impl_->ValidateWorkerState(noRecon, 100));
+}
+
+TEST_F(WorkerOcServiceImplTest, ObjectCacheOutOfMemoryMarksRuntimeState)
+{
+    worker::WorkerRuntimeFacade runtime;
+    ASSERT_TRUE(MarkRuntimeRunning(runtime));
+    impl_->SetRuntimeFacade(&runtime);
+
+    impl_->MarkOutOfMemoryIfNeeded(Status(StatusCode::K_OUT_OF_MEMORY, "allocation failed"), "Create");
+
+    auto snapshot = runtime.GetSnapshot();
+    EXPECT_EQ(snapshot.mode, worker::WorkerServiceMode::OUT_OF_MEMORY);
+    EXPECT_EQ(snapshot.reason, worker::WorkerIsolationReason::OUT_OF_MEMORY);
+    EXPECT_NE(snapshot.detail.find("Create"), std::string::npos);
+    EXPECT_NE(snapshot.detail.find("allocation failed"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, InjectedCreateOutOfMemoryDoesNotMarkRuntimeState)
+{
+    worker::WorkerRuntimeFacade runtime;
+    ASSERT_TRUE(MarkRuntimeRunning(runtime));
+    impl_->SetRuntimeFacade(&runtime);
+
+    impl_->MarkOutOfMemoryIfNeeded(
+        Status(StatusCode::K_OUT_OF_MEMORY, "Thread ID 1 Out of memory. Status inject by worker.Create.AllocateMemory"),
+        "Create");
+
+    auto snapshot = runtime.GetSnapshot();
+    EXPECT_EQ(snapshot.mode, worker::WorkerServiceMode::RUNNING);
+    auto recoverySnapshot = impl_->recoveryState_->GetResourceRecoverySnapshot();
+    EXPECT_FALSE(recoverySnapshot.memoryRequired);
+    EXPECT_FALSE(recoverySnapshot.diskRequired);
+}
+
+TEST_F(WorkerOcServiceImplTest, DiskCreateOutOfMemoryRecordsDiskRecoveryRequirement)
+{
+    worker::WorkerRuntimeFacade runtime;
+    ASSERT_TRUE(MarkRuntimeRunning(runtime));
+    impl_->SetRuntimeFacade(&runtime);
+
+    impl_->MarkOutOfMemoryIfNeeded(Status(StatusCode::K_OUT_OF_MEMORY, "disk full"), "Create", memory::CacheType::DISK);
+
+    auto recoverySnapshot = impl_->recoveryState_->GetResourceRecoverySnapshot();
+    EXPECT_TRUE(recoverySnapshot.diskRequired);
+    EXPECT_FALSE(recoverySnapshot.memoryRequired);
+}
+
+TEST_F(WorkerOcServiceImplTest, RestartReconciliationMarksRuntimeRecoveringBeforeFanout)
+{
+    auto restartService = std::make_shared<WorkerOCServiceImpl>(
+        localAddress_, localAddress_, objectTable_, nullptr, evictionManager_, nullptr,
+        ObjectCacheRecoveryDependencies{}, nullptr, topologyRuntime_.Runtime(), metadataRoute_,
+        topologyRuntime_.Engine()->Membership(), &exitRequested_, true, true);
+    restartService->InitServiceImpl();
+    worker::WorkerRuntimeFacade runtime;
+    ASSERT_TRUE(MarkRuntimeRunning(runtime));
+
+    restartService->SetRuntimeFacade(&runtime);
+
+    const auto snapshotAfterAttach = runtime.GetSnapshot();
+    EXPECT_EQ(snapshotAfterAttach.mode, worker::WorkerServiceMode::RECOVERING);
+    EXPECT_EQ(snapshotAfterAttach.recoveryPhase, worker::WorkerRecoveryPhase::METADATA);
+    EXPECT_FALSE(restartService->BuildObjectCacheRecoveryEvidenceReport().evidence.metadataReady);
+    EXPECT_FALSE(restartService->BuildObjectCacheRecoveryEvidenceReport().evidence.ownershipReady);
+    const auto generationAfterAttach = restartService->recoveryState_->CurrentRecoveryEvidenceGeneration();
+
+    ASSERT_TRUE(MarkRuntimeRunning(runtime));
+    ASSERT_TRUE(restartService->SetRuntimeFacade(&runtime));
+    EXPECT_EQ(restartService->recoveryState_->CurrentRecoveryEvidenceGeneration(), generationAfterAttach);
+
+    const auto rc = restartService->WhetherNonRestart();
+
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_NOT_READY);
+    const auto snapshot = runtime.GetSnapshot();
+    EXPECT_EQ(snapshot.mode, worker::WorkerServiceMode::RECOVERING);
+    EXPECT_EQ(snapshot.recoveryPhase, worker::WorkerRecoveryPhase::METADATA);
+}
+
+TEST_F(WorkerOcServiceImplTest, MigrationOutOfMemoryHandlerUsesWorkerRuntimeState)
+{
+    worker::WorkerRuntimeFacade runtime;
+    ASSERT_TRUE(MarkRuntimeRunning(runtime));
+    impl_->SetRuntimeFacade(&runtime);
+    BINEXPECT_CALL(&WorkerOcServiceMigrateImpl::CheckResource, (_, _))
+        .Times(1)
+        .WillOnce(Return(Status(StatusCode::K_OUT_OF_MEMORY, "migration allocation failed")));
+    MigrateDataReqPb req;
+    req.set_type(MigrateType::SPILL);
+    req.add_objects()->set_object_key("object-a");
+    MigrateDataRspPb rsp;
+
+    EXPECT_EQ(impl_->gMigrateProc_->MigrateData(req, rsp, {}).GetCode(), StatusCode::K_OUT_OF_MEMORY);
+
+    const auto snapshot = runtime.GetSnapshot();
+    EXPECT_EQ(snapshot.mode, worker::WorkerServiceMode::OUT_OF_MEMORY);
+    EXPECT_NE(snapshot.detail.find("MigrateData.CheckResource"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, HealthCheckRemainsAvailableWhenOutOfMemory)
+{
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkOutOfMemory("oom");
+    impl_->SetRuntimeFacade(&runtime);
+    DS_ASSERT_OK(SetHealthProbe());
+    SetTopologyServingAdmission(true);
+    Raii reset([]() {
+        SetTopologyServingAdmission(true);
+        SetUnhealthy();
+    });
+
+    HealthCheckRequestPb req;
+    HealthCheckReplyPb resp;
+    auto rc = impl_->HealthCheck(req, resp);
+
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_OK);
+    EXPECT_EQ(resp.worker_service_mode(), "OUT_OF_MEMORY");
+    EXPECT_EQ(resp.worker_service_reason(), "OUT_OF_MEMORY");
+    EXPECT_EQ(resp.worker_recovery_phase(), "RESOURCE");
+    EXPECT_EQ(resp.recovery_evidence_mask(), 0U);
+}
+
+TEST_F(WorkerOcServiceImplTest, ReferenceCleanupRemainsAvailableDuringResourceRecovery)
+{
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkOutOfMemory("oom");
+    impl_->SetRuntimeFacade(&runtime);
+    ReleaseGRefsReqPb releaseReq;
+    ReleaseGRefsRspPb releaseRsp;
+    GDecreaseReqPb decreaseReq;
+    GDecreaseRspPb decreaseRsp;
+
+    EXPECT_TRUE(impl_->DecreaseMemoryRef(ClientKey::Intern("client-id"), {}).IsOk());
+    EXPECT_NE(impl_->ReleaseGRefs(releaseReq, releaseRsp).GetCode(), StatusCode::K_OUT_OF_MEMORY);
+    EXPECT_NE(impl_->GDecreaseRef(decreaseReq, decreaseRsp).GetCode(), StatusCode::K_OUT_OF_MEMORY);
+
+    runtime.MarkRecovering(worker::WorkerIsolationReason::OUT_OF_MEMORY, "resource recovery");
+    EXPECT_TRUE(impl_->DecreaseMemoryRef(ClientKey::Intern("client-id"), {}).IsOk());
+    EXPECT_NE(impl_->ReleaseGRefs(releaseReq, releaseRsp).GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(impl_->GDecreaseRef(decreaseReq, decreaseRsp).GetCode(), StatusCode::K_NOT_READY);
+}
+
+TEST_F(WorkerOcServiceImplTest, LocalExistRemainsAvailableWhenOutOfMemory)
+{
+    auto akSkManager = std::make_shared<AkSkManager>();
+    auto service = CreateWorkerOCService(akSkManager);
+    service->InitServiceImpl();
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkOutOfMemory("oom");
+    service->SetRuntimeFacade(&runtime);
+    DS_ASSERT_OK(SetHealthProbe());
+    SetTopologyServingAdmission(false);
+    Raii reset([]() {
+        SetTopologyServingAdmission(true);
+        SetUnhealthy();
+    });
+
+    auto clientId = ClientKey::Intern("exist-client-id");
+    DS_ASSERT_OK(worker::ClientManager::Instance().AddClient(clientId, -1));
+    Raii removeClient([&clientId]() { worker::ClientManager::Instance().RemoveClient(clientId); });
+
+    ExistReqPb req;
+    req.set_client_id("exist-client-id");
+    req.set_is_local(true);
+    req.add_object_keys("missing-object");
+    ExistRspPb rsp;
+    auto rc = service->Exist(req, rsp);
+
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_OK);
+    ASSERT_EQ(rsp.exists_size(), 1);
+    EXPECT_FALSE(rsp.exists(0));
+}
+
+TEST_F(WorkerOcServiceImplTest, GetObjMetaInfoRemainsAvailableWhenOutOfMemory)
+{
+    auto akSkManager = std::make_shared<AkSkManager>();
+    auto service = CreateWorkerOCService(akSkManager);
+    service->InitServiceImpl();
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkOutOfMemory("oom");
+    service->SetRuntimeFacade(&runtime);
+    DS_ASSERT_OK(SetHealthProbe());
+    SetTopologyServingAdmission(false);
+    Raii reset([]() {
+        SetTopologyServingAdmission(true);
+        SetUnhealthy();
+    });
+
+    GetObjMetaInfoReqPb req;
+    GetObjMetaInfoRspPb rsp;
+    auto rc = service->GetObjMetaInfo(req, rsp);
+
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_OK);
+    EXPECT_EQ(rsp.objs_meta_info_size(), 0);
+}
+
+TEST_F(WorkerOcServiceImplTest, ClearObjectRemainsAvailableWhenOutOfMemory)
+{
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkOutOfMemory("oom");
+    impl_->SetRuntimeFacade(&runtime);
+    impl_->clearDataFlow_ = std::make_unique<WorkerOcServiceClearDataFlow>(
+        objectTable_, globalRefTable_, nullptr, gRefProc_, deleteProc_, nullptr, metadataRoute_, *endpointPolicy_,
+        localAddress_.ToString());
+
+    ClearDataReqPb req;
+    auto rc = impl_->ClearObject(req);
+
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_OK);
+}
+
+TEST_F(WorkerOcServiceImplTest, EvictionManagerRemainsUsableWhenOutOfMemory)
+{
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkOutOfMemory("oom");
+    impl_->SetRuntimeFacade(&runtime);
+    auto akSkManager = std::make_shared<AkSkManager>();
+    DS_ASSERT_OK(evictionManager_->Init(globalRefTable_, akSkManager));
+
+    constexpr uint64_t dataSize = 1024;
+    const std::string objectKey = "oom_eviction_candidate";
+    AddObject(objectKey, 1, dataSize);
+
+    evictionManager_->Add(objectKey);
+    std::vector<EvictionList::Node> objects;
+    EvictionList::Node oldest;
+    DS_ASSERT_OK(evictionManager_->GetAllObjectsInfo(objects, oldest));
+    ASSERT_EQ(objects.size(), size_t(1));
+    EXPECT_EQ(oldest.objectKey, objectKey);
+
+    evictionManager_->Erase(objectKey);
+    objects.clear();
+    DS_ASSERT_OK(evictionManager_->GetAllObjectsInfo(objects, oldest));
+    EXPECT_TRUE(objects.empty());
+}
+
+TEST_F(WorkerOcServiceImplTest, WorkerWorkerMigrationTargetRejectsWhenRuntimeIsNotRunning)
+{
+    struct Case {
+        worker::WorkerServiceMode mode;
+        StatusCode expectedCode;
+    };
+    const std::vector<Case> cases = {
+        { worker::WorkerServiceMode::LOCAL_ISOLATED, StatusCode::K_NOT_READY },
+        { worker::WorkerServiceMode::RECOVERING, StatusCode::K_NOT_READY },
+        { worker::WorkerServiceMode::OUT_OF_MEMORY, StatusCode::K_OUT_OF_MEMORY },
+    };
+    auto workerWorkerSvc = CreateWorkerWorkerOCService();
+    for (const auto &item : cases) {
+        worker::WorkerRuntimeFacade runtime;
+        switch (item.mode) {
+            case worker::WorkerServiceMode::LOCAL_ISOLATED:
+                runtime.MarkLocalIsolated(worker::WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION,
+                                          "local isolation");
+                break;
+            case worker::WorkerServiceMode::RECOVERING:
+                runtime.MarkRecovering(worker::WorkerIsolationReason::RECOVERY_EVIDENCE_INCOMPLETE, "recovering");
+                break;
+            case worker::WorkerServiceMode::OUT_OF_MEMORY:
+                runtime.MarkOutOfMemory("oom");
+                break;
+            default:
+                break;
+        }
+        workerWorkerSvc.SetRuntimeFacade(&runtime);
+
+        MigrateDataReqPb migrateReq;
+        MigrateDataRspPb migrateRsp;
+        auto migrateRc = workerWorkerSvc.MigrateData(migrateReq, migrateRsp, {});
+        EXPECT_EQ(migrateRc.GetCode(), item.expectedCode) << worker::ToString(item.mode);
+        EXPECT_NE(migrateRc.GetMsg().find("MIGRATION_TARGET"), std::string::npos);
+        EXPECT_NE(migrateRc.GetMsg().find(worker::ToString(item.mode)), std::string::npos);
+
+        MigrateDataDirectReqPb directReq;
+        MigrateDataDirectRspPb directRsp;
+        auto directRc = workerWorkerSvc.MigrateDataDirect(directReq, directRsp);
+        EXPECT_EQ(directRc.GetCode(), item.expectedCode) << worker::ToString(item.mode);
+        EXPECT_NE(directRc.GetMsg().find("MIGRATION_TARGET"), std::string::npos);
+        EXPECT_NE(directRc.GetMsg().find(worker::ToString(item.mode)), std::string::npos);
+    }
+}
+
+TEST_F(WorkerOcServiceImplTest, WorkerWorkerMigrationTargetRejectsDirectRequestsWithFailedObjects)
+{
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkOutOfMemory("oom");
+    auto workerWorkerSvc = CreateWorkerWorkerOCService();
+    workerWorkerSvc.SetRuntimeFacade(&runtime);
+
+    MigrateDataReqPb migrateReq;
+    migrateReq.add_objects()->set_object_key("migrate-object");
+    MigrateDataRspPb migrateRsp;
+    auto migrateRc = workerWorkerSvc.MigrateData(migrateReq, migrateRsp, {});
+    EXPECT_EQ(migrateRc.GetCode(), StatusCode::K_OUT_OF_MEMORY);
+    EXPECT_THAT(migrateRsp.fail_ids(), ElementsAre("migrate-object"));
+
+    MigrateDataDirectReqPb directReq;
+    directReq.add_objects()->set_object_key("direct-object");
+    MigrateDataDirectRspPb directRsp;
+    auto directRc = workerWorkerSvc.MigrateDataDirect(directReq, directRsp);
+    EXPECT_EQ(directRc.GetCode(), StatusCode::K_OUT_OF_MEMORY);
+    EXPECT_THAT(directRsp.failed_object_keys(), ElementsAre("direct-object"));
+}
+
+TEST_F(WorkerOcServiceImplTest, WorkerWorkerClassifiesMigrationNotificationAndDiagnostics)
+{
+    auto akSkManager = std::make_shared<AkSkManager>();
+    constexpr const char *clientCred = "test-client-credential";
+    constexpr const char *serverCred = "test-server-credential";
+    akSkManager->SetClientAkSk(clientCred, serverCred);
+    akSkManager->SetServerAkSk(AkSkType::SYSTEM, clientCred, serverCred);
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkStopping(worker::WorkerIsolationReason::PROCESS_STOPPING, "stopping");
+    auto workerWorkerSvc = CreateWorkerWorkerOCService(akSkManager);
+    workerWorkerSvc.SetRuntimeFacade(&runtime);
+
+    NotifyRemoteGetReqPb migrationReq;
+    NotifyRemoteGetRspPb migrationRsp;
+    const auto migrationRc = workerWorkerSvc.NotifyRemoteGet(migrationReq, migrationRsp);
+    EXPECT_EQ(migrationRc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(migrationRc.GetMsg().find("MIGRATION_TARGET"), std::string::npos);
+    EXPECT_NE(migrationRc.GetMsg().find("NotifyRemoteGet"), std::string::npos);
+
+    CheckCoordinatorStateReqPb diagnosticReq;
+    CheckCoordinatorStateRspPb diagnosticRsp;
+    const auto unsignedDiagnosticRc = workerWorkerSvc.CheckCoordinatorState(diagnosticReq, diagnosticRsp);
+    EXPECT_EQ(unsignedDiagnosticRc.GetMsg().find("mode=STOPPING"), std::string::npos);
+    DS_ASSERT_OK(akSkManager->GenerateSignature(diagnosticReq));
+    EXPECT_TRUE(workerWorkerSvc.CheckCoordinatorState(diagnosticReq, diagnosticRsp).IsOk());
+
+    GetClusterStateReqPb clusterReq;
+    GetClusterStateRspPb clusterRsp;
+    DS_ASSERT_OK(akSkManager->GenerateSignature(clusterReq));
+    const auto clusterRc = workerWorkerSvc.GetClusterState(clusterReq, clusterRsp);
+    EXPECT_EQ(clusterRc.GetMsg().find("mode=STOPPING"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, MasterWorkerClassifiesCleanupAndRecoveryRpcs)
+{
+    auto akSkManager = std::make_shared<AkSkManager>();
+    constexpr const char *clientCred = "test-client-credential";
+    constexpr const char *serverCred = "test-server-credential";
+    akSkManager->SetClientAkSk(clientCred, serverCred);
+    akSkManager->SetServerAkSk(AkSkType::SYSTEM, clientCred, serverCred);
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkStopping(worker::WorkerIsolationReason::PROCESS_STOPPING, "stopping");
+    MasterWorkerOCServiceImpl masterWorkerSvc(impl_, akSkManager);
+    masterWorkerSvc.SetRuntimeFacade(&runtime);
+    impl_->clearDataFlow_ = std::make_unique<WorkerOcServiceClearDataFlow>(
+        objectTable_, globalRefTable_, nullptr, gRefProc_, deleteProc_, nullptr, metadataRoute_, *endpointPolicy_,
+        localAddress_.ToString());
+
+    ClearDataReqPb clearReq;
+    ClearDataRspPb clearRsp;
+    EXPECT_TRUE(masterWorkerSvc.ClearData(clearReq, clearRsp).IsOk());
+
+    PushMetaToWorkerReqPb recoveryReq;
+    PushMetaToWorkerRspPb recoveryRsp;
+    const auto unsignedRecoveryRc = masterWorkerSvc.PushMetaToWorker(recoveryReq, recoveryRsp);
+    EXPECT_EQ(unsignedRecoveryRc.GetMsg().find("mode=STOPPING"), std::string::npos);
+    DS_ASSERT_OK(akSkManager->GenerateSignature(recoveryReq));
+    const auto recoveryRc = masterWorkerSvc.PushMetaToWorker(recoveryReq, recoveryRsp);
+    EXPECT_EQ(recoveryRc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(recoveryRc.GetMsg().find("RECOVERY_RPC"), std::string::npos);
+    EXPECT_NE(recoveryRc.GetMsg().find("mode=STOPPING"), std::string::npos);
+
+    RequestMetaFromWorkerReqPb requestMetaReq;
+    RequestMetaFromWorkerRspPb requestMetaRsp;
+    DS_ASSERT_OK(akSkManager->GenerateSignature(requestMetaReq));
+    const auto requestMetaRc = masterWorkerSvc.RequestMetaFromWorker(requestMetaReq, requestMetaRsp);
+    EXPECT_EQ(requestMetaRc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(requestMetaRc.GetMsg().find("RECOVERY_RPC"), std::string::npos);
+
+    QueryGlobalRefNumReqPb queryRefReq;
+    QueryGlobalRefNumRspPb queryRefRsp;
+    DS_ASSERT_OK(akSkManager->GenerateSignature(queryRefReq));
+    const auto queryRefRc = masterWorkerSvc.QueryGlobalRefNumOnWorker(queryRefReq, queryRefRsp);
+    EXPECT_EQ(queryRefRc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(queryRefRc.GetMsg().find("NORMAL_READ"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, MasterWorkerRejectsDataAndOwnershipInputsOutsideRunning)
+{
+    auto akSkManager = std::make_shared<AkSkManager>();
+    constexpr const char *clientCred = "test-client-credential";
+    constexpr const char *serverCred = "test-server-credential";
+    akSkManager->SetClientAkSk(clientCred, serverCred);
+    akSkManager->SetServerAkSk(AkSkType::SYSTEM, clientCred, serverCred);
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkLocalIsolated(worker::WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION, "isolated");
+    MasterWorkerOCServiceImpl masterWorkerSvc(impl_, akSkManager);
+    masterWorkerSvc.SetRuntimeFacade(&runtime);
+
+    PublishMetaReqPb publishReq;
+    PublishMetaRspPb publishRsp;
+    DS_ASSERT_OK(akSkManager->GenerateSignature(publishReq));
+    const auto publishRc = masterWorkerSvc.PublishMeta(publishReq, publishRsp);
+    EXPECT_EQ(publishRc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(publishRc.GetMsg().find("MIGRATION_TARGET"), std::string::npos);
+    EXPECT_NE(publishRc.GetMsg().find("PublishMeta"), std::string::npos);
+
+    ChangePrimaryCopyReqPb primaryReq;
+    ChangePrimaryCopyRspPb primaryRsp;
+    DS_ASSERT_OK(akSkManager->GenerateSignature(primaryReq));
+    const auto primaryRc = masterWorkerSvc.ChangePrimaryCopy(primaryReq, primaryRsp);
+    EXPECT_EQ(primaryRc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(primaryRc.GetMsg().find("PRIMARY_PROMOTION_RPC"), std::string::npos);
+    EXPECT_NE(primaryRc.GetMsg().find("ChangePrimaryCopy"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, ChangePrimaryCopyKeepsEarlierSuccessWhenIsolationRejectsNextKey)
+{
+    constexpr const char *kPromotionPause = "process.change.primary.copy";
+    const std::string inFlightKey = "promotion-in-flight";
+    const std::string isolatedKey = "promotion-after-isolation";
+    AddObject(inFlightKey);
+    AddObject(isolatedKey);
+    for (const auto &objectKey : { inFlightKey, isolatedKey }) {
+        std::shared_ptr<SafeObjType> entry;
+        DS_ASSERT_OK(objectTable_->Get(objectKey, entry));
+        DS_ASSERT_OK(entry->WLock());
+        (*entry)->stateInfo.SetPrimaryCopy(false);
+        entry->WUnlock();
+    }
+
+    auto akSkManager = std::make_shared<AkSkManager>();
+    constexpr const char *clientCred = "test-client-credential";
+    constexpr const char *serverCred = "test-server-credential";
+    akSkManager->SetClientAkSk(clientCred, serverCred);
+    akSkManager->SetServerAkSk(AkSkType::SYSTEM, clientCred, serverCred);
+    worker::WorkerRuntimeFacade runtime;
+    auto evidence = worker::WorkerRunningEvidence{ true, true, false, false, false, true };
+    ASSERT_TRUE(runtime.TryCompleteRecovery(evidence, "serving while reconciliation is incomplete"));
+    ASSERT_EQ(runtime.GetSnapshot().recoveryPhase, worker::WorkerRecoveryPhase::METADATA);
+    MasterWorkerOCServiceImpl masterWorkerSvc(impl_, akSkManager);
+    masterWorkerSvc.SetRuntimeFacade(&runtime);
+
+    ChangePrimaryCopyReqPb inFlightReq;
+    inFlightReq.add_object_keys(inFlightKey);
+    inFlightReq.add_object_keys(isolatedKey);
+    DS_ASSERT_OK(akSkManager->GenerateSignature(inFlightReq));
+    ChangePrimaryCopyRspPb inFlightRsp;
+    const uint64_t pauseBaseline = inject::GetExecuteCount(kPromotionPause);
+    DS_ASSERT_OK(inject::Set(kPromotionPause, "pause"));
+    Raii clearPause([kPromotionPause] { (void)inject::Clear(kPromotionPause); });
+    auto promotion = std::async(std::launch::async, [&masterWorkerSvc, &inFlightReq, &inFlightRsp] {
+        return masterWorkerSvc.ChangePrimaryCopy(inFlightReq, inFlightRsp);
+    });
+    if (!WaitForInjectPointExecuteCount(kPromotionPause, pauseBaseline + 1,
+                                        std::chrono::milliseconds(K_LOCK_PROBE_TIMEOUT_MS))) {
+        (void)inject::Clear(kPromotionPause);
+        ADD_FAILURE() << "promotion did not reach the in-operation pause";
+        promotion.wait();
+        return;
+    }
+
+    auto isolation = std::async(std::launch::async, [&runtime] {
+        runtime.MarkLocalIsolated(worker::WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION,
+                                  "local isolation during primary promotion");
+    });
+    const auto pendingDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (runtime.CheckAdmission(worker::WorkerAdmissionKind::PRIMARY_PROMOTION_RPC, "ChangePrimaryCopy").IsOk()
+           && std::chrono::steady_clock::now() < pendingDeadline) {
+        std::this_thread::yield();
+    }
+    if (runtime.CheckAdmission(worker::WorkerAdmissionKind::PRIMARY_PROMOTION_RPC, "ChangePrimaryCopy").IsOk()) {
+        (void)inject::Clear(kPromotionPause);
+        ADD_FAILURE() << "local isolation did not publish transition intent";
+        promotion.wait();
+        isolation.wait();
+        return;
+    }
+    EXPECT_EQ(isolation.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+
+    DS_ASSERT_OK(inject::Clear(kPromotionPause));
+    ASSERT_EQ(promotion.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_TRUE(promotion.get().IsOk());
+    EXPECT_THAT(inFlightRsp.success_ids(), ElementsAre(inFlightKey));
+    ASSERT_EQ(isolation.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    isolation.get();
+    EXPECT_EQ(runtime.GetSnapshot().mode, worker::WorkerServiceMode::LOCAL_ISOLATED);
+
+    std::shared_ptr<SafeObjType> inFlightEntry;
+    DS_ASSERT_OK(objectTable_->Get(inFlightKey, inFlightEntry));
+    DS_ASSERT_OK(inFlightEntry->RLock());
+    EXPECT_TRUE((*inFlightEntry)->stateInfo.IsPrimaryCopy());
+    inFlightEntry->RUnlock();
+    std::shared_ptr<SafeObjType> isolatedEntry;
+    DS_ASSERT_OK(objectTable_->Get(isolatedKey, isolatedEntry));
+    DS_ASSERT_OK(isolatedEntry->RLock());
+    EXPECT_FALSE((*isolatedEntry)->stateInfo.IsPrimaryCopy());
+    isolatedEntry->RUnlock();
+}
+
+TEST_F(WorkerOcServiceImplTest, ChangePrimaryCopyObjectLockWaitDoesNotBlockLocalIsolation)
+{
+    constexpr const char *kBeforePromotionWLock = "process.promote.primary.copy.before.wlock";
+    const std::string objectKey = "promotion-waits-for-object-lock";
+    AddObject(objectKey);
+    std::shared_ptr<SafeObjType> entry;
+    DS_ASSERT_OK(objectTable_->Get(objectKey, entry));
+    DS_ASSERT_OK(entry->WLock());
+    (*entry)->stateInfo.SetPrimaryCopy(false);
+    bool entryLocked = true;
+    Raii releaseEntry([&entry, &entryLocked] {
+        if (entryLocked) {
+            entry->WUnlock();
+        }
+    });
+
+    auto akSkManager = std::make_shared<AkSkManager>();
+    constexpr const char *clientCred = "test-client-credential";
+    constexpr const char *serverCred = "test-server-credential";
+    akSkManager->SetClientAkSk(clientCred, serverCred);
+    akSkManager->SetServerAkSk(AkSkType::SYSTEM, clientCred, serverCred);
+    worker::WorkerRuntimeFacade runtime;
+    auto evidence = worker::WorkerRunningEvidence{ true, true, false, false, false, true };
+    ASSERT_TRUE(runtime.TryCompleteRecovery(evidence, "serving while reconciliation is incomplete"));
+    MasterWorkerOCServiceImpl masterWorkerSvc(impl_, akSkManager);
+    masterWorkerSvc.SetRuntimeFacade(&runtime);
+
+    ChangePrimaryCopyReqPb req;
+    req.add_object_keys(objectKey);
+    DS_ASSERT_OK(akSkManager->GenerateSignature(req));
+    ChangePrimaryCopyRspPb rsp;
+    const uint64_t beforeWLockBaseline = inject::GetExecuteCount(kBeforePromotionWLock);
+    DS_ASSERT_OK(inject::Set(kBeforePromotionWLock, "call()"));
+    Raii clearInject([kBeforePromotionWLock] { (void)inject::Clear(kBeforePromotionWLock); });
+    auto promotion = std::async(std::launch::async,
+                                [&masterWorkerSvc, &req, &rsp] { return masterWorkerSvc.ChangePrimaryCopy(req, rsp); });
+    if (!WaitForInjectPointExecuteCount(kBeforePromotionWLock, beforeWLockBaseline + 1,
+                                        std::chrono::milliseconds(K_LOCK_PROBE_TIMEOUT_MS))) {
+        entry->WUnlock();
+        entryLocked = false;
+        promotion.wait();
+        ADD_FAILURE() << "promotion did not reach the object-lock boundary";
+        return;
+    }
+
+    auto isolation = std::async(std::launch::async, [&runtime] {
+        runtime.MarkLocalIsolated(worker::WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION,
+                                  "local isolation while promotion waits for object lock");
+    });
+    if (isolation.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+        entry->WUnlock();
+        entryLocked = false;
+        promotion.wait();
+        isolation.wait();
+        ADD_FAILURE() << "object-lock wait blocked local isolation";
+        return;
+    }
+    isolation.get();
+    EXPECT_EQ(runtime.GetSnapshot().mode, worker::WorkerServiceMode::LOCAL_ISOLATED);
+
+    entry->WUnlock();
+    entryLocked = false;
+    ASSERT_EQ(promotion.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    const auto promotionRc = promotion.get();
+    EXPECT_EQ(promotionRc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(promotionRc.GetMsg().find("PRIMARY_PROMOTION_RPC"), std::string::npos);
+    EXPECT_TRUE(rsp.success_ids().empty());
+    DS_ASSERT_OK(entry->RLock());
+    EXPECT_FALSE((*entry)->stateInfo.IsPrimaryCopy());
+    entry->RUnlock();
+}
+
+TEST_F(WorkerOcServiceImplTest, PublishMetaRechecksAdmissionWhenQueuedWorkStarts)
+{
+    auto akSkManager = std::make_shared<AkSkManager>();
+    constexpr const char *clientCred = "test-client-credential";
+    constexpr const char *serverCred = "test-server-credential";
+    akSkManager->SetClientAkSk(clientCred, serverCred);
+    akSkManager->SetServerAkSk(AkSkType::SYSTEM, clientCred, serverCred);
+    worker::WorkerRuntimeFacade runtime;
+    ASSERT_TRUE(MarkRuntimeRunning(runtime));
+    MasterWorkerOCServiceImpl masterWorkerSvc(impl_, akSkManager);
+    masterWorkerSvc.SetRuntimeFacade(&runtime);
+
+    impl_->threadPool_ = std::make_shared<ThreadPool>(1, 1, "PublishMetaAdmissionTest");
+    auto blockerStarted = std::make_shared<std::promise<void>>();
+    auto releaseBlocker = std::make_shared<std::promise<void>>();
+    auto releaseFuture = releaseBlocker->get_future().share();
+    impl_->threadPool_->Execute([blockerStarted, releaseFuture] {
+        blockerStarted->set_value();
+        releaseFuture.wait();
+    });
+    blockerStarted->get_future().wait();
+
+    BINEXPECT_CALL((GetObjectFromAnywhereMethod)&WorkerOCServiceImpl::GetObjectFromAnywhere, (_, _, _)).Times(0);
+    PublishMetaReqPb req;
+    req.mutable_meta()->set_object_key("queued-publish");
+    PublishMetaRspPb rsp;
+    DS_ASSERT_OK(akSkManager->GenerateSignature(req));
+    DS_ASSERT_OK(masterWorkerSvc.PublishMeta(req, rsp));
+    runtime.MarkLocalIsolated(worker::WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION, "isolated");
+    releaseBlocker->set_value();
+    impl_->threadPool_->Submit([] {}).wait();
+}
+
+TEST_F(WorkerOcServiceImplTest, MasterWorkerRejectsNestedRefIncreaseOutsideRunning)
+{
+    auto akSkManager = std::make_shared<AkSkManager>();
+    constexpr const char *clientCred = "test-client-credential";
+    constexpr const char *serverCred = "test-server-credential";
+    akSkManager->SetClientAkSk(clientCred, serverCred);
+    akSkManager->SetServerAkSk(AkSkType::SYSTEM, clientCred, serverCred);
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkStopping(worker::WorkerIsolationReason::PROCESS_STOPPING, "stopping");
+    MasterWorkerOCServiceImpl masterWorkerSvc(impl_, akSkManager);
+    masterWorkerSvc.SetRuntimeFacade(&runtime);
+
+    NotifyMasterIncNestedReqPb req;
+    NotifyMasterIncNestedResPb rsp;
+    DS_ASSERT_OK(akSkManager->GenerateSignature(req));
+    const auto rc = masterWorkerSvc.NotifyMasterIncNestedRefs(req, rsp);
+
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(rc.GetMsg().find("NORMAL_WRITE"), std::string::npos);
+    EXPECT_NE(rc.GetMsg().find("NotifyMasterIncNestedRefs"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, WorkerWorkerReadRejectsBeforeOwnershipEvidence)
+{
+    worker::WorkerRuntimeFacade runtime;
+    runtime.MarkRecovering(worker::WorkerIsolationReason::RECOVERY_EVIDENCE_INCOMPLETE,
+                           "ownership evidence is incomplete");
+    auto workerWorkerSvc = CreateWorkerWorkerOCService();
+    workerWorkerSvc.SetRuntimeFacade(&runtime);
+
+    GetObjectRemoteReqPb req;
+    GetObjectRemoteRspPb rsp;
+    std::vector<RpcMessage> payload;
+    auto rc = workerWorkerSvc.GetObjectRemote(req, rsp, payload, true);
+
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_NOT_READY);
+    EXPECT_NE(rc.GetMsg().find("NORMAL_READ"), std::string::npos);
+    EXPECT_NE(rc.GetMsg().find("RECOVERING"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, RecoverMetadataOfDataRecordsReadyEvidenceForEmptyBatch)
+{
+    impl_->metadataRecoveryManager_ = std::make_unique<MetaDataRecoveryManager>(
+        localAddress_, objectTable_, MetaDataRecoveryManager::ClusterAccess{}, nullptr, metadataRoute_);
+    std::vector<std::string> failedIds;
+
+    DS_ASSERT_OK(impl_->RecoverMetadataOfData(impl_->BeginRecoveryEvidenceGeneration("metadata"), {}, failedIds, ""));
+
+    EXPECT_TRUE(failedIds.empty());
+    auto report = impl_->GetLastMetadataRecoveryEvidenceReport();
+    EXPECT_TRUE(report.evidence.metadataReady);
+    EXPECT_NE(report.detail.find("metadata_recovered=0/0"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, RecoverMetadataOfDataRecordsMissingEvidenceWhenManagerUnavailable)
+{
+    impl_->metadataRecoveryManager_ = nullptr;
+    std::vector<std::string> failedIds;
+
+    auto rc =
+        impl_->RecoverMetadataOfData(impl_->BeginRecoveryEvidenceGeneration("metadata"), { "object-a" }, failedIds, "");
+
+    EXPECT_EQ(rc.GetCode(), StatusCode::K_RUNTIME_ERROR);
+    EXPECT_THAT(failedIds, ElementsAre("object-a"));
+    auto report = impl_->GetLastMetadataRecoveryEvidenceReport();
+    EXPECT_FALSE(report.evidence.metadataReady);
+    EXPECT_NE(report.detail.find("metadata_recovered=0/1"), std::string::npos);
+    EXPECT_NE(report.detail.find("metadata_failed=1"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, BuildObjectCacheRecoveryEvidenceRequiresMetadataAndSlotReadiness)
+{
+    impl_->metadataRecoveryManager_ = std::make_unique<MetaDataRecoveryManager>(
+        localAddress_, objectTable_, MetaDataRecoveryManager::ClusterAccess{}, nullptr, metadataRoute_);
+    std::vector<std::string> failedIds;
+    DS_ASSERT_OK(impl_->RecoverMetadataOfData(impl_->BeginRecoveryEvidenceGeneration("metadata"), {}, failedIds, ""));
+    impl_->slotRecoveryManager_ = std::make_shared<TestSlotRecoveryManager>(std::make_shared<EmptySlotRecoveryStore>());
+
+    auto report = impl_->BuildObjectCacheRecoveryEvidenceReport();
+
+    EXPECT_TRUE(report.evidence.metadataReady);
+    EXPECT_TRUE(report.evidence.slotReady);
+    EXPECT_TRUE(report.evidence.ownershipReady);
+    EXPECT_NE(report.detail.find("metadata_recovered=0/0"), std::string::npos);
+    EXPECT_NE(report.detail.find("slot_recovery_disabled"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, BuildObjectCacheRecoveryEvidenceTreatsNoMetadataWorkAsReady)
+{
+    impl_->slotRecoveryManager_ = std::make_shared<TestSlotRecoveryManager>(std::make_shared<EmptySlotRecoveryStore>());
+
+    auto report = impl_->BuildObjectCacheRecoveryEvidenceReport();
+
+    EXPECT_TRUE(report.evidence.metadataReady);
+    EXPECT_TRUE(report.evidence.slotReady);
+    EXPECT_TRUE(report.evidence.ownershipReady);
+    EXPECT_NE(report.detail.find("metadata_recovered=0/0"), std::string::npos);
+    EXPECT_NE(report.detail.find("slot_recovery_disabled"), std::string::npos);
+}
+
+TEST_F(WorkerOcServiceImplTest, NewRecoveryGenerationInvalidatesOldCompleteEvidence)
+{
+    worker::WorkerRuntimeFacade runtime;
+    impl_->SetRuntimeFacade(&runtime);
+    impl_->slotRecoveryManager_ = std::make_shared<TestSlotRecoveryManager>(std::make_shared<EmptySlotRecoveryStore>());
+    auto oldGeneration = impl_->BeginRecoveryEvidenceGeneration("old");
+    impl_->MarkRestartReconciliationEvidenceReady(oldGeneration, "old metadata reconciliation complete");
+    auto oldReport = impl_->BuildObjectCacheRecoveryEvidenceReport(oldGeneration);
+    EXPECT_TRUE(oldReport.evidence.metadataReady);
+    EXPECT_TRUE(oldReport.evidence.slotReady);
+
+    auto newGeneration = impl_->BeginRecoveryEvidenceGeneration("new");
+    EXPECT_NE(oldGeneration, newGeneration);
+    EXPECT_FALSE(impl_->MarkRestartReconciliationEvidenceReady(oldGeneration, "stale completion"));
+    auto pendingReport = impl_->BuildObjectCacheRecoveryEvidenceReport();
+    EXPECT_FALSE(pendingReport.evidence.metadataReady);
+    EXPECT_FALSE(pendingReport.evidence.ownershipReady);
+
+    auto staleReport = impl_->BuildObjectCacheRecoveryEvidenceReport(oldGeneration);
+    EXPECT_FALSE(staleReport.evidence.membershipReady);
+    EXPECT_FALSE(staleReport.evidence.metadataReady);
+
+    auto currentReport = impl_->BuildObjectCacheRecoveryEvidenceReport(newGeneration);
+    EXPECT_FALSE(currentReport.evidence.metadataReady);
+    EXPECT_TRUE(currentReport.evidence.slotReady);
+
+    (void)runtime.ObserveTopologyAvailability(cluster::TopologyAvailabilityLevel::NORMAL, [](bool) {});
+    worker::WorkerRecoveryEvidenceReport completeReport{ { true, true, true, true, true, true },
+                                                         "generation forwarding complete" };
+    EXPECT_TRUE(runtime.CommitRecoveryEvidence(newGeneration, cluster::TopologyAvailabilityLevel::NORMAL,
+                                               completeReport, [](bool) {}));
+}
+
+TEST_F(WorkerOcServiceImplReadyTopologyTest, NetworkRecoveryStartedExceptionReturnsBeforeScheduling)
+{
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+    auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
+    apiManager->SetApi(api);
+    impl_->workerMasterApiManager_ = std::move(apiManager);
+    int scheduleCount = 0;
+    impl_->reconciliationRequestScheduler_ = [&](std::function<void()>) {
+        ++scheduleCount;
+        return Status::OK();
+    };
+
+    const auto rc = impl_->ReconcileNetworkRecoveryOwnership(
+        0, [](worker::WorkerRecoveryGeneration) -> bool { throw std::runtime_error("start failed"); }, nullptr);
+
+    EXPECT_EQ(rc.GetCode(), K_RUNTIME_ERROR);
+    EXPECT_EQ(scheduleCount, 0);
+
+    const auto retryGeneration = impl_->CurrentRecoveryEvidenceGeneration();
+    impl_->reconciliationRequestScheduler_ = [&](std::function<void()>) {
+        ++scheduleCount;
+        return Status(K_RUNTIME_ERROR, "enqueue failed");
+    };
+    int terminalCount = 0;
+    DS_ASSERT_OK(impl_->ReconcileNetworkRecoveryOwnership(
+        retryGeneration, [](worker::WorkerRecoveryGeneration) { return true; },
+        [&](worker::WorkerRecoveryGeneration, const Status &status) {
+            ++terminalCount;
+            EXPECT_EQ(status.GetCode(), K_RUNTIME_ERROR);
+        }));
+
+    EXPECT_EQ(scheduleCount, 1);
+    EXPECT_EQ(terminalCount, 1);
+}
+
+TEST_F(WorkerOcServiceImplTest, QueuedReconciliationExceptionAndCompletionExceptionAreContained)
+{
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+    api->SetThrowReconciliation();
+    auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
+    apiManager->SetApi(api);
+    impl_->workerMasterApiManager_ = std::move(apiManager);
+    std::function<void()> queuedTask;
+    impl_->reconciliationRequestScheduler_ = [&](std::function<void()> task) {
+        queuedTask = std::move(task);
+        return Status::OK();
+    };
+    int completionCount = 0;
+
+    DS_ASSERT_OK(impl_->ScheduleReconciliationRequest(localAddress_.ToString(), 1,
+                                                      master::ReconciliationQueryPb::NETWORK_RECOVERY,
+                                                      [&](const std::string &, const Status &status) {
+                                                          EXPECT_EQ(status.GetCode(), K_RUNTIME_ERROR);
+                                                          ++completionCount;
+                                                          throw std::runtime_error("complete failed");
+                                                      }));
+    ASSERT_NE(queuedTask, nullptr);
+    EXPECT_NO_THROW(queuedTask());
+
+    EXPECT_EQ(api->ReconciliationCallCount(), 1);
+    EXPECT_EQ(completionCount, 1);
+}
+
+TEST_F(WorkerOcServiceImplReadyTopologyTest, NetworkRecoveryRetryBeginRejectsSupersededGeneration)
+{
+    // Kills unconditional generation creation on a stale retry.
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+    auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
+    apiManager->SetApi(api);
+    impl_->workerMasterApiManager_ = std::move(apiManager);
+    int scheduleCount = 0;
+    impl_->reconciliationRequestScheduler_ = [&](std::function<void()>) {
+        ++scheduleCount;
+        return Status::OK();
+    };
+    const auto supersededGeneration = impl_->BeginRecoveryEvidenceGeneration("superseded");
+    const auto currentGeneration = impl_->BeginRecoveryEvidenceGeneration("current");
+
+    auto rc = impl_->ReconcileNetworkRecoveryOwnership(
+        supersededGeneration,
+        [&](worker::WorkerRecoveryGeneration) {
+            ADD_FAILURE() << "stale retry started a fanout";
+            return false;
+        },
+        [&](worker::WorkerRecoveryGeneration, const Status &) { ADD_FAILURE() << "stale retry terminated a fanout"; });
+
+    EXPECT_EQ(rc.GetCode(), K_TRY_AGAIN);
+    EXPECT_EQ(impl_->CurrentRecoveryEvidenceGeneration(), currentGeneration);
+    EXPECT_EQ(scheduleCount, 0);
+}
+
+TEST_F(WorkerOcServiceImplReadyTopologyTest, NetworkRecoveryDuplicateProductionEntryPointPreservesActiveFanout)
+{
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+    auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
+    apiManager->SetApi(api);
+    impl_->workerMasterApiManager_ = std::move(apiManager);
+    std::vector<std::function<void()>> queuedTasks;
+    impl_->reconciliationRequestScheduler_ = [&](std::function<void()> task) {
+        queuedTasks.emplace_back(std::move(task));
+        return Status::OK();
+    };
+
+    DS_ASSERT_OK(impl_->ReconcileNetworkRecoveryOwnership());
+    const auto generation = impl_->CurrentRecoveryEvidenceGeneration();
+    ASSERT_NE(generation, 0);
+    ASSERT_EQ(queuedTasks.size(), 1);
+    int originalTerminalCount = 0;
+    impl_->recoveryState_->ownershipFanoutTerminalHandler_ = [generation, &originalTerminalCount](
+                                                                 worker::WorkerRecoveryGeneration completedGeneration,
+                                                                 const Status &status) {
+        EXPECT_EQ(completedGeneration, generation);
+        EXPECT_TRUE(status.IsOk());
+        ++originalTerminalCount;
+    };
+
+    const auto duplicateRc = impl_->ReconcileNetworkRecoveryOwnership();
+
+    EXPECT_EQ(duplicateRc.GetCode(), K_TRY_AGAIN);
+    EXPECT_EQ(impl_->CurrentRecoveryEvidenceGeneration(), generation);
+    ASSERT_EQ(queuedTasks.size(), 1);
+
+    queuedTasks.front()();
+    EXPECT_EQ(api->ReconciliationCallCount(), 1);
+    EXPECT_EQ(originalTerminalCount, 1);
+    EXPECT_FALSE(impl_->recoveryState_->CompleteOwnershipOwner(generation, localAddress_.ToString(), Status::OK()));
+    EXPECT_EQ(originalTerminalCount, 1);
+
+    DS_ASSERT_OK(impl_->ReconcileNetworkRecoveryOwnership());
+    EXPECT_GT(impl_->CurrentRecoveryEvidenceGeneration(), generation);
+    ASSERT_EQ(queuedTasks.size(), 2);
+}
+
+TEST_F(WorkerOcServiceImplReadyTopologyTest, NetworkRecoveryDuplicateCurrentGenerationPreservesActiveFanout)
+{
+    auto api = std::make_shared<FakeWorkerMasterOCApi>(localAddress_);
+    auto apiManager = std::make_shared<FakeWorkerMasterApiManager>(localAddress_, metadataRoute_);
+    apiManager->SetApi(api);
+    impl_->workerMasterApiManager_ = std::move(apiManager);
+    std::vector<std::function<void()>> queuedTasks;
+    impl_->reconciliationRequestScheduler_ = [&](std::function<void()> task) {
+        queuedTasks.emplace_back(std::move(task));
+        return Status::OK();
+    };
+    worker::WorkerRecoveryGeneration generation = 0;
+    int originalTerminalCount = 0;
+    DS_ASSERT_OK(impl_->ReconcileNetworkRecoveryOwnership(
+        0,
+        [&](worker::WorkerRecoveryGeneration startedGeneration) {
+            generation = startedGeneration;
+            return true;
+        },
+        [&](worker::WorkerRecoveryGeneration completedGeneration, const Status &status) {
+            EXPECT_EQ(completedGeneration, generation);
+            EXPECT_TRUE(status.IsOk());
+            ++originalTerminalCount;
+        }));
+    ASSERT_NE(generation, 0);
+    ASSERT_EQ(queuedTasks.size(), 1);
+
+    int duplicateStartedCount = 0;
+    int duplicateTerminalCount = 0;
+    const auto duplicateRc = impl_->ReconcileNetworkRecoveryOwnership(
+        generation,
+        [&](worker::WorkerRecoveryGeneration) {
+            ++duplicateStartedCount;
+            return true;
+        },
+        [&](worker::WorkerRecoveryGeneration, const Status &) { ++duplicateTerminalCount; });
+
+    EXPECT_EQ(duplicateRc.GetCode(), K_TRY_AGAIN);
+    EXPECT_EQ(impl_->CurrentRecoveryEvidenceGeneration(), generation);
+    EXPECT_EQ(queuedTasks.size(), 1);
+    EXPECT_EQ(duplicateStartedCount, 0);
+    EXPECT_EQ(duplicateTerminalCount, 0);
+    EXPECT_EQ(originalTerminalCount, 0);
+
+    queuedTasks.front()();
+    EXPECT_EQ(api->ReconciliationCallCount(), 1);
+    EXPECT_EQ(originalTerminalCount, 1);
+    EXPECT_EQ(duplicateStartedCount, 0);
+    EXPECT_EQ(duplicateTerminalCount, 0);
+    EXPECT_EQ(impl_->CurrentRecoveryEvidenceGeneration(), generation);
+}
+
+TEST_F(WorkerOcServiceImplTest, LateRuntimeFacadeAttachmentSynchronizesCurrentRecoveryGeneration)
+{
+    const auto generation = impl_->BeginRecoveryEvidenceGeneration("detached recovery");
+    worker::WorkerRuntimeFacade runtime;
+    ASSERT_TRUE(impl_->SetRuntimeFacade(&runtime));
+    const auto token = runtime.ObserveTopologyAvailability(cluster::TopologyAvailabilityLevel::NORMAL, [](bool) {});
+    worker::WorkerRecoveryEvidenceReport report{ { true, true, true, true, true, true }, "complete recovery" };
+    bool outerGate = false;
+
+    EXPECT_EQ(token.generation, generation);
+    EXPECT_TRUE(
+        runtime.CommitRecoveryEvidence(generation, token.level, report, [&outerGate](bool open) { outerGate = open; }));
+    EXPECT_TRUE(outerGate);
+}
+
+TEST_F(WorkerOcServiceImplTest, RuntimeAheadRejectsLateGenerationSynchronization)
+{
+    const auto objectCacheGeneration = impl_->BeginRecoveryEvidenceGeneration("detached recovery");
+    worker::WorkerRuntimeFacade runtime;
+    const auto runtimeGeneration = objectCacheGeneration + 1;
+    ASSERT_TRUE(runtime.BeginRecoveryEvidenceGeneration(runtimeGeneration, "runtime ahead"));
+    (void)runtime.ObserveTopologyAvailability(cluster::TopologyAvailabilityLevel::NORMAL, [](bool) {});
+    worker::WorkerRecoveryEvidenceReport report{ { true, true, true, true, true, true }, "complete recovery" };
+    ASSERT_TRUE(runtime.CommitRecoveryEvidence(runtimeGeneration, cluster::TopologyAvailabilityLevel::NORMAL, report,
+                                               [](bool) {}));
+
+    EXPECT_FALSE(impl_->SetRuntimeFacade(&runtime));
+    (void)impl_->BeginRecoveryEvidenceGeneration("next detached recovery");
+    (void)impl_->BeginRecoveryEvidenceGeneration("later detached recovery");
+    EXPECT_TRUE(runtime.CommitRecoveryEvidence(runtimeGeneration, cluster::TopologyAvailabilityLevel::NORMAL, report,
+                                               [](bool) {}));
+}
+
+TEST_F(WorkerOcServiceImplTest, StaleReconciliationCompletionDoesNotPublishHealthOrTopology)
+{
+    const auto staleGeneration = impl_->BeginRecoveryEvidenceGeneration("stale");
+    impl_->numRecon_ = 1;
+    PushMetaToWorkerReqPb req;
+    req.set_is_restart(true);
+    std::promise<void> topologyChecked;
+    std::promise<void> releaseCompletion;
+    auto releaseFuture = releaseCompletion.get_future().share();
+    BINEXPECT_CALL((GetExpectedReconciliationCountMethod)&WorkerOCServiceImpl::GetExpectedReconciliationCount, (_))
+        .WillOnce(Invoke([](int &expectedCount) {
+            expectedCount = 1;
+            return Status::OK();
+        }));
+    BINEXPECT_CALL(&WorkerOCServiceImpl::CheckWaitTopologyReady, ()).WillOnce(Invoke([&] {
+        topologyChecked.set_value();
+        releaseFuture.wait();
+        return Status::OK();
+    }));
+    BINEXPECT_CALL(&SetHealthProbe, ()).Times(0);
+    BINEXPECT_CALL(&worker::WorkerTopologyRuntimeAdapter::NotifyReconciliationDone, ()).Times(0);
+
+    auto completion = std::async(std::launch::async, [&] { return impl_->GetReadyToWork(req, staleGeneration); });
+    ASSERT_EQ(topologyChecked.get_future().wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    const auto currentGeneration = impl_->BeginRecoveryEvidenceGeneration("current");
+    releaseCompletion.set_value();
+
+    EXPECT_NE(currentGeneration, staleGeneration);
+    EXPECT_TRUE(completion.get().IsOk());
+    EXPECT_FALSE(impl_->setHealthFile_.load());
+}
+
+TEST_F(WorkerOcServiceImplTest, ResourceRecoveryRequirementRemainsStickyAcrossEvidenceChecks)
+{
+    worker::WorkerRuntimeFacade runtime;
+    ASSERT_TRUE(MarkRuntimeRunning(runtime));
+    impl_->SetRuntimeFacade(&runtime);
+    impl_->metadataRecoveryManager_ = std::make_unique<MetaDataRecoveryManager>(
+        localAddress_, objectTable_, MetaDataRecoveryManager::ClusterAccess{}, nullptr, metadataRoute_);
+    std::vector<std::string> failedIds;
+    DS_ASSERT_OK(impl_->RecoverMetadataOfData(impl_->BeginRecoveryEvidenceGeneration("metadata"), {}, failedIds, ""));
+    impl_->slotRecoveryManager_ = std::make_shared<TestSlotRecoveryManager>(std::make_shared<EmptySlotRecoveryStore>());
+    impl_->evictionManager_ = std::make_shared<WorkerOcEvictionManager>(objectTable_, localAddress_,
+                                                                        HostPort("127.0.0.1", 19091), metadataRoute_);
+    BINEXPECT_CALL(&WorkerOcEvictionManager::IsResourceRecovered, (_))
+        .Times(2)
+        .WillOnce(Return(true))
+        .WillOnce(Return(false));
+    impl_->MarkOutOfMemoryIfNeeded(Status(StatusCode::K_OUT_OF_MEMORY, "allocation failed"), "Create");
+
+    EXPECT_TRUE(impl_->BuildObjectCacheRecoveryEvidenceReport().evidence.resourceReady);
+    EXPECT_FALSE(impl_->BuildObjectCacheRecoveryEvidenceReport().evidence.resourceReady);
+}
+
+TEST_F(WorkerOcServiceImplTest, ResourceRecoveryRequirementClearsAfterMatchingGenerationCommit)
+{
+    worker::WorkerRuntimeFacade runtime;
+    ASSERT_TRUE(MarkRuntimeRunning(runtime));
+    impl_->SetRuntimeFacade(&runtime);
+    impl_->evictionManager_ = std::make_shared<WorkerOcEvictionManager>(objectTable_, localAddress_,
+                                                                        HostPort("127.0.0.1", 19091), metadataRoute_);
+    BINEXPECT_CALL(&WorkerOcEvictionManager::IsResourceRecovered, (_)).Times(1).WillOnce(Return(true));
+    impl_->MarkOutOfMemoryIfNeeded(Status(StatusCode::K_OUT_OF_MEMORY, "allocation failed"), "Create");
+    uint64_t generation = 0;
+
+    const auto report = impl_->BuildObjectCacheRecoveryEvidenceReport(&generation);
+    ASSERT_TRUE(report.evidence.resourceReady);
+    bool outerGate = false;
+    EXPECT_TRUE(impl_->PublishResourceRecoveryIfCurrent(generation, [&] {
+        const auto token = runtime.ObserveTopologyAvailability(cluster::TopologyAvailabilityLevel::NORMAL, [](bool) {});
+        const bool committed =
+            runtime.CommitResourceRecovery(token, report, [&outerGate](bool open) { outerGate = open; });
+        return committed && outerGate;
+    }));
+    EXPECT_TRUE(outerGate);
+    EXPECT_EQ(runtime.GetSnapshot().mode, worker::WorkerServiceMode::RUNNING);
+    EXPECT_TRUE(impl_->BuildObjectCacheRecoveryEvidenceReport().evidence.resourceReady);
+}
+
+TEST_F(WorkerOcServiceImplTest, StaleResourceRecoveryCommitDoesNotClearNewIncident)
+{
+    worker::WorkerRuntimeFacade runtime;
+    impl_->SetRuntimeFacade(&runtime);
+    impl_->evictionManager_ = std::make_shared<WorkerOcEvictionManager>(objectTable_, localAddress_,
+                                                                        HostPort("127.0.0.1", 19091), metadataRoute_);
+    BINEXPECT_CALL(&WorkerOcEvictionManager::IsResourceRecovered, (_))
+        .Times(2)
+        .WillOnce(Return(true))
+        .WillOnce(Return(false));
+    impl_->MarkOutOfMemoryIfNeeded(Status(StatusCode::K_OUT_OF_MEMORY, "first incident"), "Create");
+    uint64_t staleGeneration = 0;
+    EXPECT_TRUE(impl_->BuildObjectCacheRecoveryEvidenceReport(&staleGeneration).evidence.resourceReady);
+
+    impl_->MarkOutOfMemoryIfNeeded(Status(StatusCode::K_OUT_OF_MEMORY, "second incident"), "Create");
+    EXPECT_FALSE(impl_->PublishResourceRecoveryIfCurrent(staleGeneration, [] { return true; }));
+
+    EXPECT_FALSE(impl_->BuildObjectCacheRecoveryEvidenceReport().evidence.resourceReady);
+}
+
+TEST_F(WorkerOcServiceImplTest, StaleResourceRecoveryDoesNotPublishRunningAdmission)
+{
+    worker::WorkerRuntimeFacade runtime;
+    worker::WorkerRunningEvidence runningEvidence{ true, true, true, true, true, true };
+    ASSERT_TRUE(runtime.TryCompleteRecovery(runningEvidence, "ready"));
+    impl_->SetRuntimeFacade(&runtime);
+    impl_->evictionManager_ = std::make_shared<WorkerOcEvictionManager>(objectTable_, localAddress_,
+                                                                        HostPort("127.0.0.1", 19091), metadataRoute_);
+    BINEXPECT_CALL(&WorkerOcEvictionManager::IsResourceRecovered, (_)).Times(1).WillOnce(Return(true));
+    impl_->MarkOutOfMemoryIfNeeded(Status(StatusCode::K_OUT_OF_MEMORY, "first incident"), "Create");
+    uint64_t staleGeneration = 0;
+    EXPECT_TRUE(impl_->BuildObjectCacheRecoveryEvidenceReport(&staleGeneration).evidence.resourceReady);
+
+    impl_->MarkOutOfMemoryIfNeeded(Status(StatusCode::K_OUT_OF_MEMORY, "second incident"), "Create");
+    DS_ASSERT_OK(SetHealthProbe());
+    SetTopologyServingAdmission(false);
+    Raii reset([]() {
+        SetTopologyServingAdmission(true);
+        SetUnhealthy();
+    });
+    bool published = false;
+
+    const bool open = impl_->PublishResourceRecoveryIfCurrent(staleGeneration, [&] {
+        published = true;
+        const bool running = runtime.TryCompleteRecovery(runningEvidence, "stale recovery");
+        SetTopologyServingAdmission(running);
+        return running;
+    });
+
+    EXPECT_FALSE(open);
+    EXPECT_FALSE(published);
+    EXPECT_FALSE(IsHealthy());
+    EXPECT_EQ(runtime.GetSnapshot().mode, worker::WorkerServiceMode::OUT_OF_MEMORY);
+}
+
 TEST_F(WorkerOcServiceImplTest, CollectDisconnectedClientRefIdsReturnsOnlyMissingClients)
 {
     const auto liveClient = ClientKey::Intern("live-client");
@@ -515,12 +2521,10 @@ TEST_F(WorkerOcServiceImplTest, CollectDisconnectedClientRefIdsReturnsOnlyMissin
 
     std::vector<std::string> failIncIds;
     std::vector<std::string> firstIncIds;
-    DS_ASSERT_OK(
-        impl_->globalRefTable_->GIncreaseRef(liveClient, { "live-object" }, failIncIds, firstIncIds));
+    DS_ASSERT_OK(impl_->globalRefTable_->GIncreaseRef(liveClient, { "live-object" }, failIncIds, firstIncIds));
     failIncIds.clear();
     firstIncIds.clear();
-    DS_ASSERT_OK(
-        impl_->globalRefTable_->GIncreaseRef(staleClient, { "stale-object" }, failIncIds, firstIncIds));
+    DS_ASSERT_OK(impl_->globalRefTable_->GIncreaseRef(staleClient, { "stale-object" }, failIncIds, firstIncIds));
 
     auto disconnectedClients = impl_->CollectDisconnectedClientRefIds();
 
@@ -787,16 +2791,14 @@ TEST_F(WorkerOcServiceImplTest, GIncreaseRefReleasesGRefLockBeforeRefMovingSleep
     GIncreaseRspPb rsp;
 
     DS_ASSERT_OK(inject::Set(K_REF_MOVING_RETRY_BEFORE_SLEEP_INJECT_POINT, "pause"));
-    auto refFuture = std::async(std::launch::async, [&gRefProc, &req, &rsp] {
-        return gRefProc.GIncreaseRef(req, rsp);
-    });
-    auto clearRetrySleepInject =
-        Raii([]() { (void)inject::Clear(K_REF_MOVING_RETRY_BEFORE_SLEEP_INJECT_POINT); });
+    auto refFuture =
+        std::async(std::launch::async, [&gRefProc, &req, &rsp] { return gRefProc.GIncreaseRef(req, rsp); });
+    auto clearRetrySleepInject = Raii([]() { (void)inject::Clear(K_REF_MOVING_RETRY_BEFORE_SLEEP_INJECT_POINT); });
 
     ASSERT_TRUE(api->WaitForFirstRefMovingCall(std::chrono::milliseconds(K_WAIT_FIRST_MOVING_CALL_TIMEOUT_MS)));
-    ASSERT_TRUE(WaitForInjectPointExecuteCount(
-        K_REF_MOVING_RETRY_BEFORE_SLEEP_INJECT_POINT, K_FIRST_INJECT_EXECUTE_COUNT,
-        std::chrono::milliseconds(K_WAIT_RETRY_SLEEP_INJECT_TIMEOUT_MS)));
+    ASSERT_TRUE(WaitForInjectPointExecuteCount(K_REF_MOVING_RETRY_BEFORE_SLEEP_INJECT_POINT,
+                                               K_FIRST_INJECT_EXECUTE_COUNT,
+                                               std::chrono::milliseconds(K_WAIT_RETRY_SLEEP_INJECT_TIMEOUT_MS)));
     auto lockProbe = std::async(std::launch::async, [&gRefProc, &objectKey, &api] {
         std::map<std::string, std::shared_ptr<SafeObjType>> lockedEntries;
         gRefProc.BatchGRefLock(std::vector<std::string>{ objectKey }, false, lockedEntries);
@@ -835,13 +2837,12 @@ TEST_F(WorkerOcServiceImplTest, GIncreaseMasterRefWithLockReleasesGRefLockBefore
     auto refFuture = std::async(std::launch::async, [&gRefProc, &masterAddress, &objectKey, &failedIds] {
         return gRefProc.GIncreaseMasterRefWithLock(masterAddress, { objectKey }, failedIds);
     });
-    auto clearRetrySleepInject =
-        Raii([]() { (void)inject::Clear(K_REF_MOVING_RETRY_BEFORE_SLEEP_INJECT_POINT); });
+    auto clearRetrySleepInject = Raii([]() { (void)inject::Clear(K_REF_MOVING_RETRY_BEFORE_SLEEP_INJECT_POINT); });
 
     ASSERT_TRUE(api->WaitForFirstRefMovingCall(std::chrono::milliseconds(K_WAIT_FIRST_MOVING_CALL_TIMEOUT_MS)));
-    ASSERT_TRUE(WaitForInjectPointExecuteCount(
-        K_REF_MOVING_RETRY_BEFORE_SLEEP_INJECT_POINT, K_FIRST_INJECT_EXECUTE_COUNT,
-        std::chrono::milliseconds(K_WAIT_RETRY_SLEEP_INJECT_TIMEOUT_MS)));
+    ASSERT_TRUE(WaitForInjectPointExecuteCount(K_REF_MOVING_RETRY_BEFORE_SLEEP_INJECT_POINT,
+                                               K_FIRST_INJECT_EXECUTE_COUNT,
+                                               std::chrono::milliseconds(K_WAIT_RETRY_SLEEP_INJECT_TIMEOUT_MS)));
     auto lockProbe = std::async(std::launch::async, [&gRefProc, &objectKey, &api] {
         std::map<std::string, std::shared_ptr<SafeObjType>> lockedEntries;
         gRefProc.BatchGRefLock(std::vector<std::string>{ objectKey }, false, lockedEntries);
@@ -861,10 +2862,41 @@ TEST_F(WorkerOcServiceImplTest, GIncreaseMasterRefWithLockReleasesGRefLockBefore
     EXPECT_TRUE(failedIds.empty());
 }
 
+TEST_F(WorkerOcServiceImplTest, ClearMatchedObjectsRecoversBeforeCleanupWhenMetadataRecoveryDisabled)
+{
+    const bool oldEnableMetadataRecovery = FLAGS_enable_metadata_recovery;
+    FLAGS_enable_metadata_recovery = false;
+    Raii restoreFlag([oldEnableMetadataRecovery] { FLAGS_enable_metadata_recovery = oldEnableMetadataRecovery; });
+    const std::string objectKey = "recover-before-cleanup";
+    AddObject(objectKey);
+
+    BINEXPECT_CALL((FilterObjectsNeedClearByMasterMethod)&WorkerOcServiceClearDataFlow::FilterObjectsNeedClearByMaster,
+                   (ElementsAre(objectKey), _, _, _))
+        .WillOnce(Invoke([&objectKey](const std::vector<std::string> &, std::vector<std::string> &needClear,
+                                      std::unordered_set<std::string> &, std::unordered_map<std::string, uint64_t> &) {
+            needClear.emplace_back(objectKey);
+        }));
+    BINEXPECT_CALL((RetryFailedMetadataRecoveryMethod)&WorkerOcServiceClearDataFlow::
+                       RetryFailedMetadataRecoveryAndClearUnrecoverable,
+                   (ElementsAre(objectKey)))
+        .WillOnce(Invoke([](const std::vector<std::string> &) {
+            WorkerOcServiceClearDataFlow::RetryMetadataRecoveryResult result;
+            result.recoveredCount = 1;
+            return result;
+        }));
+
+    ClearDataRetryIds retryIds;
+    dataClearImpl_->ClearMatchedObjects({ objectKey }, retryIds);
+
+    EXPECT_TRUE(retryIds.Empty());
+    std::shared_ptr<SafeObjType> entry;
+    EXPECT_TRUE(objectTable_->Get(objectKey, entry).IsOk());
+}
+
 TEST_F(WorkerOcServiceImplTest, DISABLED_ClearDataImplDispatchesMatchedObjectsToClearAndRebuild)
 {
-    using GetMatchObjectIdsMethod = Status (WorkerOcServiceClearDataFlow::*)(const ClearDataReqPb &,
-                                                                             std::vector<std::string> &);
+    using GetMatchObjectIdsMethod =
+        Status (WorkerOcServiceClearDataFlow::*)(const ClearDataReqPb &, std::vector<std::string> &);
     using ClearMatchedObjectsMethod =
         void (WorkerOcServiceClearDataFlow::*)(const std::vector<std::string> &, ClearDataRetryIds &);
     using RebuildRefForMatchedObjectsMethod =
@@ -873,20 +2905,18 @@ TEST_F(WorkerOcServiceImplTest, DISABLED_ClearDataImplDispatchesMatchedObjectsTo
     std::vector<std::string> matchObjIds{ "obj1", "obj2" };
     std::vector<std::string> clearObjIds;
     std::vector<std::string> rebuildObjIds;
-    BINEXPECT_CALL((GetMatchObjectIdsMethod) & WorkerOcServiceClearDataFlow::GetMatchObjectIds, (_, _))
+    BINEXPECT_CALL((GetMatchObjectIdsMethod)&WorkerOcServiceClearDataFlow::GetMatchObjectIds, (_, _))
         .WillOnce(Invoke([&matchObjIds](const ClearDataReqPb &, std::vector<std::string> &outObjIds) {
             outObjIds = matchObjIds;
             return Status::OK();
         }));
-    BINEXPECT_CALL((ClearMatchedObjectsMethod) & WorkerOcServiceClearDataFlow::ClearMatchedObjects, (_, _))
-        .WillOnce(Invoke([&clearObjIds](const std::vector<std::string> &objIds,
-                                        ClearDataRetryIds &) { clearObjIds = objIds; }));
-    BINEXPECT_CALL((RebuildRefForMatchedObjectsMethod) & WorkerOcServiceClearDataFlow::RebuildRefForMatchedObjects,
+    BINEXPECT_CALL((ClearMatchedObjectsMethod)&WorkerOcServiceClearDataFlow::ClearMatchedObjects, (_, _))
+        .WillOnce(Invoke(
+            [&clearObjIds](const std::vector<std::string> &objIds, ClearDataRetryIds &) { clearObjIds = objIds; }));
+    BINEXPECT_CALL((RebuildRefForMatchedObjectsMethod)&WorkerOcServiceClearDataFlow::RebuildRefForMatchedObjects,
                    (_, _))
-        .WillOnce(Invoke([&rebuildObjIds](const std::vector<std::string> &objIds,
-                                          ClearDataRetryIds &) {
-            rebuildObjIds = objIds;
-        }));
+        .WillOnce(Invoke(
+            [&rebuildObjIds](const std::vector<std::string> &objIds, ClearDataRetryIds &) { rebuildObjIds = objIds; }));
 
     ClearDataRetryIds retryIds;
     ClearDataReqPb req;
@@ -898,18 +2928,18 @@ TEST_F(WorkerOcServiceImplTest, DISABLED_ClearDataImplDispatchesMatchedObjectsTo
 
 TEST_F(WorkerOcServiceImplTest, ClearDataImplReturnsWhenSelectObjectsFailed)
 {
-    using GetMatchObjectIdsMethod = Status (WorkerOcServiceClearDataFlow::*)(const ClearDataReqPb &,
-                                                                             std::vector<std::string> &);
+    using GetMatchObjectIdsMethod =
+        Status (WorkerOcServiceClearDataFlow::*)(const ClearDataReqPb &, std::vector<std::string> &);
     using ClearMatchedObjectsMethod =
         void (WorkerOcServiceClearDataFlow::*)(const std::vector<std::string> &, ClearDataRetryIds &);
     using RebuildRefForMatchedObjectsMethod =
         void (WorkerOcServiceClearDataFlow::*)(const std::vector<std::string> &, ClearDataRetryIds &);
 
     Status selectFailed(StatusCode::K_RUNTIME_ERROR, "select failed");
-    BINEXPECT_CALL((GetMatchObjectIdsMethod) & WorkerOcServiceClearDataFlow::GetMatchObjectIds, (_, _))
+    BINEXPECT_CALL((GetMatchObjectIdsMethod)&WorkerOcServiceClearDataFlow::GetMatchObjectIds, (_, _))
         .WillOnce(Return(selectFailed));
-    BINEXPECT_CALL((ClearMatchedObjectsMethod) & WorkerOcServiceClearDataFlow::ClearMatchedObjects, (_, _)).Times(0);
-    BINEXPECT_CALL((RebuildRefForMatchedObjectsMethod) & WorkerOcServiceClearDataFlow::RebuildRefForMatchedObjects,
+    BINEXPECT_CALL((ClearMatchedObjectsMethod)&WorkerOcServiceClearDataFlow::ClearMatchedObjects, (_, _)).Times(0);
+    BINEXPECT_CALL((RebuildRefForMatchedObjectsMethod)&WorkerOcServiceClearDataFlow::RebuildRefForMatchedObjects,
                    (_, _))
         .Times(0);
 
@@ -935,15 +2965,14 @@ TEST_F(WorkerOcServiceImplTest, RebuildRefForMatchedObjectsShouldCollectRetryIds
     AddWorkerRef("obj3", "client-3");
 
     RecoverMasterAppRefEvent::GetInstance().AddSubscriber(
-        kRecoverMasterAppRefSubscriber,
-        [](std::function<bool(const std::string &)> matchFunc, const std::string &) {
+        kRecoverMasterAppRefSubscriber, [](std::function<bool(const std::string &)> matchFunc, const std::string &) {
             EXPECT_TRUE(matchFunc("obj1"));
             EXPECT_FALSE(matchFunc("obj2"));
             EXPECT_TRUE(matchFunc("obj3"));
             EXPECT_FALSE(matchFunc("obj4"));
             return Status(StatusCode::K_RUNTIME_ERROR, "recover failed");
         });
-    BINEXPECT_CALL((IncreaseMasterRefMethod) & WorkerOcServiceGlobalReferenceImpl::GIncreaseMasterRefWithLock, (_, _))
+    BINEXPECT_CALL((IncreaseMasterRefMethod)&WorkerOcServiceGlobalReferenceImpl::GIncreaseMasterRefWithLock, (_, _))
         .WillOnce(Invoke([](std::function<bool(const std::string &)> matchFunc, std::vector<std::string> &failedIds) {
             EXPECT_TRUE(matchFunc("obj1"));
             EXPECT_TRUE(matchFunc("obj2"));
@@ -972,23 +3001,18 @@ TEST_F(WorkerOcServiceImplTest, ClearDataRetryImplShouldRouteFailedIdsToRetrySta
     std::vector<std::string> clearObjIds;
     std::vector<std::string> increaseObjIds;
     std::vector<std::string> recoverObjIds;
-    BINEXPECT_CALL((ClearMatchedObjectsMethod) & WorkerOcServiceClearDataFlow::ClearMatchedObjects, (_, _))
-        .WillOnce(Invoke([&clearObjIds](const std::vector<std::string> &objIds,
-                                        ClearDataRetryIds &retryIds) {
+    BINEXPECT_CALL((ClearMatchedObjectsMethod)&WorkerOcServiceClearDataFlow::ClearMatchedObjects, (_, _))
+        .WillOnce(Invoke([&clearObjIds](const std::vector<std::string> &objIds, ClearDataRetryIds &retryIds) {
             clearObjIds = objIds;
             retryIds.clearFailedIds.emplace("clear-next");
         }));
-    BINEXPECT_CALL((RetryIncreaseMasterRefMethod) & WorkerOcServiceClearDataFlow::RetryIncreaseMasterRef, (_, _))
-        .WillOnce(Invoke([&increaseObjIds](const std::vector<std::string> &objIds,
-                                           ClearDataRetryIds &retryIds) {
+    BINEXPECT_CALL((RetryIncreaseMasterRefMethod)&WorkerOcServiceClearDataFlow::RetryIncreaseMasterRef, (_, _))
+        .WillOnce(Invoke([&increaseObjIds](const std::vector<std::string> &objIds, ClearDataRetryIds &retryIds) {
             increaseObjIds = objIds;
             retryIds.increaseFailedIds.emplace("increase-next");
         }));
-    BINEXPECT_CALL((RetryRecoverMasterAppRefMethod) &
-                       WorkerOcServiceClearDataFlow::RetryRecoverMasterAppRef,
-                   (_, _))
-        .WillOnce(Invoke([&recoverObjIds](const std::vector<std::string> &objIds,
-                                          ClearDataRetryIds &retryIds) {
+    BINEXPECT_CALL((RetryRecoverMasterAppRefMethod)&WorkerOcServiceClearDataFlow::RetryRecoverMasterAppRef, (_, _))
+        .WillOnce(Invoke([&recoverObjIds](const std::vector<std::string> &objIds, ClearDataRetryIds &retryIds) {
             recoverObjIds = objIds;
             retryIds.recoverAppRefFailedIds.emplace("recover-next");
         }));
@@ -1008,6 +3032,176 @@ TEST_F(WorkerOcServiceImplTest, ClearDataRetryImplShouldRouteFailedIdsToRetrySta
     EXPECT_THAT(nextRetryIds.clearFailedIds, UnorderedElementsAre("clear-next"));
     EXPECT_THAT(nextRetryIds.increaseFailedIds, UnorderedElementsAre("increase-next"));
     EXPECT_THAT(nextRetryIds.recoverAppRefFailedIds, UnorderedElementsAre("recover-next"));
+}
+
+TEST_F(WorkerOcServiceImplTest, ClearDataAsyncRetrySchedulesRoundTenThenStopsAtBudget)
+{
+    using AddTimerMethod =
+        Status (TimerQueue::*)(const uint64_t &, const std::function<void()>, TimerQueue::TimerImpl &);
+    using SubmitRetryMethod =
+        void (WorkerOcServiceClearDataFlow::*)(const ClearDataReqPb &, uint64_t, const ClearDataRetryIds &);
+    constexpr uint64_t maxRetryRounds = 10;
+    constexpr uint64_t expectedIntervalMs = 200;
+    size_t timerSubmissions = 0;
+    size_t threadPoolSubmissions = 0;
+    uint64_t submittedRetryRound = 0;
+    std::function<void()> timerCallback;
+    BINEXPECT_CALL((AddTimerMethod)&TimerQueue::AddTimer, (_, _, _))
+        .WillOnce(Invoke([&](const uint64_t &delayMs, const std::function<void()> callback, TimerQueue::TimerImpl &) {
+            ++timerSubmissions;
+            EXPECT_EQ(delayMs, expectedIntervalMs);
+            timerCallback = std::move(callback);
+            return Status::OK();
+        }));
+    BINEXPECT_CALL((SubmitRetryMethod)&WorkerOcServiceClearDataFlow::SubmitRetryClearDataAsync, (_, _, _))
+        .WillOnce(Invoke([&](const ClearDataReqPb &, uint64_t retryRound, const ClearDataRetryIds &) {
+            ++threadPoolSubmissions;
+            submittedRetryRound = retryRound;
+        }));
+    ClearDataReqPb req;
+    ClearDataRetryIds retryIds;
+    retryIds.clearFailedIds.emplace("persistent-failure");
+    dataClearImpl_->RetryClearDataAsync(req, retryIds, maxRetryRounds - 1);
+    ASSERT_NE(timerCallback, nullptr);
+    timerCallback();
+    dataClearImpl_->RetryClearDataAsync(req, retryIds, maxRetryRounds);
+    dataClearImpl_->RetryClearDataAsync(req, retryIds, std::numeric_limits<uint64_t>::max());
+    EXPECT_EQ(timerSubmissions, 1U);
+    EXPECT_EQ(threadPoolSubmissions, 1U);
+    EXPECT_EQ(submittedRetryRound, maxRetryRounds);
+}
+
+TEST_F(WorkerOcServiceImplTest, TopologyOwnedClearDataStartsTheSharedRetryBudgetAtZero)
+{
+    using ClearMatchedObjectsMethod =
+        void (WorkerOcServiceClearDataFlow::*)(const std::vector<std::string> &, ClearDataRetryIds &);
+    using RebuildRefForMatchedObjectsMethod =
+        void (WorkerOcServiceClearDataFlow::*)(const std::vector<std::string> &, ClearDataRetryIds &);
+    using RetryMethod =
+        void (WorkerOcServiceClearDataFlow::*)(const ClearDataReqPb &, const ClearDataRetryIds &, uint64_t);
+    using SubmitRetryMethod =
+        void (WorkerOcServiceClearDataFlow::*)(const ClearDataReqPb &, uint64_t, const ClearDataRetryIds &);
+    auto completedRetryRounds = std::make_shared<std::promise<uint64_t>>();
+    auto observedRounds = completedRetryRounds->get_future();
+    auto taskDrained = std::make_shared<std::promise<void>>();
+    auto taskDrainedFuture = taskDrained->get_future();
+    BINEXPECT_CALL((ClearMatchedObjectsMethod)&WorkerOcServiceClearDataFlow::ClearMatchedObjects, (_, _))
+        .WillOnce(Invoke([](const std::vector<std::string> &, ClearDataRetryIds &retryIds) {
+            retryIds.clearFailedIds.emplace("topology-failure");
+        }));
+    BINEXPECT_CALL((RebuildRefForMatchedObjectsMethod)&WorkerOcServiceClearDataFlow::RebuildRefForMatchedObjects,
+                   (_, _));
+    BINEXPECT_CALL((RetryMethod)&WorkerOcServiceClearDataFlow::RetryClearDataAsync, (_, _, _))
+        .WillOnce(Invoke([completedRetryRounds](const ClearDataReqPb &, const ClearDataRetryIds &, uint64_t rounds) {
+            completedRetryRounds->set_value(rounds);
+        }));
+    BINEXPECT_CALL((SubmitRetryMethod)&WorkerOcServiceClearDataFlow::SubmitRetryClearDataAsync, (_, _, _)).Times(0);
+
+    WorkerOcServiceClearDataFlow::OwnedTopologyClearRequest request{ {}, "topology-operation", { "object" } };
+    dataClearImpl_->SubmitOwnedTopologyCleanup(std::move(request));
+    dataClearImpl_->clearDataThreadPool_->Execute([taskDrained] { taskDrained->set_value(); });
+    ASSERT_EQ(taskDrainedFuture.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    ASSERT_EQ(observedRounds.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_EQ(observedRounds.get(), 0U);
+}
+
+TEST_F(WorkerOcServiceImplTest, ClearDataAsyncRetryDoesNotScheduleAfterExit)
+{
+    using AddTimerMethod =
+        Status (TimerQueue::*)(const uint64_t &, const std::function<void()>, TimerQueue::TimerImpl &);
+    BINEXPECT_CALL((AddTimerMethod)&TimerQueue::AddTimer, (_, _, _)).Times(0);
+    dataClearImpl_->exitFlag_->store(true);
+    ClearDataRetryIds retryIds;
+    retryIds.clearFailedIds.emplace("shutdown-failure");
+    dataClearImpl_->RetryClearDataAsync({}, retryIds, 0);
+}
+
+TEST_F(WorkerOcServiceImplTest, ClearDataAsyncRetryDestructorWaitsForHandoffAndRejectsLateCallback)
+{
+    using AddTimerMethod =
+        Status (TimerQueue::*)(const uint64_t &, const std::function<void()>, TimerQueue::TimerImpl &);
+    using SubmitRetryMethod =
+        void (WorkerOcServiceClearDataFlow::*)(const ClearDataReqPb &, uint64_t, const ClearDataRetryIds &);
+    std::vector<std::function<void()>> timerCallbacks;
+    auto callbackRegistered = std::make_shared<std::promise<void>>();
+    auto callbackRegisteredFuture = callbackRegistered->get_future();
+    auto releaseCallback = std::make_shared<std::promise<void>>();
+    auto releaseCallbackFuture = releaseCallback->get_future().share();
+    auto poolTaskCompleted = std::make_shared<std::promise<void>>();
+    auto poolTaskCompletedFuture = poolTaskCompleted->get_future();
+    auto lifetime = dataClearImpl_->asyncRetryLifetime_;
+    auto *threadPool = dataClearImpl_->clearDataThreadPool_.get();
+    BINEXPECT_CALL((AddTimerMethod)&TimerQueue::AddTimer, (_, _, _))
+        .Times(2)
+        .WillRepeatedly(Invoke([&](const uint64_t &, const std::function<void()> callback, TimerQueue::TimerImpl &) {
+            timerCallbacks.emplace_back(std::move(callback));
+            return Status::OK();
+        }));
+    BINEXPECT_CALL((SubmitRetryMethod)&WorkerOcServiceClearDataFlow::SubmitRetryClearDataAsync, (_, _, _))
+        .WillOnce(Invoke([callbackRegistered, releaseCallbackFuture, threadPool, poolTaskCompleted](
+                             const ClearDataReqPb &, uint64_t, const ClearDataRetryIds &) {
+            callbackRegistered->set_value();
+            releaseCallbackFuture.wait();
+            threadPool->Execute([poolTaskCompleted] { poolTaskCompleted->set_value(); });
+        }));
+
+    ClearDataRetryIds retryIds;
+    retryIds.clearFailedIds.emplace("shutdown-failure");
+    dataClearImpl_->RetryClearDataAsync({}, retryIds, 0);
+    dataClearImpl_->RetryClearDataAsync({}, retryIds, 0);
+    ASSERT_EQ(timerCallbacks.size(), 2U);
+
+    auto callbackFuture = std::async(std::launch::async, timerCallbacks.front());
+    if (callbackRegisteredFuture.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+        releaseCallback->set_value();
+        callbackFuture.wait();
+        FAIL() << "timer callback did not reach the registered handoff point";
+        return;
+    }
+    auto clearDataFlow = std::move(dataClearImpl_);
+    auto destructorFuture =
+        std::async(std::launch::async, [clearDataFlow = std::move(clearDataFlow)]() mutable { clearDataFlow.reset(); });
+    bool stopping = false;
+    {
+        std::unique_lock<std::mutex> lock(lifetime->mutex);
+        stopping = lifetime->cv.wait_for(lock, std::chrono::seconds(1), [&lifetime] { return lifetime->stopping; });
+        if (stopping) {
+            EXPECT_EQ(lifetime->activeCallbacks, 1U);
+        }
+    }
+    if (!stopping) {
+        releaseCallback->set_value();
+        callbackFuture.wait();
+        destructorFuture.wait();
+        FAIL() << "destructor did not close the retry callback lifetime gate";
+        return;
+    }
+    EXPECT_EQ(destructorFuture.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+
+    timerCallbacks.back()();
+    releaseCallback->set_value();
+    callbackFuture.get();
+    ASSERT_EQ(poolTaskCompletedFuture.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    ASSERT_EQ(destructorFuture.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    destructorFuture.get();
+
+    std::lock_guard<std::mutex> lock(lifetime->mutex);
+    EXPECT_EQ(lifetime->activeCallbacks, 0U);
+}
+
+TEST_F(WorkerOcServiceImplTest, ClearDataAsyncRetryAddTimerFailureDoesNotSubmit)
+{
+    using AddTimerMethod =
+        Status (TimerQueue::*)(const uint64_t &, const std::function<void()>, TimerQueue::TimerImpl &);
+    using SubmitRetryMethod =
+        void (WorkerOcServiceClearDataFlow::*)(const ClearDataReqPb &, uint64_t, const ClearDataRetryIds &);
+    BINEXPECT_CALL((AddTimerMethod)&TimerQueue::AddTimer, (_, _, _))
+        .WillOnce(Return(Status(StatusCode::K_RUNTIME_ERROR, "timer unavailable")));
+    BINEXPECT_CALL((SubmitRetryMethod)&WorkerOcServiceClearDataFlow::SubmitRetryClearDataAsync, (_, _, _)).Times(0);
+
+    ClearDataRetryIds retryIds;
+    retryIds.clearFailedIds.emplace("timer-failure");
+    dataClearImpl_->RetryClearDataAsync({}, retryIds, 0);
 }
 
 TEST_F(WorkerOcServiceImplTest, NotifyRemoteGetRejectsAfterLocalScaleInStarts)
@@ -1037,15 +3231,14 @@ TEST_F(WorkerOcServiceImplTest, NotifyRemoteGetHoldsAdmissionUntilRequestReturns
     NotifyRemoteGetReqPb req;
     req.add_object_keys("admission-hold-object");
     NotifyRemoteGetRspPb rsp;
-    auto requestFuture = std::async(std::launch::async, [this, &req, &rsp] {
-        return impl_->NotifyRemoteGet(req, rsp);
-    });
+    auto requestFuture =
+        std::async(std::launch::async, [this, &req, &rsp] { return impl_->NotifyRemoteGet(req, rsp); });
     // Wait until the RPC hits the inject point - admission is acquired and held.
     const bool requestAdmitted = WaitForInjectPointExecuteCount(injectPoint, 1, schedulingTimeout);
 
     auto closeFuture = std::async(std::launch::async, [this, closeBudget] {
-        return impl_->gMigrateProc_->CloseIncomingMigrationAdmissionAndWait(
-            std::chrono::steady_clock::now() + closeBudget);
+        return impl_->gMigrateProc_->CloseIncomingMigrationAdmissionAndWait(std::chrono::steady_clock::now()
+                                                                            + closeBudget);
     });
     Status lateAdmission(K_RUNTIME_ERROR, "Migration admission gate did not close");
     const auto gateDeadline = std::chrono::steady_clock::now() + schedulingTimeout;
@@ -1082,16 +3275,15 @@ TEST_F(WorkerOcServiceImplTest, NotifyRemoteGetReturnsFailureWhenDrainTimesOut)
     NotifyRemoteGetReqPb req;
     req.add_object_keys("drain-timeout-object");
     NotifyRemoteGetRspPb rsp;
-    auto requestFuture = std::async(std::launch::async, [this, &req, &rsp] {
-        return impl_->NotifyRemoteGet(req, rsp);
-    });
+    auto requestFuture =
+        std::async(std::launch::async, [this, &req, &rsp] { return impl_->NotifyRemoteGet(req, rsp); });
     // Wait until the RPC hits the inject point - admission is acquired and held.
     const bool requestAdmitted = WaitForInjectPointExecuteCount(injectPoint, 1, schedulingTimeout);
 
     // Drain with an already-expired deadline so it times out immediately.
     auto closeFuture = std::async(std::launch::async, [this, closeBudget] {
-        return impl_->gMigrateProc_->CloseIncomingMigrationAdmissionAndWait(
-            std::chrono::steady_clock::now() + closeBudget);
+        return impl_->gMigrateProc_->CloseIncomingMigrationAdmissionAndWait(std::chrono::steady_clock::now()
+                                                                            + closeBudget);
     });
     // Wait for drain to time out.
     const auto closeStatus = closeFuture.get();

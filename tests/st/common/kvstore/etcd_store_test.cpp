@@ -15,6 +15,7 @@
  * Description: Test interface to ETCD
  */
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <condition_variable>
 #include <mutex>
@@ -39,6 +40,7 @@
 #include "datasystem/common/util/strings_util.h"
 #include "datasystem/common/log/log.h"
 #include "datasystem/common/util/random_data.h"
+#include "datasystem/common/util/raii.h"
 #include "datasystem/object_client.h"
 #include "datasystem/object/object_enum.h"
 #include "datasystem/common/kvstore/etcd/member_service_info.h"
@@ -58,6 +60,8 @@ DS_DECLARE_string(etcd_passphrase_path);
 
 namespace datasystem {
 namespace st {
+
+constexpr uint32_t TEST_LOCAL_FAILURE_TIMEOUT_S = 60;
 
 class EtcdStoreTest : public ExternalClusterTest {
 protected:
@@ -110,6 +114,18 @@ protected:
                 rc = db_->Put(defaultTable_, keyForReadOnly_, readOnlyValue_);
             }
         }
+    }
+
+    template <typename Predicate>
+    bool WaitForCondition(Predicate predicate)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        bool satisfied = predicate();
+        while (!satisfied && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            satisfied = predicate();
+        }
+        return satisfied;
     }
 
     void ReceivedEvents(mvccpb::Event &&event)
@@ -607,6 +623,11 @@ TEST_F(EtcdStoreTest, TestKeepAliveFailedDueToNetworkerFailure)
 
     // "return true" means networker failure.
     db_->SetCheckEtcdStateWhenNetworkFailedHandler([]() { return true; });
+    std::atomic<uint32_t> localIsolationCount{ 0 };
+    db_->SetLocalIsolationHandler([&localIsolationCount](const Status &status) {
+        EXPECT_TRUE(status.IsError()) << status.ToString();
+        localIsolationCount.fetch_add(1);
+    });
     LOG(INFO) << "Create a watcher for monitoring events";
     db_->SetEventHandler([this](mvccpb::Event &&event) { ReceivedEvents(std::move(event)); });
     DS_ASSERT_OK(db_->WatchEvents(tableName_, "keyA", 1));
@@ -619,6 +640,235 @@ TEST_F(EtcdStoreTest, TestKeepAliveFailedDueToNetworkerFailure)
     sleep(waitWriteFakeEventTimeS);
     int eventNum = 2;  // event1: put; event2: fake delete
     EXPECT_EQ(eventCount_, eventNum);
+    EXPECT_EQ(localIsolationCount.load(), 1ul);
+}
+
+TEST_F(EtcdStoreTest, TestKeepAliveGlobalEtcdFailureDoesNotReportLocalIsolation)
+{
+    FLAGS_node_timeout_s = 3;  // node timeout is 3 s
+    FLAGS_node_dead_timeout_s = TEST_LOCAL_FAILURE_TIMEOUT_S;
+    FLAGS_auto_del_dead_node = true;
+    datasystem::inject::Set("EtcdStore.LaunchKeepAliveThreads.loopQuickly", "call(0)");
+    InitTestEtcdInstance();
+    ASSERT_TRUE(db_ != nullptr && tableCreated_);
+
+    watchKey_.push_back("keyA1");
+    watchValue_.push_back("pass");
+
+    db_->SetCheckEtcdStateWhenNetworkFailedHandler([]() { return false; });
+    std::atomic<uint32_t> localIsolationCount{ 0 };
+    db_->SetLocalIsolationHandler([&localIsolationCount](const Status &status) {
+        EXPECT_TRUE(status.IsOk()) << status.ToString();
+        localIsolationCount.fetch_add(1);
+    });
+    LOG(INFO) << "Create a watcher for monitoring events";
+    db_->SetEventHandler([this](mvccpb::Event &&event) { ReceivedEvents(std::move(event)); });
+    DS_ASSERT_OK(db_->WatchEvents(tableName_, "keyA", 1));
+    DS_ASSERT_OK(db_->InitKeepAlive(tableName_, watchKey_[0], false));
+    sleep(1);  // wait etcd notify new event before shutdown.
+    auto externalCluster = dynamic_cast<ExternalCluster *>(cluster_.get());
+    inject::Set("etcd.sendrpc", "call(2000)");
+    DS_ASSERT_OK(externalCluster->ShutdownEtcds());
+    int waitRetryTimeS = 5;
+    sleep(waitRetryTimeS);
+    int eventNum = 1;  // event1: put; no fake delete for global etcd failure.
+    EXPECT_EQ(eventCount_, eventNum);
+    EXPECT_EQ(localIsolationCount.load(), 0ul);
+}
+
+TEST_F(EtcdStoreTest, TestKeepAliveGlobalEtcdRecoveryDoesNotTriggerLocalRecovery)
+{
+    constexpr char kLeaseExpiredInject[] = "GetLeaseExpiredMs";
+    constexpr char kFailurePauseInject[] = "EtcdStore.ProcessKeepAliveFailure.beforeMarkTimeout";
+    constexpr char kRenewalInject[] = "EtcdKeepAlive.SendKeepAliveMessage";
+
+    std::atomic<uint32_t> localIsolationCount{ 0 };
+    std::atomic<uint32_t> localRecoveryCount{ 0 };
+    bool dbClosed = false;
+    Raii cleanup([&]() {
+        (void)inject::Clear(kFailurePauseInject);
+        (void)inject::Clear(kRenewalInject);
+        (void)inject::Clear(kLeaseExpiredInject);
+        if (!dbClosed && db_ != nullptr) {
+            db_->Close();
+            dbClosed = true;
+        }
+    });
+
+    FLAGS_node_timeout_s = 5;
+    FLAGS_node_dead_timeout_s = TEST_LOCAL_FAILURE_TIMEOUT_S;
+    FLAGS_auto_del_dead_node = true;
+    DS_ASSERT_OK(inject::Set(kLeaseExpiredInject, "call(1000)"));
+    DS_ASSERT_OK(inject::Set(kFailurePauseInject, "pause"));
+    DS_ASSERT_OK(inject::Set(kRenewalInject, "call()"));
+
+    InitTestEtcdInstance();
+    ASSERT_TRUE(db_ != nullptr && tableCreated_);
+    db_->SetCheckEtcdStateWhenNetworkFailedHandler([]() { return false; });
+    db_->SetLocalIsolationHandler([&localIsolationCount](const Status &) { localIsolationCount.fetch_add(1); });
+    db_->SetLocalRecoveryHandler([&localRecoveryCount] { localRecoveryCount.fetch_add(1); });
+    DS_ASSERT_OK(db_->InitKeepAlive(tableName_, "global-outage-recovery-key", false));
+
+    auto *externalCluster = dynamic_cast<ExternalCluster *>(cluster_.get());
+    ASSERT_NE(externalCluster, nullptr);
+    const uint64_t failurePauseBaseline = inject::GetExecuteCount(kFailurePauseInject);
+    DS_ASSERT_OK(externalCluster->ShutdownEtcds());
+
+    ASSERT_TRUE(WaitForCondition([&]() { return inject::GetExecuteCount(kFailurePauseInject) > failurePauseBaseline; }))
+        << "keepalive did not reach the paused global-outage classification";
+
+    DS_ASSERT_OK(inject::Clear(kRenewalInject));
+    DS_ASSERT_OK(inject::Set(kRenewalInject, "pause"));
+    const uint64_t renewalPauseBaseline = inject::GetExecuteCount(kRenewalInject);
+    DS_ASSERT_OK(externalCluster->StartEtcdCluster());
+    DS_ASSERT_OK(inject::Clear(kFailurePauseInject));
+
+    ASSERT_TRUE(WaitForCondition([&]() { return inject::GetExecuteCount(kRenewalInject) > renewalPauseBaseline; }))
+        << "recreated keepalive did not reach its paused first renewal";
+
+    const int64_t rebuiltLeaseId = db_->CheckLeaseId();
+    std::unique_ptr<GrpcSession<etcdserverpb::Lease>> leaseSession;
+    DS_ASSERT_OK(GrpcSession<etcdserverpb::Lease>::CreateSession(FLAGS_etcd_address, leaseSession));
+    auto getLeaseTtl = [&](int64_t &ttl) {
+        etcdserverpb::LeaseTimeToLiveRequest request;
+        request.set_id(rebuiltLeaseId);
+        etcdserverpb::LeaseTimeToLiveResponse response;
+        auto rc = leaseSession->SendRpc("LeaseTimeToLive", request, response,
+                                        &etcdserverpb::Lease::Stub::LeaseTimeToLive, "", 0, 1000);
+        if (rc.IsOk() && response.id() == rebuiltLeaseId) {
+            ttl = response.ttl();
+        }
+        return rc;
+    };
+
+    int64_t ttlBeforeRenewal = FLAGS_node_timeout_s;
+    ASSERT_TRUE(WaitForCondition(
+        [&]() { return getLeaseTtl(ttlBeforeRenewal).IsOk() && ttlBeforeRenewal <= FLAGS_node_timeout_s - 2; }));
+    ASSERT_GT(ttlBeforeRenewal, 0);
+
+    DS_ASSERT_OK(inject::Clear(kRenewalInject));
+    int64_t ttlAfterRenewal = ttlBeforeRenewal;
+    ASSERT_TRUE(WaitForCondition([&]() {
+        return getLeaseTtl(ttlAfterRenewal).IsOk() && ttlAfterRenewal > ttlBeforeRenewal;
+    })) << "rebuilt lease TTL did not increase after first renewal";
+    leaseSession->Shutdown();
+    db_->Close();
+    dbClosed = true;
+    EXPECT_EQ(localIsolationCount.load(), 0U);
+    EXPECT_EQ(localRecoveryCount.load(), 0U);
+}
+
+TEST_F(EtcdStoreTest, TestKeepAliveLocalIsolationRecoveryTriggersLocalRecoveryOnce)
+{
+    constexpr char kLeaseExpiredInject[] = "GetLeaseExpiredMs";
+    constexpr char kKeepAliveFailureInject[] = "EtcdKeepAlive.SendKeepAliveMessage";
+    constexpr char kQuickRetryInject[] = "EtcdStore.LaunchKeepAliveThreads.loopQuickly";
+    constexpr char kConfirmDelayInject[] = "EtcdStore.ProcessKeepAliveFailure.beforeMarkTimeout";
+
+    std::atomic<uint32_t> localIsolationCount{ 0 };
+    std::atomic<uint32_t> localRecoveryCount{ 0 };
+    bool dbClosed = false;
+    Raii cleanup([&]() {
+        (void)inject::Clear(kKeepAliveFailureInject);
+        (void)inject::Clear(kLeaseExpiredInject);
+        (void)inject::Clear(kQuickRetryInject);
+        (void)inject::Clear(kConfirmDelayInject);
+        if (!dbClosed && db_ != nullptr) {
+            db_->Close();
+            dbClosed = true;
+        }
+    });
+
+    FLAGS_node_timeout_s = 3;
+    FLAGS_node_dead_timeout_s = TEST_LOCAL_FAILURE_TIMEOUT_S;
+    FLAGS_auto_del_dead_node = true;
+    DS_ASSERT_OK(inject::Set(kKeepAliveFailureInject, "3*return(K_RPC_UNAVAILABLE)->call()"));
+    DS_ASSERT_OK(inject::Set(kLeaseExpiredInject, "call(1000)"));
+    DS_ASSERT_OK(inject::Set(kQuickRetryInject, "call(0)"));
+    DS_ASSERT_OK(inject::Set(kConfirmDelayInject, "1*sleep(1100)->call()"));
+
+    InitTestEtcdInstance();
+    ASSERT_TRUE(db_ != nullptr && tableCreated_);
+    db_->SetCheckEtcdStateWhenNetworkFailedHandler([]() { return true; });
+    db_->SetLocalIsolationHandler([&localIsolationCount](const Status &) { localIsolationCount.fetch_add(1); });
+    db_->SetLocalRecoveryHandler([&localRecoveryCount] { localRecoveryCount.fetch_add(1); });
+    db_->SetEventHandler([](mvccpb::Event &&) {});
+    DS_ASSERT_OK(db_->InitKeepAlive(tableName_, "local-isolation-recovery-key", false));
+
+    ASSERT_TRUE(WaitForCondition([&]() { return localIsolationCount.load() == 1U; }));
+    ASSERT_GE(inject::GetExecuteCount(kKeepAliveFailureInject), 3U);
+
+    ASSERT_TRUE(WaitForCondition([&]() { return localRecoveryCount.load() == 1U; }));
+
+    const uint64_t renewalBaseline = inject::GetExecuteCount(kKeepAliveFailureInject);
+    ASSERT_TRUE(WaitForCondition([&]() { return inject::GetExecuteCount(kKeepAliveFailureInject) > renewalBaseline; }))
+        << "keepalive did not complete a second renewal after local recovery";
+    db_->Close();
+    dbClosed = true;
+    EXPECT_EQ(localIsolationCount.load(), 1U);
+    EXPECT_EQ(localRecoveryCount.load(), 1U);
+}
+
+TEST_F(EtcdStoreTest, TestKeepAliveLocalIsolationRecoverySurvivesFirstLeaseRebuildFailure)
+{
+    constexpr char kLeaseExpiredInject[] = "GetLeaseExpiredMs";
+    constexpr char kKeepAliveFailureInject[] = "EtcdKeepAlive.SendKeepAliveMessage";
+    constexpr char kQuickRetryInject[] = "EtcdStore.LaunchKeepAliveThreads.loopQuickly";
+    constexpr char kLeaseRebuildFailureInject[] = "GetLeaseIDWithReconnectIfError.Error";
+    constexpr char kConfirmDelayInject[] = "EtcdStore.ProcessKeepAliveFailure.beforeMarkTimeout";
+
+    std::atomic<uint32_t> localIsolationCount{ 0 };
+    std::atomic<uint32_t> localRecoveryCount{ 0 };
+    std::atomic<bool> rebuildFailureInstalled{ false };
+    bool dbClosed = false;
+    Raii cleanup([&]() {
+        (void)inject::Clear(kLeaseRebuildFailureInject);
+        (void)inject::Clear(kKeepAliveFailureInject);
+        (void)inject::Clear(kLeaseExpiredInject);
+        (void)inject::Clear(kQuickRetryInject);
+        (void)inject::Clear(kConfirmDelayInject);
+        if (!dbClosed && db_ != nullptr) {
+            db_->Close();
+            dbClosed = true;
+        }
+    });
+
+    FLAGS_node_timeout_s = 3;
+    FLAGS_node_dead_timeout_s = TEST_LOCAL_FAILURE_TIMEOUT_S;
+    FLAGS_auto_del_dead_node = true;
+    DS_ASSERT_OK(inject::Set(kKeepAliveFailureInject, "3*return(K_RPC_UNAVAILABLE)->call()"));
+    DS_ASSERT_OK(inject::Set(kLeaseExpiredInject, "call(1000)"));
+    DS_ASSERT_OK(inject::Set(kQuickRetryInject, "call(0)"));
+    DS_ASSERT_OK(inject::Set(kConfirmDelayInject, "1*sleep(1100)->call()"));
+
+    InitTestEtcdInstance();
+    ASSERT_TRUE(db_ != nullptr && tableCreated_);
+    db_->SetCheckEtcdStateWhenNetworkFailedHandler([]() { return true; });
+    db_->SetLocalIsolationHandler([&](const Status &) {
+        auto rc = inject::Set(kLeaseRebuildFailureInject, "1*return(K_RPC_UNAVAILABLE)");
+        rebuildFailureInstalled.store(rc.IsOk());
+        localIsolationCount.fetch_add(1);
+    });
+    db_->SetLocalRecoveryHandler([&localRecoveryCount] { localRecoveryCount.fetch_add(1); });
+    db_->SetEventHandler([](mvccpb::Event &&) {});
+    DS_ASSERT_OK(db_->InitKeepAlive(tableName_, "local-isolation-rebuild-retry-key", false));
+
+    ASSERT_TRUE(WaitForCondition([&]() { return localIsolationCount.load() == 1U; }));
+    ASSERT_TRUE(rebuildFailureInstalled.load());
+
+    ASSERT_TRUE(WaitForCondition([&]() { return inject::GetExecuteCount(kLeaseRebuildFailureInject) == 1U; }))
+        << "the first lease rebuild was not forced to fail";
+
+    ASSERT_TRUE(WaitForCondition([&]() {
+        return inject::GetExecuteCount(kKeepAliveFailureInject) >= 4U && localRecoveryCount.load() == 1U;
+    })) << "keepalive did not renew after the failed lease rebuild";
+
+    const uint64_t renewalBaseline = inject::GetExecuteCount(kKeepAliveFailureInject);
+    ASSERT_TRUE(WaitForCondition([&]() { return inject::GetExecuteCount(kKeepAliveFailureInject) > renewalBaseline; }));
+    db_->Close();
+    dbClosed = true;
+    EXPECT_EQ(localIsolationCount.load(), 1U);
+    EXPECT_EQ(localRecoveryCount.load(), 1U);
 }
 
 TEST_F(EtcdStoreTest, LEVEL1_TestRetrieveEvent)

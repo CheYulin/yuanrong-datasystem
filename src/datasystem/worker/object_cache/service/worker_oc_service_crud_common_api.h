@@ -313,7 +313,7 @@ public:
      * @param[in] objectKV The object to clear and its corresponding objectKey.
      * @return Status of the call.
      */
-    Status ClearObject(ObjectKV &objectKV);
+    Status ClearObject(ObjectKV &objectKV, bool deletePersistenceObject = false);
 
     /**
      * @brief Unlock a batch of objects.

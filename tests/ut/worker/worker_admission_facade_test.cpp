@@ -1,0 +1,138 @@
+/**
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * Description: Worker admission facade tests.
+ */
+#include "datasystem/worker/runtime/worker_admission_facade.h"
+
+#include <chrono>
+#include <future>
+
+#include "gtest/gtest.h"
+
+namespace datasystem::worker {
+namespace {
+WorkerRunningEvidence CompleteEvidence()
+{
+    WorkerRunningEvidence evidence;
+    evidence.membershipReady = true;
+    evidence.topologyReady = true;
+    evidence.metadataReady = true;
+    evidence.slotReady = true;
+    evidence.ownershipReady = true;
+    evidence.resourceReady = true;
+    return evidence;
+}
+
+TEST(WorkerAdmissionFacadeTest, NormalGuardRejectsPendingTransition)
+{
+    WorkerRuntimeStateManager state;
+    ASSERT_TRUE(state.TryMarkRunning(CompleteEvidence(), "ready"));
+    WorkerAdmissionFacade facade(state);
+
+    state.MarkLocalIsolated(WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION, "local");
+
+    EXPECT_FALSE(facade.TryAcquireNormalGuard("Put").has_value());
+    EXPECT_FALSE(facade.CheckRecoveryRpc("RecoverMetadata").IsOk());
+}
+
+TEST(WorkerAdmissionFacadeTest, RecoveryRpcAllowedInRunningAndRecovering)
+{
+    WorkerRuntimeStateManager state;
+    WorkerAdmissionFacade facade(state);
+
+    ASSERT_TRUE(state.TryMarkRunning(CompleteEvidence(), "ready"));
+    EXPECT_TRUE(facade.CheckRecoveryRpc("PushMetaToWorker").IsOk());
+
+    state.MarkRecovering(WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION, "recovering");
+
+    EXPECT_TRUE(facade.CheckRecoveryRpc("RecoverMetadata").IsOk());
+    EXPECT_FALSE(facade.CheckNormalWrite("Put").IsOk());
+}
+
+TEST(WorkerAdmissionFacadeTest, NormalReadGuardUsesFacadeBoundary)
+{
+    WorkerRuntimeStateManager state;
+    ASSERT_TRUE(state.TryMarkRunning(CompleteEvidence(), "ready"));
+    WorkerAdmissionFacade facade(state);
+
+    {
+        std::optional<WorkerRuntimeStateReadGuard> guard;
+        EXPECT_TRUE(facade.AcquireNormalReadGuard("GetObjectRemote", guard).IsOk());
+        ASSERT_TRUE(guard.has_value());
+        EXPECT_EQ(guard->GetSnapshot().mode, WorkerServiceMode::RUNNING);
+    }
+
+    std::optional<WorkerRuntimeStateReadGuard> blocked;
+    state.MarkLocalIsolated(WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION, "local");
+    auto rc = facade.AcquireNormalReadGuard("GetObjectRemote", blocked);
+    EXPECT_FALSE(rc.IsOk());
+    EXPECT_FALSE(blocked.has_value());
+}
+
+TEST(WorkerAdmissionFacadeTest, AdmissionGuardHoldsRuntimeReadWindowForWrites)
+{
+    WorkerRuntimeStateManager state;
+    ASSERT_TRUE(state.TryMarkRunning(CompleteEvidence(), "ready"));
+    WorkerAdmissionFacade facade(state);
+
+    std::optional<WorkerRuntimeStateReadGuard> guard;
+    ASSERT_TRUE(facade.AcquireGuard(WorkerAdmissionKind::NORMAL_WRITE, "Create", guard).IsOk());
+    ASSERT_TRUE(guard.has_value());
+    EXPECT_EQ(guard->GetSnapshot().mode, WorkerServiceMode::RUNNING);
+
+    auto transition = std::async(std::launch::async, [&state]() {
+        state.MarkLocalIsolated(WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION, "local");
+    });
+    EXPECT_EQ(transition.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    guard.reset();
+
+    EXPECT_EQ(transition.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_EQ(state.GetSnapshot().mode, WorkerServiceMode::LOCAL_ISOLATED);
+}
+
+TEST(WorkerAdmissionFacadeTest, TransitionPendingAllowsControlPlaneAcquireGuardWithoutHoldingReadWindow)
+{
+    WorkerRuntimeStateManager state;
+    ASSERT_TRUE(state.TryMarkRunning(CompleteEvidence(), "ready"));
+    WorkerAdmissionFacade facade(state);
+
+    std::optional<WorkerRuntimeStateReadGuard> writeGuard;
+    ASSERT_TRUE(facade.AcquireGuard(WorkerAdmissionKind::NORMAL_WRITE, "Create", writeGuard).IsOk());
+    ASSERT_TRUE(writeGuard.has_value());
+
+    auto transition = std::async(std::launch::async, [&state]() {
+        state.MarkLocalIsolated(WorkerIsolationReason::CONTROL_BACKEND_LOCAL_ISOLATION, "local");
+    });
+    ASSERT_EQ(transition.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+
+    for (auto kind :
+         { WorkerAdmissionKind::DIAGNOSTIC_RPC, WorkerAdmissionKind::CLEANUP_RPC, WorkerAdmissionKind::RECOVERY_RPC }) {
+        std::optional<WorkerRuntimeStateReadGuard> controlGuard;
+        auto rc = facade.AcquireGuard(kind, "control-plane", controlGuard);
+        EXPECT_TRUE(rc.IsOk()) << rc.ToString();
+        EXPECT_FALSE(controlGuard.has_value());
+    }
+
+    std::optional<WorkerRuntimeStateReadGuard> normalGuard;
+    auto rc = facade.AcquireGuard(WorkerAdmissionKind::NORMAL_READ, "Get", normalGuard);
+    EXPECT_EQ(rc.GetCode(), K_NOT_READY);
+    EXPECT_FALSE(normalGuard.has_value());
+
+    writeGuard.reset();
+    EXPECT_EQ(transition.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_EQ(state.GetSnapshot().mode, WorkerServiceMode::LOCAL_ISOLATED);
+}
+}  // namespace
+}  // namespace datasystem::worker

@@ -57,6 +57,7 @@ ds_cc_test(
     srcs = ["client_dfx_test.cpp"],
     tags = ["manual"],
     deps = OC_CLIENT_COMMON_DEPS + [
+        "//src/datasystem/client:client_transport",
         "//src/datasystem/client/object_cache/client_worker_api:iclient_worker_api",
         "//src/datasystem/common/kvstore/etcd:etcd_store",
         "//src/datasystem/common/rpc:rpc_auth_key_manager",

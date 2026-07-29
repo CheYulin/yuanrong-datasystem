@@ -1,0 +1,193 @@
+load("//bazel:build_defs.bzl", "ds_cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+ds_cc_library(
+    name = "worker_runtime_types",
+    hdrs = [
+        "worker_runtime_types.h",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_runtime_state",
+    srcs = [
+        "worker_runtime_state.cpp",
+    ],
+    hdrs = [
+        "worker_runtime_state.h",
+    ],
+    deps = [
+        ":worker_recovery_evidence",
+        ":worker_runtime_types",
+        "//src/datasystem/common/inject:common_inject",
+        "//src/datasystem/common/metrics:common_metrics",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_recovery_evidence",
+    srcs = [
+        "worker_recovery_evidence.cpp",
+    ],
+    hdrs = [
+        "worker_recovery_evidence.h",
+    ],
+    deps = [
+        ":worker_runtime_types",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_service_admission",
+    srcs = [
+        "worker_service_admission.cpp",
+    ],
+    hdrs = [
+        "worker_service_admission.h",
+    ],
+    deps = [
+        ":worker_runtime_state",
+        ":worker_runtime_types",
+        "//src/datasystem/common/util:status_helper",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_admission_facade",
+    srcs = [
+        "worker_admission_facade.cpp",
+    ],
+    hdrs = [
+        "worker_admission_facade.h",
+    ],
+    deps = [
+        ":worker_service_admission",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_runtime_facade",
+    srcs = [
+        "worker_runtime_facade.cpp",
+    ],
+    hdrs = [
+        "worker_runtime_facade.h",
+    ],
+    deps = [
+        ":worker_admission_facade",
+        ":worker_recovery_controller",
+        ":worker_recovery_evidence",
+        ":worker_runtime_types",
+        "//src/datasystem/cluster:cluster_topology",
+        "//src/datasystem/common/util:status_helper",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_topology_runtime",
+    srcs = [
+        "worker_topology_runtime.cpp",
+    ],
+    hdrs = [
+        "worker_topology_runtime.h",
+    ],
+    deps = [
+        "//src/datasystem/cluster:cluster_topology",
+        "//src/datasystem/common/util:status_helper",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_recovery_controller",
+    srcs = [
+        "worker_recovery_controller.cpp",
+    ],
+    hdrs = [
+        "worker_recovery_controller.h",
+    ],
+    deps = [
+        ":worker_recovery_evidence",
+        ":worker_runtime_state",
+        "//src/datasystem/common/inject:common_inject",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_recovery_evidence_tracker",
+    srcs = [
+        "worker_recovery_evidence_tracker.cpp",
+    ],
+    hdrs = [
+        "worker_recovery_evidence_tracker.h",
+    ],
+    deps = [
+        ":worker_recovery_evidence",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_isolation_coordinator",
+    srcs = [
+        "worker_isolation_coordinator.cpp",
+    ],
+    hdrs = [
+        "worker_isolation_coordinator.h",
+    ],
+    deps = [
+        ":worker_runtime_facade",
+        ":worker_runtime_state",
+        "//src/datasystem/common/inject:common_inject",
+        "//src/datasystem/common/log:common_log",
+        "//src/datasystem/common/util:status_helper",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_control_backend_probe",
+    srcs = [
+        "worker_control_backend_probe.cpp",
+    ],
+    hdrs = [
+        "worker_control_backend_probe.h",
+    ],
+    deps = [
+        "//src/datasystem/cluster:cluster_control_backend_state",
+        "//src/datasystem/common/log:common_log",
+        "//src/datasystem/common/rpc:rpc_message",
+        "//src/datasystem/common/util:status_helper",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_runtime_core",
+    deps = [
+        ":worker_admission_facade",
+        ":worker_isolation_coordinator",
+        ":worker_recovery_controller",
+        ":worker_recovery_evidence",
+        ":worker_recovery_evidence_tracker",
+        ":worker_runtime_facade",
+        ":worker_runtime_state",
+        ":worker_runtime_types",
+        ":worker_service_admission",
+        ":worker_topology_runtime",
+    ],
+)
+
+ds_cc_library(
+    name = "worker_topology_phase_callbacks",
+    srcs = [
+        "worker_topology_phase_callbacks.cpp",
+    ],
+    hdrs = [
+        "worker_topology_phase_callbacks.h",
+    ],
+    deps = [
+        "//src/datasystem/cluster:cluster_topology",
+        "//src/datasystem/common/log:common_log",
+        "//src/datasystem/common/rpc:api_deadline",
+        "//src/datasystem/common/rpc:rpc_stub_cache_mgr",
+        "//src/datasystem/common/util:status_helper",
+    ],
+)

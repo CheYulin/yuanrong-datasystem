@@ -68,8 +68,8 @@ public:
         return Status::OK();
     }
 
-    Status Save(const std::string &, uint64_t, int64_t, const std::shared_ptr<std::iostream> &, uint64_t,
-                WriteMode, uint32_t) override
+    Status Save(const std::string &, uint64_t, int64_t, const std::shared_ptr<std::iostream> &, uint64_t, WriteMode,
+                uint32_t) override
     {
         return Status::OK();
     }
@@ -133,6 +133,25 @@ std::shared_ptr<FakePersistenceApi> BuildSingleMetaPreloadApi(const std::string 
             auto content = std::make_shared<std::stringstream>();
             (*content) << "payload";
             return callback(meta, content);
+        });
+}
+
+std::shared_ptr<FakePersistenceApi> BuildTwoMetaPreloadApi(const std::string &expectedSourceWorker,
+                                                           uint32_t expectedSlot, const std::string &firstObjectKey,
+                                                           const std::string &secondObjectKey)
+{
+    return std::make_shared<FakePersistenceApi>(
+        [expectedSourceWorker, expectedSlot, firstObjectKey, secondObjectKey](
+            const std::string &sourceWorkerAddress, uint32_t slotId, const SlotPreloadCallback &callback) {
+            EXPECT_EQ(sourceWorkerAddress, expectedSourceWorker);
+            EXPECT_EQ(slotId, expectedSlot);
+            for (const auto &objectKey : { firstObjectKey, secondObjectKey }) {
+                SlotPreloadMeta meta{ objectKey, 1, WriteMode::WRITE_THROUGH_L2_CACHE, 11 };
+                auto content = std::make_shared<std::stringstream>();
+                (*content) << "payload";
+                RETURN_IF_NOT_OK(callback(meta, content));
+            }
+            return Status::OK();
         });
 }
 
@@ -433,9 +452,7 @@ bool WaitUntil(const std::function<bool()> &predicate, int timeoutMs = WAIT_TIME
 
 class FakeSlotRecoveryStore : public SlotRecoveryStore {
 public:
-    FakeSlotRecoveryStore() : SlotRecoveryStore(nullptr)
-    {
-    }
+    FakeSlotRecoveryStore() = default;
 
     Status Init() override
     {
@@ -456,6 +473,9 @@ public:
     Status ListIncidents(std::vector<std::pair<std::string, SlotRecoveryInfoPb>> &incidents) override
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (listIncidentsStatus_.IsError()) {
+            return listIncidentsStatus_;
+        }
         incidents.clear();
         for (const auto &entry : incidents_) {
             incidents.emplace_back(entry.first, entry.second);
@@ -529,6 +549,12 @@ public:
         ++versions_[failedWorker];
     }
 
+    void SetListIncidentsStatus(const Status &status)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        listIncidentsStatus_ = status;
+    }
+
     bool HasDeletedSnapshot(const std::string &failedWorker)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -570,6 +596,7 @@ private:
     std::unordered_map<std::string, std::vector<SlotRecoveryInfoPb>> histories_;
     std::unordered_map<std::string, SlotRecoveryInfoPb> deletedSnapshots_;
     std::unordered_map<std::string, int> createCount_;
+    Status listIncidentsStatus_;
 };
 
 class SlotRecoveryManagerTestHelper : public SlotRecoveryManager {
@@ -582,6 +609,7 @@ public:
     }
 
     using SlotRecoveryManager::BuildPlannedLocalRestartTasks;
+    using SlotRecoveryManager::BuildSlotRecoveryEvidenceReportFromStore;
     using SlotRecoveryManager::ClaimLocalTask;
     using SlotRecoveryManager::CollectInheritedTasks;
     using SlotRecoveryManager::CollectLocalRestartPlan;
@@ -605,7 +633,7 @@ public:
         auto &topologyRuntime = GetObjectTopologyTestRuntime();
         RETURN_IF_NOT_OK(topologyRuntime.Init(localAddress_));
         return SlotRecoveryManager::Init(localAddress_, topologyRuntime.Engine()->Membership(), std::move(persistApi),
-                                         nullptr, nullptr, metadataRecoveryManager);
+                                         nullptr, store_, metadataRecoveryManager);
     }
 
     void SetActiveWorkers(const std::vector<std::string> &workers)
@@ -641,12 +669,6 @@ public:
     }
 
 private:
-    std::shared_ptr<SlotRecoveryStore> CreateStore(datasystem::EtcdStore *etcdStore) const override
-    {
-        (void)etcdStore;
-        return store_;
-    }
-
     HostPort localAddress_;
     std::shared_ptr<SlotRecoveryStore> store_;
     std::vector<std::string> activeWorkers_;
@@ -659,6 +681,7 @@ class SlotRecoveryTest : public testing::Test {
 public:
     void SetUp() override
     {
+        oldL2CacheType_ = FLAGS_l2_cache_type;
         FLAGS_l2_cache_type = "distributed_disk";
         BINEXPECT_CALL(&datasystem::memory::Allocator::GetMemoryAvailToHighWater, ())
             .WillRepeatedly(Return(std::numeric_limits<uint64_t>::max()));
@@ -667,8 +690,12 @@ public:
     void TearDown() override
     {
         datasystem::inject::ClearAll();
+        FLAGS_l2_cache_type = oldL2CacheType_;
         RELEASE_STUBS
     }
+
+private:
+    std::string oldL2CacheType_;
 };
 
 TEST_F(SlotRecoveryTest, LocalFailureMarksTaskFailed)
@@ -701,6 +728,89 @@ TEST_F(SlotRecoveryTest, LocalFailureMarksTaskFailed)
     EXPECT_FALSE(manager.GetExecutedTasks().empty());
 
     manager.Shutdown();
+}
+
+TEST_F(SlotRecoveryTest, SlotRecoveryEvidenceFromStoreIsReadyWhenAllIncidentsComplete)
+{
+    auto store = std::make_shared<FakeSlotRecoveryStore>();
+    auto completedTask = BuildSingleSlotTask("worker1", 0);
+    completedTask.set_owner_worker("127.0.0.1:4002");
+    completedTask.set_task_status(RecoveryTaskPb::COMPLETED);
+    store->SeedIncident("worker1", BuildIncident({ completedTask }));
+
+    SlotRecoveryManagerTestHelper manager(HostPort("127.0.0.1", 4002), store);
+    DS_ASSERT_OK(manager.InitForTest());
+
+    auto report = manager.BuildSlotRecoveryEvidenceReportFromStore();
+
+    EXPECT_TRUE(report.evidence.slotReady);
+    EXPECT_NE(report.detail.find("slot_incidents_ready=1/1"), std::string::npos);
+}
+
+TEST_F(SlotRecoveryTest, SlotRecoveryEvidenceFromStoreBlocksWhenAnyIncidentIsUnfinishedOrFailed)
+{
+    auto store = std::make_shared<FakeSlotRecoveryStore>();
+    auto completedTask = BuildSingleSlotTask("worker1", 0);
+    completedTask.set_owner_worker("127.0.0.1:4002");
+    completedTask.set_task_status(RecoveryTaskPb::COMPLETED);
+    store->SeedIncident("worker1", BuildIncident({ completedTask }));
+
+    auto failedTask = BuildSingleSlotTask("worker2", 1);
+    failedTask.set_owner_worker("127.0.0.1:4002");
+    failedTask.set_task_status(RecoveryTaskPb::FAILED);
+    store->SeedIncident("worker2", BuildIncident({ failedTask }));
+
+    auto pendingTask = BuildSingleSlotTask("worker3", 2);
+    pendingTask.set_owner_worker("127.0.0.1:4002");
+    pendingTask.set_task_status(RecoveryTaskPb::PENDING);
+    store->SeedIncident("worker3", BuildIncident({ pendingTask }));
+
+    SlotRecoveryManagerTestHelper manager(HostPort("127.0.0.1", 4002), store);
+    DS_ASSERT_OK(manager.InitForTest());
+
+    auto report = manager.BuildSlotRecoveryEvidenceReportFromStore();
+
+    EXPECT_FALSE(report.evidence.slotReady);
+    EXPECT_NE(report.detail.find("slot_incidents_ready=1/3"), std::string::npos);
+    EXPECT_NE(report.detail.find("slot_incidents_failed=1"), std::string::npos);
+}
+
+TEST_F(SlotRecoveryTest, SlotRecoveryEvidenceIsReadyWhenFeatureDisabled)
+{
+    SlotRecoveryManager manager;
+
+    auto report = manager.BuildSlotRecoveryEvidenceReportFromStore();
+
+    EXPECT_TRUE(report.evidence.slotReady);
+    EXPECT_NE(report.detail.find("slot_recovery_disabled"), std::string::npos);
+}
+
+TEST_F(SlotRecoveryTest, SlotRecoveryEvidenceIsReadyWhenFeatureDisabledWithBackendStore)
+{
+    FLAGS_l2_cache_type = "obs";
+    auto store = std::make_shared<FakeSlotRecoveryStore>();
+    store->SetListIncidentsStatus(Status(K_RUNTIME_ERROR, __LINE__, __FILE__, "store should not be queried"));
+    SlotRecoveryManagerTestHelper manager(HostPort("127.0.0.1", 4002), store);
+    DS_ASSERT_OK(manager.InitForTest());
+
+    auto report = manager.BuildSlotRecoveryEvidenceReportFromStore();
+
+    EXPECT_TRUE(report.evidence.slotReady);
+    EXPECT_NE(report.detail.find("slot_recovery_disabled"), std::string::npos);
+}
+
+TEST_F(SlotRecoveryTest, SlotRecoveryEvidenceIsReadyWhenIncidentTableIsAbsent)
+{
+    auto store = std::make_shared<FakeSlotRecoveryStore>();
+    store->SetListIncidentsStatus(
+        Status(K_RUNTIME_ERROR, __LINE__, __FILE__, "The table does not exist. tableName:/datasystem/slot_recovery"));
+    SlotRecoveryManagerTestHelper manager(HostPort("127.0.0.1", 4002), store);
+    DS_ASSERT_OK(manager.InitForTest());
+
+    auto report = manager.BuildSlotRecoveryEvidenceReportFromStore();
+
+    EXPECT_TRUE(report.evidence.slotReady);
+    EXPECT_NE(report.detail.find("slot_recovery_table_absent"), std::string::npos);
 }
 
 TEST_F(SlotRecoveryTest, MultiFailureIsolation)
@@ -868,8 +978,7 @@ TEST_F(SlotRecoveryTest, ExcludesBlockedSlotsOnRestart)
         for (const auto &task : snapshot.recovery_tasks()) {
             if (task.failed_worker() == "127.0.0.1:7451" && task.owner_worker() == "127.0.0.1:7451"
                 && task.task_status() == RecoveryTaskPb::PENDING) {
-                if (task.source_worker() == "127.0.0.1:7451"
-                    && CollectSlots(task) == BuildSlotSetExcluding({ 1, 2 })) {
+                if (task.source_worker() == "127.0.0.1:7451" && CollectSlots(task) == BuildSlotSetExcluding({ 1, 2 })) {
                     sawSelfFillTask = true;
                 } else if (task.source_worker() == "127.0.0.1:7455"
                            && CollectSlots(task) == (std::set<uint32_t>{ 2 })) {
@@ -1214,6 +1323,151 @@ TEST_F(SlotRecoveryTest, ExecuteRecoveryTaskDeferOnRpcUnavailable)
     DS_ASSERT_OK(manager.InitForTest(persistApi, &metadataManager));
     DS_ASSERT_OK(manager.ExecuteRecoveryTask(task));
     ASSERT_TRUE(WaitUntil([&recoverMetadataCalls]() { return recoverMetadataCalls.load() >= 2; }));
+    manager.Shutdown();
+}
+
+TEST_F(SlotRecoveryTest, RecoveryMetadataBatchRetriesOnlyFailedIdsAfterMembershipChange)
+{
+    LOG(INFO) << "Scenario: mixed metadata recovery should keep succeeded entries recovered while retrying only "
+              << "the failed ids after the coordination path becomes available again.";
+    auto store = std::make_shared<FakeSlotRecoveryStore>();
+    SlotRecoveryManagerTestHelper manager(HostPort("127.0.0.1", 7201), store);
+    constexpr const char *kSucceededObject = "tenant/object_succeeded";
+    constexpr const char *kDeferredObject = "tenant/object_deferred";
+    auto persistApi = BuildTwoMetaPreloadApi("127.0.0.1:7200", 1, kSucceededObject, kDeferredObject);
+    MetaDataRecoveryManager metadataManager(HostPort("127.0.0.1", 7201), nullptr,
+                                            MetaDataRecoveryManager::ClusterAccess{}, nullptr, GetTestMetadataRoute());
+    ExpectRecoverLocalEntriesAlwaysOk();
+
+    std::atomic<int> recoverMetadataCalls{ 0 };
+    std::mutex pushedMutex;
+    std::vector<std::vector<std::string>> pushedBatches;
+    BINEXPECT_CALL((RecoverMetadataMethod)&MetaDataRecoveryManager::RecoverMetadata, (_, _, _))
+        .WillRepeatedly(
+            Invoke([&](const std::vector<ObjectMetaPb> &metas, std::vector<std::string> &failedIds, std::string) {
+                std::vector<std::string> objectKeys;
+                for (const auto &meta : metas) {
+                    objectKeys.emplace_back(meta.object_key());
+                }
+                {
+                    std::lock_guard<std::mutex> lock(pushedMutex);
+                    pushedBatches.emplace_back(objectKeys);
+                }
+
+                if (++recoverMetadataCalls == 1) {
+                    EXPECT_THAT(objectKeys,
+                                UnorderedElementsAre(std::string(kSucceededObject), std::string(kDeferredObject)));
+                    failedIds = { kDeferredObject };
+                    return Status(K_RPC_UNAVAILABLE, __LINE__, __FILE__, "membership transition");
+                }
+                EXPECT_THAT(objectKeys, ElementsAre(std::string(kDeferredObject)));
+                failedIds.clear();
+                return Status::OK();
+            }));
+
+    auto task = BuildSingleSlotTask("127.0.0.1:7200", 1);
+
+    DS_ASSERT_OK(manager.InitForTest(persistApi, &metadataManager));
+    DS_ASSERT_OK(manager.ExecuteRecoveryTask(task));
+    ASSERT_TRUE(WaitUntil([&recoverMetadataCalls]() { return recoverMetadataCalls.load() >= 2; }));
+    manager.Shutdown();
+
+    std::lock_guard<std::mutex> lock(pushedMutex);
+    ASSERT_GE(pushedBatches.size(), 2U);
+    EXPECT_THAT(pushedBatches.front(),
+                UnorderedElementsAre(std::string(kSucceededObject), std::string(kDeferredObject)));
+    EXPECT_THAT(pushedBatches.back(), ElementsAre(std::string(kDeferredObject)));
+}
+
+TEST_F(SlotRecoveryTest, DeferredRecoveryMetadataRetryIgnoresNewMembersAfterMembershipChange)
+{
+    LOG(INFO) << "Scenario: deferred metadata retry should keep the original recovered-meta payload and retry only "
+              << "failed ids even if membership changes before the retry drains.";
+    auto store = std::make_shared<FakeSlotRecoveryStore>();
+    SlotRecoveryManagerTestHelper manager(HostPort("127.0.0.1", 7201), store);
+    manager.SetActiveWorkers({ "127.0.0.1:7201", "127.0.0.1:7202" });
+    constexpr const char *kSucceededObject = "tenant/object_succeeded_before_churn";
+    constexpr const char *kDeferredObject = "tenant/object_deferred_after_churn";
+    auto persistApi = BuildTwoMetaPreloadApi("127.0.0.1:7200", 1, kSucceededObject, kDeferredObject);
+    MetaDataRecoveryManager metadataManager(HostPort("127.0.0.1", 7201), nullptr,
+                                            MetaDataRecoveryManager::ClusterAccess{}, nullptr, GetTestMetadataRoute());
+    ExpectRecoverLocalEntriesAlwaysOk();
+
+    std::atomic<int> recoverMetadataCalls{ 0 };
+    std::atomic<bool> membershipChangedBeforeRetry{ false };
+    std::mutex pushedMutex;
+    std::vector<std::vector<std::string>> pushedBatches;
+    BINEXPECT_CALL((RecoverMetadataMethod)&MetaDataRecoveryManager::RecoverMetadata, (_, _, _))
+        .WillRepeatedly(
+            Invoke([&](const std::vector<ObjectMetaPb> &metas, std::vector<std::string> &failedIds, std::string) {
+                std::vector<std::string> objectKeys;
+                for (const auto &meta : metas) {
+                    objectKeys.emplace_back(meta.object_key());
+                    EXPECT_EQ(meta.primary_address(), "127.0.0.1:7201");
+                }
+                {
+                    std::lock_guard<std::mutex> lock(pushedMutex);
+                    pushedBatches.emplace_back(objectKeys);
+                }
+
+                const auto call = ++recoverMetadataCalls;
+                if (call == 1) {
+                    EXPECT_THAT(objectKeys,
+                                UnorderedElementsAre(std::string(kSucceededObject), std::string(kDeferredObject)));
+                    manager.SetActiveWorkers({ "127.0.0.1:7201", "127.0.0.1:7202", "127.0.0.1:7203" });
+                    membershipChangedBeforeRetry = true;
+                    failedIds = { kDeferredObject };
+                    return Status(K_RPC_UNAVAILABLE, __LINE__, __FILE__, "membership changed during recovery");
+                }
+                EXPECT_TRUE(membershipChangedBeforeRetry.load());
+                EXPECT_THAT(objectKeys, ElementsAre(std::string(kDeferredObject)));
+                failedIds.clear();
+                return Status::OK();
+            }));
+
+    auto task = BuildSingleSlotTask("127.0.0.1:7200", 1);
+
+    DS_ASSERT_OK(manager.InitForTest(persistApi, &metadataManager));
+    DS_ASSERT_OK(manager.ExecuteRecoveryTask(task));
+    ASSERT_TRUE(WaitUntil([&recoverMetadataCalls]() { return recoverMetadataCalls.load() >= 2; }));
+    manager.Shutdown();
+
+    std::lock_guard<std::mutex> lock(pushedMutex);
+    ASSERT_GE(pushedBatches.size(), 2U);
+    EXPECT_THAT(pushedBatches.front(),
+                UnorderedElementsAre(std::string(kSucceededObject), std::string(kDeferredObject)));
+    EXPECT_THAT(pushedBatches.back(), ElementsAre(std::string(kDeferredObject)));
+}
+
+TEST_F(SlotRecoveryTest, ExecuteRecoveryTaskUsesExplicitSourceWorkerInsteadOfFailedWorker)
+{
+    LOG(INFO) << "Scenario: recovery must preload from the explicit source worker when the failed worker "
+              << "is no longer the trusted data source.";
+    auto store = std::make_shared<FakeSlotRecoveryStore>();
+    SlotRecoveryManagerTestHelper manager(HostPort("127.0.0.1", 7203), store);
+    auto persistApi = BuildSingleMetaPreloadApi("127.0.0.1:7204", 4, "tenant/object_from_source", 4);
+    MetaDataRecoveryManager metadataManager(HostPort("127.0.0.1", 7203), nullptr,
+                                            MetaDataRecoveryManager::ClusterAccess{}, nullptr, GetTestMetadataRoute());
+    ExpectRecoverLocalEntriesAlwaysOk();
+
+    std::vector<ObjectMetaPb> pushedMetas;
+    BINEXPECT_CALL((RecoverMetadataMethod)&MetaDataRecoveryManager::RecoverMetadata, (_, _, _))
+        .WillRepeatedly(Invoke(
+            [&pushedMetas](const std::vector<ObjectMetaPb> &metas, std::vector<std::string> &failedIds, std::string) {
+                pushedMetas = metas;
+                failedIds.clear();
+                return Status::OK();
+            }));
+
+    auto task = BuildSingleSlotTask("127.0.0.1:7202", 4);
+    task.set_source_worker("127.0.0.1:7204");
+
+    DS_ASSERT_OK(manager.InitForTest(persistApi, &metadataManager));
+    DS_ASSERT_OK(manager.ExecuteRecoveryTask(task));
+
+    ASSERT_EQ(pushedMetas.size(), 1U);
+    EXPECT_EQ(pushedMetas.front().object_key(), "tenant/object_from_source");
+    EXPECT_EQ(pushedMetas.front().primary_address(), "127.0.0.1:7203");
     manager.Shutdown();
 }
 

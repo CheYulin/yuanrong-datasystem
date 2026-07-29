@@ -22,7 +22,7 @@
 #include <limits>
 #include <random>
 #include <unordered_map>
-
+#include <unordered_set>
 
 #include "datasystem/common/flags/flags.h"
 #include "datasystem/common/inject/inject_point.h"
@@ -37,6 +37,7 @@
 #include "datasystem/common/util/uuid_generator.h"
 #include "datasystem/worker/cluster_event_type.h"
 #include "datasystem/worker/object_cache/slot_recovery/slot_recovery_store.h"
+#include "datasystem/worker/object_cache/recovery/object_cache_recovery_evidence.h"
 
 DS_DECLARE_string(l2_cache_type);
 DS_DECLARE_uint32(node_dead_timeout_s);
@@ -99,6 +100,23 @@ std::string SlotsSummary(const google::protobuf::RepeatedField<uint32_t> &slots)
     std::vector<uint32_t> sortedSlots(slots.begin(), slots.end());
     std::sort(sortedSlots.begin(), sortedSlots.end());
     return BuildSortedSlotsSummary(sortedSlots);
+}
+
+std::vector<ObjectMetaPb> SelectRetryMetas(const std::vector<ObjectMetaPb> &recoveredMetas,
+                                           const std::vector<std::string> &failedIds)
+{
+    if (failedIds.empty()) {
+        return recoveredMetas;
+    }
+    std::unordered_set<std::string> failedIdSet(failedIds.begin(), failedIds.end());
+    std::vector<ObjectMetaPb> retryMetas;
+    retryMetas.reserve(std::min(recoveredMetas.size(), failedIds.size()));
+    for (const auto &meta : recoveredMetas) {
+        if (failedIdSet.find(meta.object_key()) != failedIdSet.end()) {
+            retryMetas.emplace_back(meta);
+        }
+    }
+    return retryMetas;
 }
 
 std::string IncidentSummary(const SlotRecoveryInfoPb &info)
@@ -375,14 +393,14 @@ Status SlotRecoveryManager::Init(
     const HostPort &localAddress, const cluster::MembershipEndpointView &membership,
     std::shared_ptr<PersistenceApi> persistApi,
     std::shared_ptr<worker::WorkerMasterApiManagerBase<worker::WorkerMasterOCApi>> apiManager,
-    datasystem::EtcdStore *etcdStore, MetaDataRecoveryManager *metadataRecoveryManager)
+    std::shared_ptr<SlotRecoveryStore> store, MetaDataRecoveryManager *metadataRecoveryManager)
 {
     localAddress_ = localAddress;
     membership_ = &membership;
     persistenceApi_ = std::move(persistApi);
     workerMasterApiManager_ = std::move(apiManager);
     metadataRecoveryManager_ = metadataRecoveryManager;
-    store_ = CreateStore(etcdStore);
+    store_ = std::move(store);
     shuttingDown_.store(false);
     if (!IsFeatureEnabled()) {
         return Status::OK();
@@ -454,6 +472,29 @@ Status SlotRecoveryManager::ScheduleLocalPendingTasksFromStore()
         "local_pending_tasks=%zu",
         localWorker, incidents.size(), scheduledIncidents, localPendingTasks);
     return Status::OK();
+}
+
+worker::WorkerRecoveryEvidenceReport SlotRecoveryManager::BuildSlotRecoveryEvidenceReportFromStore()
+{
+    worker::WorkerRecoveryEvidenceBuilder builder;
+    if (!IsFeatureEnabled()) {
+        return builder.MarkSlotReady("slot_recovery_disabled").BuildReport("slot_recovery_disabled");
+    }
+    std::vector<std::pair<std::string, SlotRecoveryInfoPb>> incidents;
+    auto rc = store_->ListIncidents(incidents);
+    if (rc.IsError()) {
+        if (rc.GetCode() == K_NOT_FOUND
+            || rc.GetMsg().find("tableName:/datasystem/slot_recovery") != std::string::npos) {
+            return builder.MarkSlotReady("slot_recovery_table_absent").BuildReport("slot_recovery_table_absent");
+        }
+        return builder.BuildReport("slot_incidents_error=" + rc.GetMsg());
+    }
+    std::vector<SlotRecoveryInfoPb> incidentInfos;
+    incidentInfos.reserve(incidents.size());
+    for (const auto &incident : incidents) {
+        incidentInfos.emplace_back(incident.second);
+    }
+    return BuildSlotRecoveryEvidenceReport(incidentInfos);
 }
 
 std::vector<std::string> SlotRecoveryManager::PickProcessWorkers(const std::vector<std::string> &failedWorkers,
@@ -678,9 +719,9 @@ Status SlotRecoveryManager::ScheduleLocalTasks(const std::string &incidentKey, c
                     "task_status=%s reason=execute_error_mark_failed err=%s",
                     incidentKey, task.failed_worker(), task.owner_worker(), TaskStatusName(task.task_status()),
                     executeRc.ToString());
-                LOG_IF_ERROR(FailLocalTask(incidentKey, task),
-                             FormatString("Async failure finalization failed for recovery task of %s.",
-                                          task.failed_worker()));
+                LOG_IF_ERROR(
+                    FailLocalTask(incidentKey, task),
+                    FormatString("Async failure finalization failed for recovery task of %s.", task.failed_worker()));
                 return;
             }
             LOG_IF_ERROR(CompleteLocalTask(incidentKey, task),
@@ -1170,8 +1211,8 @@ Status SlotRecoveryManager::PreloadRecoveryTaskSlots(const std::string &sourceWo
             },
             []() { return Status::OK(); }, { StatusCode::K_TRY_AGAIN, StatusCode::K_IO_ERROR });
         if (!rc.IsOk()) {
-            LOG(ERROR) << FormatString(
-                "Preload slot %u from %s failed. Detail: %s", slotId, sourceWorker, rc.ToString());
+            LOG(ERROR) << FormatString("Preload slot %u from %s failed. Detail: %s", slotId, sourceWorker,
+                                       rc.ToString());
             failedSlotIds.emplace_back(slotId);
             if (preloadAggregateRc.IsOk()) {
                 preloadAggregateRc = rc;
@@ -1250,7 +1291,7 @@ Status SlotRecoveryManager::EnqueueDeferredMetaRetry(const std::string &incident
     retryTask.ownerWorker = task.owner_worker();
     retryTask.sourceWorker = GetTaskSourceWorker(task);
     retryTask.slotsSummary = SlotsSummary(task.slots());
-    retryTask.pendingMetas = recoveredMetas;
+    retryTask.pendingMetas = SelectRetryMetas(recoveredMetas, failedIds);
     retryTask.failedIds = failedIds;
     retryTask.firstStatus = recoverRc;
     retryTask.enqueueTimeMs = static_cast<uint64_t>(GetSteadyClockTimeStampMs());
@@ -1330,14 +1371,6 @@ Status SlotRecoveryManager::RetryDeferredMetaTask(DeferredMetaRetryTask &retryTa
                              : rc;
         },
         []() { return Status::OK(); }, { StatusCode::K_TRY_AGAIN });
-}
-
-std::shared_ptr<SlotRecoveryStore> SlotRecoveryManager::CreateStore(datasystem::EtcdStore *etcdStore) const
-{
-    if (etcdStore == nullptr) {
-        return nullptr;
-    }
-    return std::make_shared<SlotRecoveryStore>(etcdStore);
 }
 
 bool SlotRecoveryManager::IsFeatureEnabled() const

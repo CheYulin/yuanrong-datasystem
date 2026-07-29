@@ -20,9 +20,18 @@
 #include <functional>
 #include <iostream>
 #include <chrono>
+#include <cstdlib>
+#include <fcntl.h>
+#include <list>
+#include <shared_mutex>
+#include <unistd.h>
 #include "ut/common.h"
+#include "datasystem/common/eventloop/event_loop.h"
 #include "datasystem/common/util/format.h"
+#include "datasystem/common/util/thread_pool.h"
+#define private public
 #include "datasystem/common/eventloop/timer_queue.h"
+#undef private
 #include "datasystem/common/util/random_data.h"
 using namespace datasystem;
 using namespace std::chrono;
@@ -68,6 +77,66 @@ public:
     TimerQueue *testqueue_;
     RandomData random_;
 };
+
+int fdToCheck = STDIN_FILENO;
+
+void ExitWithFdState()
+{
+    std::_Exit(fcntl(fdToCheck, F_GETFD) == -1 ? 1 : 0);
+}
+
+TEST(TimerQueueDeathTest, ConstructedButUninitializedDestructionKeepsStdinOpen)
+{
+    ASSERT_EXIT(
+        {
+            int pipeFds[2];
+            if (pipe(pipeFds) != 0 || dup2(pipeFds[0], STDIN_FILENO) == -1) {
+                std::_Exit(2);
+            }
+            if (pipeFds[0] != STDIN_FILENO) {
+                (void)close(pipeFds[0]);
+            }
+            (void)close(pipeFds[1]);
+            fdToCheck = STDIN_FILENO;
+            if (std::atexit(ExitWithFdState) != 0) {
+                std::_Exit(3);
+            }
+            (void)TimerQueue::GetInstance();
+            std::exit(4);
+        },
+        testing::ExitedWithCode(0), "");
+}
+
+TEST(TimerQueueDeathTest, FinalizedTimerFdIsNotClosedAgainAfterReuse)
+{
+    ASSERT_EXIT(
+        {
+            if (std::atexit(ExitWithFdState) != 0) {
+                std::_Exit(2);
+            }
+            auto *timerQueue = TimerQueue::GetInstance();
+            if (!timerQueue->Initialize() || timerQueue->runTimerFD_ < 0) {
+                std::_Exit(3);
+            }
+            const int timerFd = timerQueue->runTimerFD_;
+            timerQueue->Finalize();
+
+            int pipeFds[2];
+            if (pipe(pipeFds) != 0 || dup2(pipeFds[0], timerFd) == -1) {
+                std::_Exit(4);
+            }
+            if (pipeFds[0] != timerFd) {
+                (void)close(pipeFds[0]);
+            }
+            if (pipeFds[1] != timerFd) {
+                (void)close(pipeFds[1]);
+            }
+            fdToCheck = timerFd;
+            std::exit(5);
+        },
+        testing::ExitedWithCode(0), "");
+}
+
 TEST_F(TimerTest, DISABLED_AddNewTimer)
 {
     Init();

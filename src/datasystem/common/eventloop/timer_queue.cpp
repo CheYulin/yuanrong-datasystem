@@ -72,6 +72,7 @@ void TimerQueue::TimerFdSetTime(const uint64_t delay)
     it.it_value.tv_nsec = (delay % SECTOMILLI) * MILLITOMICR * MICRTONANO;
     if (timerfd_settime(runTimerFD_, 0, &it, nullptr) == -1) {
         RETRY_ON_EINTR(close(runTimerFD_));
+        runTimerFD_ = -1;
         return;
     }
 }
@@ -136,6 +137,7 @@ bool TimerQueue::Initialize()
             timerEvLoop_->AddFdEvent(runTimerFD_, EPOLLIN, std::bind(&TimerQueue::ScanTimerPool, this), nullptr);
         if (status.IsError()) {
             RETRY_ON_EINTR(close(runTimerFD_));
+            runTimerFD_ = -1;
             return false;
         }
         asyncEraseAndRunTimer_ = std::make_unique<ThreadPool>(eraseThreadNum, 0, "TimerQueue");
@@ -150,6 +152,7 @@ void TimerQueue::Finalize()
         std::lock_guard<std::shared_timed_mutex> lock(timersLock_);
         if (runTimerFD_ >= 0) {
             RETRY_ON_EINTR(close(runTimerFD_));
+            runTimerFD_ = -1;
         }
     }
 }

@@ -25,7 +25,6 @@
 namespace datasystem::metrics {
 enum class KvMetricId : uint16_t {
     // Confirm no external numeric ID dependency before deleting intermediate entries
-    // Confirm no external numeric ID dependency before deleting intermediate entries
     CLIENT_PUT_REQUEST_TOTAL = 0,
     CLIENT_PUT_ERROR_TOTAL,
     CLIENT_GET_REQUEST_TOTAL,
@@ -157,6 +156,14 @@ enum class KvMetricId : uint16_t {
     CLIENT_SHM_ZERO_COPY_SET_TOTAL,
     CLIENT_SHM_PAYLOAD_FALLBACK_SET_TOTAL,
     CLIENT_SHM_GET_DEGRADE_TO_TRANSPORT_TOTAL,
+    WORKER_SERVICE_MODE,
+    WORKER_SERVICE_REASON,
+    WORKER_RECOVERY_PHASE,
+    WORKER_RECOVERY_EVIDENCE_MASK,
+    WORKER_ADMISSION_REJECT_TOTAL,
+    WORKER_CONTROL_BACKEND_SCOPE_LOCAL_TOTAL,
+    WORKER_CONTROL_BACKEND_SCOPE_GLOBAL_TOTAL,
+    WORKER_CONTROL_BACKEND_SCOPE_INCONCLUSIVE_TOTAL,
     KV_METRIC_END
 };
 

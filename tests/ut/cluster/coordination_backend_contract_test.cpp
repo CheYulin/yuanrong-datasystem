@@ -17,6 +17,7 @@
 #include "datasystem/cluster/coordination_backend/coordination_backend.h"
 #include "datasystem/cluster/coordination_backend/ds_coordination_backend.h"
 #include "datasystem/cluster/coordination_backend/etcd_coordination_backend.h"
+#include "tests/ut/cluster/testing/fake_coordination_backend.h"
 
 #include <type_traits>
 
@@ -122,7 +123,13 @@ static_assert(std::is_abstract_v<ICoordinationBackend>);
 static_assert(std::has_virtual_destructor_v<ICoordinationBackend>);
 static_assert(
     std::is_same_v<decltype(&ICoordinationBackend::ShutdownEventSources), Status (ICoordinationBackend::*)()>);
+static_assert(
+    std::is_same_v<decltype(&ICoordinationBackend::ShutdownWatchEventSources), Status (ICoordinationBackend::*)()>);
 static_assert(std::is_same_v<decltype(&ICoordinationBackend::Shutdown), Status (ICoordinationBackend::*)()>);
+static_assert(std::is_same_v<decltype(&ICoordinationBackend::SetLocalIsolationHandler),
+                             void (ICoordinationBackend::*)(ICoordinationBackend::LocalIsolationHandler)>);
+static_assert(std::is_same_v<decltype(&ICoordinationBackend::SetLocalRecoveryHandler),
+                             void (ICoordinationBackend::*)(ICoordinationBackend::LocalRecoveryHandler)>);
 
 TEST(CoordinationBackendContractTest, PreservesExactAndPrefixWatchDescriptor)
 {
@@ -168,6 +175,56 @@ TEST(CoordinationBackendContractTest, NullStoreFailsOperationsAndShutsDownIdempo
     EXPECT_TRUE(backend.Shutdown().IsOk());
 }
 
+TEST(CoordinationBackendContractTest, ShutdownEventSourcesDoesNotClearLocalMembershipCallbacks)
+{
+    FakeCoordinationBackend backend;
+    int isolationCount = 0;
+    int recoveryCount = 0;
+    backend.SetLocalIsolationHandler([&isolationCount](const Status &) { ++isolationCount; });
+    backend.SetLocalRecoveryHandler([&recoveryCount] { ++recoveryCount; });
+
+    EXPECT_TRUE(backend.ShutdownEventSources().IsOk());
+    backend.EmitLocalIsolation(Status(K_RPC_UNAVAILABLE, "local"));
+    backend.EmitLocalRecovery();
+
+    EXPECT_EQ(isolationCount, 1);
+    EXPECT_EQ(recoveryCount, 1);
+}
+
+TEST(CoordinationBackendContractTest, LocalIsolationSignalsDoNotDeleteMembershipThroughBackend)
+{
+    FakeCoordinationBackend backend;
+    int isolationCount = 0;
+    int recoveryCount = 0;
+    backend.SetLocalIsolationHandler([&isolationCount](const Status &status) {
+        EXPECT_EQ(status.GetCode(), K_RPC_UNAVAILABLE);
+        ++isolationCount;
+    });
+    backend.SetLocalRecoveryHandler([&recoveryCount] { ++recoveryCount; });
+
+    backend.EmitLocalIsolation(Status(K_RPC_UNAVAILABLE, "local keepalive failed"));
+    backend.EmitLocalRecovery();
+
+    EXPECT_EQ(isolationCount, 1);
+    EXPECT_EQ(recoveryCount, 1);
+    EXPECT_EQ(backend.DeleteAttemptCount(), 0UL);
+}
+
+TEST(CoordinationBackendContractTest, DefaultWatchIdentityCapabilityIsUnsupported)
+{
+    FakeCoordinationBackend backend;
+    ICoordinationBackend &contract = backend;
+    int membershipReadyCount = 0;
+
+    contract.SetMembershipReadyHandler([&membershipReadyCount](const std::string &, bool) { ++membershipReadyCount; });
+    EXPECT_FALSE(contract.OwnsWatchIdentity("coordinator-a", 1));
+    EXPECT_FALSE(contract.IsWatchRegistrationInProgress());
+    contract.InvalidateWatches();
+    contract.HandleWatchEvent("coordinator-a", 1,
+                              CoordinationEvent{ CoordinationEventType::PUT, "key", "value", 1, 2 });
+    EXPECT_EQ(membershipReadyCount, 0);
+}
+
 TEST(CoordinationBackendContractTest, DsBackendPreservesClusterScopedMembershipTable)
 {
     DsCoordinationBackend backend(nullptr, "127.0.0.1:1");
@@ -179,6 +236,17 @@ TEST(CoordinationBackendContractTest, DsBackendPreservesClusterScopedMembershipT
     EXPECT_EQ(prefix, "/datasystem/cluster");
     EXPECT_TRUE(backend.GetStorePrefix("/datasystem/cluster-a/topology", prefix).IsOk());
     EXPECT_EQ(prefix, "/datasystem/cluster-a/topology");
+}
+
+TEST(CoordinationBackendContractTest, DsBackendRegistersLogicalTablePrefixes)
+{
+    DsCoordinationBackend backend(nullptr, "127.0.0.1:1");
+    std::string prefix;
+
+    ASSERT_TRUE(backend.CreateTableWithExactPrefix("logical", "/physical/root").IsOk());
+    EXPECT_TRUE(backend.GetStorePrefix("logical", prefix).IsOk());
+    EXPECT_EQ(prefix, "/physical/root");
+    EXPECT_EQ(backend.CreateTableWithExactPrefix("logical", "/physical/other").GetCode(), K_DUPLICATED);
 }
 
 TEST(CoordinationBackendContractTest, DsBackendPrefixWatchAcceptsCoordinatorChildEvents)

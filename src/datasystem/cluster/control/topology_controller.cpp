@@ -171,7 +171,8 @@ bool TopologyControllerOptions::IsValid() const noexcept
 
 TopologyController::TopologyController(ICoordinationBackend &backend, TopologyRepository &repository,
                                        const TopologyKeyHelper &keys, const IPlanningAlgorithm &algorithm,
-                                       CoordinationEventDispatcher &dispatcher, TopologyControllerOptions options)
+                                       CoordinationEventDispatcher &dispatcher,
+                                       const TopologyControllerOptions &options)
     : backend_(backend),
       repository_(repository),
       keys_(keys),
@@ -206,7 +207,7 @@ Status TopologyController::Start()
         auto rc = backend_.WatchEvents(watches);
         if (rc.IsError()) {
             dispatcher_.ShutdownIngress();
-            LOG_IF_ERROR(backend_.ShutdownEventSources(),
+            LOG_IF_ERROR(backend_.ShutdownWatchEventSources(),
                          "Shut down topology Controller event sources after Start failure");
             backend_.SetEventHandler(ICoordinationBackend::EventHandler{});
             return rc;
@@ -228,7 +229,7 @@ Status TopologyController::Start()
         diagnostics_.running = false;
         dispatcher_.ShutdownIngress();
         if (options_.eventSourceMode == TopologyEventSourceMode::SELF_MANAGED) {
-            LOG_IF_ERROR(backend_.ShutdownEventSources(),
+            LOG_IF_ERROR(backend_.ShutdownWatchEventSources(),
                          "Shut down topology Controller event sources after thread Start failure");
             backend_.SetEventHandler(ICoordinationBackend::EventHandler{});
         }
@@ -249,7 +250,7 @@ Status TopologyController::Stop(std::chrono::steady_clock::time_point deadline)
     dispatcher_.ShutdownIngress();
     Status eventSourceStatus;
     if (options_.eventSourceMode == TopologyEventSourceMode::SELF_MANAGED) {
-        eventSourceStatus = backend_.ShutdownEventSources();
+        eventSourceStatus = backend_.ShutdownWatchEventSources();
         backend_.SetEventHandler(ICoordinationBackend::EventHandler{});
     }
     if (!stoppedCv_.wait_until(lock, deadline, [this] { return threadExited_; })) {
@@ -291,7 +292,7 @@ Status TopologyController::SubmitCoordinationEvent(CoordinationEvent &&event)
 
 Status TopologyController::PrepareMembershipRestartObservation()
 {
-    if (options_.membershipRestartHandler == nullptr) {
+    if (options_.membershipRestartHandler == nullptr && options_.membershipRecoveryHandler == nullptr) {
         return Status::OK();
     }
     std::string eventPrefix;
@@ -303,12 +304,15 @@ Status TopologyController::PrepareMembershipRestartObservation()
     membershipEventPrefix_ = std::move(eventPrefix);
     latestRestartTimestampByAddress_.clear();
     pendingRestartTimestampByAddress_.clear();
+    latestRecoveryTimestampByAddress_.clear();
+    pendingRecoveryTimestampByAddress_.clear();
     return Status::OK();
 }
 
 Status TopologyController::ObserveMembershipRestart(const CoordinationEvent &event)
 {
-    if (event.type != CoordinationEventType::PUT || options_.membershipRestartHandler == nullptr) {
+    if (event.type != CoordinationEventType::PUT
+        || (options_.membershipRestartHandler == nullptr && options_.membershipRecoveryHandler == nullptr)) {
         return Status::OK();
     }
     std::string eventPrefix;
@@ -325,11 +329,13 @@ Status TopologyController::ObserveMembershipRestart(const CoordinationEvent &eve
     CHECK_FAIL_RETURN_STATUS(canonicalKey == address, K_INVALID, "membership restart event key is not exact");
     MembershipValue value;
     RETURN_IF_NOT_OK(MembershipValueCodec::Decode(event.value, value));
-    if (value.lifecycleState != MemberLifecycleState::RESTARTING) {
-        return Status::OK();
+    CHECK_FAIL_RETURN_STATUS(value.timestamp > 0, K_INVALID, "membership lifecycle timestamp is invalid");
+    if (value.lifecycleState == MemberLifecycleState::RESTARTING && options_.membershipRestartHandler != nullptr) {
+        RecordMembershipRestart(address, value.timestamp);
+    } else if (value.lifecycleState == MemberLifecycleState::RECOVERING
+               && options_.membershipRecoveryHandler != nullptr) {
+        RecordMembershipRecovery(address, value.timestamp);
     }
-    CHECK_FAIL_RETURN_STATUS(value.timestamp > 0, K_INVALID, "membership restart timestamp is invalid");
-    RecordMembershipRestart(address, value.timestamp);
     return Status::OK();
 }
 
@@ -345,6 +351,18 @@ void TopologyController::ObserveMembershipRestarts(const std::vector<MembershipR
     }
 }
 
+void TopologyController::ObserveMembershipRecoveries(const std::vector<MembershipRecord> &memberships)
+{
+    if (options_.membershipRecoveryHandler == nullptr) {
+        return;
+    }
+    for (const auto &record : memberships) {
+        if (record.state == MemberLifecycleState::RECOVERING && record.timestamp > 0) {
+            RecordMembershipRecovery(record.address, record.timestamp);
+        }
+    }
+}
+
 void TopologyController::RecordMembershipRestart(const std::string &address, int64_t timestamp)
 {
     std::lock_guard<std::mutex> lock(membershipRestartMutex_);
@@ -354,6 +372,17 @@ void TopologyController::RecordMembershipRestart(const std::string &address, int
     }
     iter->second = timestamp;
     pendingRestartTimestampByAddress_[address] = timestamp;
+}
+
+void TopologyController::RecordMembershipRecovery(const std::string &address, int64_t timestamp)
+{
+    std::lock_guard<std::mutex> lock(membershipRestartMutex_);
+    auto [iter, inserted] = latestRecoveryTimestampByAddress_.emplace(address, timestamp);
+    if (!inserted && timestamp <= iter->second) {
+        return;
+    }
+    iter->second = timestamp;
+    pendingRecoveryTimestampByAddress_[address] = timestamp;
 }
 
 void TopologyController::DrainMembershipRestarts()
@@ -371,6 +400,26 @@ void TopologyController::DrainMembershipRestarts()
             auto latest = latestRestartTimestampByAddress_.find(address);
             if (latest != latestRestartTimestampByAddress_.end() && latest->second == timestamp) {
                 pendingRestartTimestampByAddress_[address] = timestamp;
+            }
+        }
+    }
+}
+
+void TopologyController::DrainMembershipRecoveries()
+{
+    std::unordered_map<std::string, int64_t> pending;
+    {
+        std::lock_guard<std::mutex> lock(membershipRestartMutex_);
+        pending.swap(pendingRecoveryTimestampByAddress_);
+    }
+    for (const auto &[address, timestamp] : pending) {
+        auto rc = options_.membershipRecoveryHandler(address, timestamp);
+        if (rc.IsError()) {
+            LOG(WARNING) << "Failed to deliver membership recovery event for " << address << ": " << rc.ToString();
+            std::lock_guard<std::mutex> lock(membershipRestartMutex_);
+            auto latest = latestRecoveryTimestampByAddress_.find(address);
+            if (latest != latestRecoveryTimestampByAddress_.end() && latest->second == timestamp) {
+                pendingRecoveryTimestampByAddress_[address] = timestamp;
             }
         }
     }
@@ -405,6 +454,7 @@ void TopologyController::Run()
             continue;
         }
         DrainMembershipRestarts();
+        DrainMembershipRecoveries();
         if (rc.IsOk()) {
             topologyDirty_ = true;
             membershipDirty_ = true;
@@ -545,7 +595,8 @@ Status TopologyController::ReconcileDerivedState(const TopologySnapshot &latest)
 {
     ExpectedDerivedState expected;
     RETURN_IF_NOT_OK(materializer_.RebuildExpected(latest, algorithm_, expected));
-    const uint64_t epoch = latest.GetActiveBatch().has_value() ? latest.GetActiveBatch()->epoch : 0;
+    const auto activeBatch = latest.GetActiveBatch();
+    const uint64_t epoch = activeBatch.has_value() ? activeBatch->epoch : 0;
     if (derivedBatchEpoch_ != epoch) {
         admissionCursor_ = 0;
         derivedBatchEpoch_ = epoch;
@@ -580,6 +631,7 @@ Status TopologyController::TryConfirmFailures(const TopologySnapshot &latest,
                                               const std::vector<MembershipRecord> &memberships)
 {
     ObserveMembershipRestarts(memberships);
+    ObserveMembershipRecoveries(memberships);
     FailureClassification classification;
     RETURN_IF_NOT_OK(failureClassifier_.Observe(latest, memberships, options_.now(), classification));
     for (const auto &observed : classification.newlyMissing) {
@@ -774,12 +826,13 @@ Status TopologyController::CommitConfirmedFailures(const TopologySnapshot &lates
 Status TopologyController::CommitUncommittedCleanup(const TopologySnapshot &latest,
                                                     const FailureClassification &classification)
 {
-    if (!classification.removeJoining.empty() && latest.GetActiveBatch().has_value()
-        && latest.GetActiveBatch()->type == TopologyChangeType::SCALE_OUT) {
+    const auto activeBatch = latest.GetActiveBatch();
+    if (!classification.removeJoining.empty() && activeBatch.has_value()
+        && activeBatch->type == TopologyChangeType::SCALE_OUT) {
         return CommitScaleOutUncommittedCleanup(latest, classification);
     }
-    if (!classification.removeJoining.empty() && latest.GetActiveBatch().has_value()
-        && latest.GetActiveBatch()->type == TopologyChangeType::FAILURE) {
+    if (!classification.removeJoining.empty() && activeBatch.has_value()
+        && activeBatch->type == TopologyChangeType::FAILURE) {
         return CommitFailureUncommittedCleanup(latest, classification);
     }
     if (!classification.removeInitial.empty()) {
@@ -961,12 +1014,15 @@ Status TopologyController::TryFinalizeActiveBatch(const TopologySnapshot &latest
     std::vector<MemberIdentity> failedJoining;
     RETURN_IF_NOT_OK(InspectBatchProgress(latest, expected, complete, failedJoining));
     const auto now = options_.now();
-    const auto &batch = *latest.GetActiveBatch();
+    const auto activeBatch = latest.GetActiveBatch();
+    CHECK_FAIL_RETURN_STATUS(activeBatch.has_value(), K_RUNTIME_ERROR,
+                             "active batch disappeared during reconciliation");
+    const auto &batch = *activeBatch;
     const bool preserveFailureDeadline =
         deadlineBatchType_ == TopologyChangeType::FAILURE && batch.type == TopologyChangeType::FAILURE;
     const bool sameEpoch = deadlineBatchType_ == batch.type && deadlineBatchEpoch_ == batch.epoch;
     if (!batchDeadline_.has_value() || (!sameEpoch && !preserveFailureDeadline)) {
-        const auto window = latest.GetActiveBatch()->type == TopologyChangeType::FAILURE
+        const auto window = batch.type == TopologyChangeType::FAILURE
                                 ? options_.failureBatchWindow
                                 : std::chrono::duration_cast<std::chrono::seconds>(options_.ordinaryBatchWindow);
         batchDeadline_ = now + window;
@@ -992,7 +1048,9 @@ Status TopologyController::CommitExpiredBatch(const TopologySnapshot &latest,
                                               const std::vector<MemberIdentity> &failedJoining,
                                               const std::vector<MembershipRecord> &memberships)
 {
-    const auto &batch = *latest.GetActiveBatch();
+    const auto activeBatch = latest.GetActiveBatch();
+    CHECK_FAIL_RETURN_STATUS(activeBatch.has_value(), K_RUNTIME_ERROR, "active batch disappeared during expiration");
+    const auto &batch = *activeBatch;
     if (loggedExpiredBatchEpoch_ != batch.epoch) {
         loggedExpiredBatchEpoch_ = batch.epoch;
         LOG(WARNING) << "CLUSTER_CHANGE_BATCH cluster=" << keys_.ClusterName()
@@ -1018,7 +1076,10 @@ Status TopologyController::CommitExpiredBatch(const TopologySnapshot &latest,
 Status TopologyController::InspectBatchProgress(const TopologySnapshot &latest, const ExpectedDerivedState &expected,
                                                 bool &complete, std::vector<MemberIdentity> &failedJoining)
 {
-    const auto &batch = *latest.GetActiveBatch();
+    const auto activeBatch = latest.GetActiveBatch();
+    CHECK_FAIL_RETURN_STATUS(activeBatch.has_value(), K_RUNTIME_ERROR,
+                             "active batch disappeared during progress inspection");
+    const auto &batch = *activeBatch;
     RETURN_IF_NOT_OK(RefreshTaskProgressCache(batch, expected));
     complete = finishedTaskIds_.size() == expected.tasks.size();
     std::unordered_set<std::string> incompleteTargets;
@@ -1085,16 +1146,11 @@ Status TopologyController::RefreshTaskProgressCache(const ActiveBatch &batch, co
 Status TopologyController::CommitBatchFinal(const TopologySnapshot &latest)
 {
     TopologyState next;
-    TopologyState state{ latest.ClusterHasInit(), latest.Version(), latest.Members(), latest.GetActiveBatch() };
-    const auto batch = *latest.GetActiveBatch();
-    std::vector<MemberIdentity> participants;
-    for (const auto &member : latest.Members()) {
-        if ((batch.type == TopologyChangeType::SCALE_OUT && member.state == MemberState::JOINING)
-            || (batch.type == TopologyChangeType::SCALE_IN && member.state == MemberState::LEAVING)
-            || (batch.type == TopologyChangeType::FAILURE && member.state == MemberState::FAILED)) {
-            participants.push_back(member.identity);
-        }
-    }
+    const auto activeBatch = latest.GetActiveBatch();
+    CHECK_FAIL_RETURN_STATUS(activeBatch.has_value(), K_RUNTIME_ERROR, "active batch disappeared during finalization");
+    TopologyState state{ latest.ClusterHasInit(), latest.Version(), latest.Members(), activeBatch };
+    const auto &batch = *activeBatch;
+    const auto participants = CollectBatchParticipants(latest, batch);
     if (batch.type == TopologyChangeType::SCALE_OUT) {
         RETURN_IF_NOT_OK(planBuilder_.BuildScaleOutFinal(state, next));
     } else if (batch.type == TopologyChangeType::SCALE_IN) {
@@ -1107,33 +1163,46 @@ Status TopologyController::CommitBatchFinal(const TopologySnapshot &latest)
     std::shared_ptr<const TopologySnapshot> committed;
     auto rc = CommitAndReadBack(latest.Version(), next, committed);
     if (rc.IsOk()) {
-        LOG(INFO) << "CLUSTER_CHANGE_BATCH cluster=" << keys_.ClusterName()
-                  << " action=finalized batch_type=" << TopologyChangeTypeName(batch.type)
-                  << " batch_epoch=" << batch.epoch << " previous_version=" << latest.Version()
-                  << " committed_version=" << committed->Version()
-                  << " participant_count=" << participants.size()
-                  << " sample=" << MemberIdentitySample(participants);
-        if (batch.type == TopologyChangeType::SCALE_OUT) {
-            LOG(INFO) << "CLUSTER_MEMBER_JOIN_SUMMARY cluster=" << keys_.ClusterName()
-                      << " result=success batch_epoch=" << batch.epoch
-                      << " joined_count=" << participants.size()
-                      << " sample=" << MemberIdentitySample(participants)
-                      << " committed_version=" << committed->Version();
-        } else if (batch.type == TopologyChangeType::SCALE_IN) {
-            LOG(INFO) << "CLUSTER_MEMBER_LEAVE_SUMMARY cluster=" << keys_.ClusterName()
-                      << " result=success batch_epoch=" << batch.epoch
-                      << " left_count=" << participants.size()
-                      << " sample=" << MemberIdentitySample(participants)
-                      << " committed_version=" << committed->Version();
-        } else {
-            LOG(INFO) << "CLUSTER_FAILURE cluster=" << keys_.ClusterName()
-                      << " outcome=finalized batch_epoch=" << batch.epoch
-                      << " failed_count=" << participants.size()
-                      << " sample=" << MemberIdentitySample(participants)
-                      << " committed_version=" << committed->Version();
-        }
+        LogBatchFinalized(latest, batch, participants, committed);
     }
     return rc;
+}
+
+std::vector<MemberIdentity> TopologyController::CollectBatchParticipants(const TopologySnapshot &latest,
+                                                                         const ActiveBatch &batch) const
+{
+    std::vector<MemberIdentity> participants;
+    for (const auto &member : latest.Members()) {
+        if ((batch.type == TopologyChangeType::SCALE_OUT && member.state == MemberState::JOINING)
+            || (batch.type == TopologyChangeType::SCALE_IN && member.state == MemberState::LEAVING)
+            || (batch.type == TopologyChangeType::FAILURE && member.state == MemberState::FAILED)) {
+            participants.push_back(member.identity);
+        }
+    }
+    return participants;
+}
+
+void TopologyController::LogBatchFinalized(const TopologySnapshot &latest, const ActiveBatch &batch,
+                                           const std::vector<MemberIdentity> &participants,
+                                           const std::shared_ptr<const TopologySnapshot> &committed) const
+{
+    LOG(INFO) << "CLUSTER_CHANGE_BATCH cluster=" << keys_.ClusterName()
+              << " action=finalized batch_type=" << TopologyChangeTypeName(batch.type) << " batch_epoch=" << batch.epoch
+              << " previous_version=" << latest.Version() << " committed_version=" << committed->Version()
+              << " participant_count=" << participants.size() << " sample=" << MemberIdentitySample(participants);
+    if (batch.type == TopologyChangeType::SCALE_OUT) {
+        LOG(INFO) << "CLUSTER_MEMBER_JOIN_SUMMARY cluster=" << keys_.ClusterName()
+                  << " result=success batch_epoch=" << batch.epoch << " joined_count=" << participants.size()
+                  << " sample=" << MemberIdentitySample(participants) << " committed_version=" << committed->Version();
+    } else if (batch.type == TopologyChangeType::SCALE_IN) {
+        LOG(INFO) << "CLUSTER_MEMBER_LEAVE_SUMMARY cluster=" << keys_.ClusterName()
+                  << " result=success batch_epoch=" << batch.epoch << " left_count=" << participants.size()
+                  << " sample=" << MemberIdentitySample(participants) << " committed_version=" << committed->Version();
+    } else {
+        LOG(INFO) << "CLUSTER_FAILURE cluster=" << keys_.ClusterName()
+                  << " outcome=finalized batch_epoch=" << batch.epoch << " failed_count=" << participants.size()
+                  << " sample=" << MemberIdentitySample(participants) << " committed_version=" << committed->Version();
+    }
 }
 
 Status TopologyController::CommitScaleOutExhaustion(const TopologySnapshot &latest,

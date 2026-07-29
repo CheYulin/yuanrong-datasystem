@@ -49,6 +49,7 @@
 #include "datasystem/worker/object_cache/worker_master_oc_api.h"
 #include "datasystem/worker/object_cache/worker_oc_eviction_manager.h"
 #include "datasystem/worker/object_cache/worker_oc_spill.h"
+#include "datasystem/worker/runtime/worker_runtime_facade.h"
 
 DS_DECLARE_uint32(data_migrate_rate_limit_mb);
 
@@ -58,6 +59,8 @@ constexpr double MIGRATE_SCALE_DOWN_HIGH_WATER_FACTOR = 0.95;
 
 namespace datasystem {
 namespace object_cache {
+ScopedBthreadLocal<std::vector<WorkerOcServiceMigrateImpl::PendingOutOfMemory>>
+    WorkerOcServiceMigrateImpl::pendingOutOfMemory_;
 
 namespace {
 std::unordered_set<std::string> CollectRequestObjectKeys(const ObjInfoPbList &objects)
@@ -108,7 +111,11 @@ Status WorkerOcServiceMigrateImpl::PrepareMigrateData(const MigrateDataReqPb &re
                                                       std::unordered_map<std::string, std::shared_ptr<ShmUnit>> &units)
 {
     if (req.is_slot_migration()) {
-        auto allocRc = BatchAllocateObjectGroupBySlot(req, units);
+        memory::CacheType failedCacheType = memory::CacheType::MEMORY;
+        auto allocRc = BatchAllocateObjectGroupBySlot(req, units, failedCacheType);
+        if (allocRc.GetCode() == StatusCode::K_OUT_OF_MEMORY) {
+            RecordOutOfMemory(allocRc, "MigrateData.SlotAllocate", failedCacheType);
+        }
         if (IsNoSpace(allocRc)) {
             auto failedIds = CollectRequestObjectKeys(req.objects());
             FillMigrateDataResponse(req, {}, failedIds, true, rsp);
@@ -144,6 +151,16 @@ Status WorkerOcServiceMigrateImpl::CheckResource(const MigrateDataReqPb &req, Mi
 
 Status WorkerOcServiceMigrateImpl::CheckMigrateDataAdmission(const MigrateDataReqPb &req, MigrateDataRspPb &rsp)
 {
+    if (runtime_ != nullptr) {
+        auto runtimeRc = runtime_->CheckAdmission(worker::WorkerAdmissionKind::MIGRATION_TARGET, "MigrateData");
+        if (runtimeRc.IsError()) {
+            std::unordered_set<std::string> failedIds;
+            std::transform(req.objects().begin(), req.objects().end(), std::inserter(failedIds, failedIds.end()),
+                           [](const auto &info) { return info.object_key(); });
+            FillMigrateDataResponse(req, {}, failedIds, false, rsp);
+            return runtimeRc;
+        }
+    }
     auto rc = AcquireIncomingMigrationAdmission();
     if (rc.IsOk()) {
         return Status::OK();
@@ -154,6 +171,22 @@ Status WorkerOcServiceMigrateImpl::CheckMigrateDataAdmission(const MigrateDataRe
     FillMigrateDataResponse(req, {}, failedIds, false, rsp);
     rsp.set_scale_down_state(MigrateDataRspPb::DATA_MIGRATION_STARTED);
     return rc;
+}
+
+Status WorkerOcServiceMigrateImpl::CheckMigrateDataDirectAdmission(const MigrateDataDirectReqPb &req,
+                                                                   MigrateDataDirectRspPb &rsp)
+{
+    if (runtime_ != nullptr) {
+        auto runtimeRc = runtime_->CheckAdmission(worker::WorkerAdmissionKind::MIGRATION_TARGET, "MigrateDataDirect");
+        if (runtimeRc.IsError()) {
+            return PrepareMigrateDataDirectError(req, rsp, runtimeRc.GetCode(), runtimeRc.GetMsg());
+        }
+    }
+    auto rc = AcquireIncomingMigrationAdmission();
+    if (rc.IsOk()) {
+        return Status::OK();
+    }
+    return PrepareMigrateDataDirectError(req, rsp, rc.GetCode(), rc.GetMsg());
 }
 
 Status WorkerOcServiceMigrateImpl::AcquireIncomingMigrationAdmission()
@@ -208,9 +241,9 @@ Status WorkerOcServiceMigrateImpl::MigrateData(const MigrateDataReqPb &req, Migr
     LOG(INFO) << FormatString("[Migrate Data] Type: %d, Count: %d, Objects: %s, is_slot_migration: %d, slot_id: %u",
                               static_cast<int>(req.type()), req.objects_size(), VectorToString(GetObjects(req)),
                               req.is_slot_migration(), req.slot_id());
-    INJECT_POINT("worker.migrate_service.return");
     RETURN_IF_NOT_OK(CheckMigrateDataAdmission(req, rsp));
     Raii admission([this] { ReleaseIncomingMigrationAdmission(); });
+    INJECT_POINT("worker.migrate_service.return");
     INJECT_POINT_NO_RETURN("WorkerOcServiceMigrateImpl.MigrateData.afterAdmission");
     if (IsIncomingMigrationAdmissionClosed()) {
         std::unordered_set<std::string> failedIds;
@@ -220,7 +253,9 @@ Status WorkerOcServiceMigrateImpl::MigrateData(const MigrateDataReqPb &req, Migr
         rsp.set_scale_down_state(MigrateDataRspPb::DATA_MIGRATION_STARTED);
         return Status(StatusCode::K_NOT_READY, "admission closed before data processing");
     }
+    pendingOutOfMemory_->clear();
     auto rc = MigrateDataImpl(req, rsp, std::move(payloads));
+    FlushPendingOutOfMemory();
     if (rc.IsOk() && IsIncomingMigrationDrainTimedOut()) {
         // Data may already be written to target; intentionally return failure so Source
         // keeps its local copy, accepting a transient double-write rather than data loss.
@@ -235,7 +270,9 @@ Status WorkerOcServiceMigrateImpl::MigrateData(const MigrateDataReqPb &req, Migr
 Status WorkerOcServiceMigrateImpl::MigrateDataImpl(const MigrateDataReqPb &req, MigrateDataRspPb &rsp,
                                                    std::vector<RpcMessage> payloads)
 {
-    RETURN_IF_NOT_OK(CheckResource(req, rsp));
+    auto resourceRc = CheckResource(req, rsp);
+    RecordOutOfMemory(resourceRc, "MigrateData.CheckResource", memory::CacheType::MEMORY);
+    RETURN_IF_NOT_OK(resourceRc);
     std::unordered_map<std::string, std::shared_ptr<ShmUnit>> units;
     RETURN_IF_NOT_OK(PrepareMigrateData(req, rsp, units));
 
@@ -292,18 +329,22 @@ Status WorkerOcServiceMigrateImpl::MigrateDataDirect(const MigrateDataDirectReqP
     LOG(INFO) << FormatString("[Migrate Data] Count: %d, Objects: %s", req.objects_size(),
                               VectorToString(GetObjects(req)));
     RETURN_OK_IF_TRUE(req.objects().empty());
-    auto admissionRc = AcquireIncomingMigrationAdmission();
-    if (admissionRc.IsError()) {
-        return PrepareMigrateDataDirectError(req, rsp, admissionRc.GetCode(), admissionRc.GetMsg());
-    }
+    RETURN_IF_NOT_OK(CheckMigrateDataDirectAdmission(req, rsp));
     Raii admission([this] { ReleaseIncomingMigrationAdmission(); });
     INJECT_POINT_NO_RETURN("WorkerOcServiceMigrateImpl.MigrateDataDirect.afterAdmission");
     if (IsIncomingMigrationAdmissionClosed()) {
         return PrepareMigrateDataDirectError(req, rsp, StatusCode::K_NOT_READY,
                                              "admission closed before data processing");
     }
-    RETURN_IF_NOT_OK(PreCheckMigrateDataDirect(req, rsp));
+    pendingOutOfMemory_->clear();
+    auto preCheckRc = PreCheckMigrateDataDirect(req, rsp);
+    RecordOutOfMemory(preCheckRc, "MigrateDataDirect.CheckResource", memory::CacheType::MEMORY);
+    if (preCheckRc.IsError()) {
+        FlushPendingOutOfMemory();
+        return preCheckRc;
+    }
     auto rc = MigrateDataDirectImpl(req, rsp);
+    FlushPendingOutOfMemory();
     if (rc.IsOk() && IsIncomingMigrationDrainTimedOut()) {
         // Data may already be written to target; intentionally return failure so Source
         // keeps its local copy, accepting a transient double-write rather than data loss.
@@ -694,6 +735,7 @@ Status WorkerOcServiceMigrateImpl::FillDataToObjectEntries(const MigrateDataDire
     std::vector<uint32_t> shmIndexMapping(req.objects_size(), std::numeric_limits<uint32_t>::max());
     std::vector<std::shared_ptr<ShmOwner>> shmOwners;
     Status rc = AggregateAllocateHelper(req, needReadDataIds, shmOwners, shmIndexMapping);
+    RecordOutOfMemory(rc, "MigrateDataDirect.AggregateAllocate", memory::CacheType::MEMORY);
     if (rc.IsError()) {
         LOG(ERROR) << "[Migrate Data] Aggregate allocate memory failed: " << rc.ToString();
         if (req.is_slot_migration() && IsNoSpace(rc)) {
@@ -1101,11 +1143,13 @@ Status WorkerOcServiceMigrateImpl::SaveDataWithObjectLocked(std::shared_ptr<Safe
         LOG_IF(ERROR, rc.IsError()) << FormatString("[Migrate Data] Spill object [%s] failed: %s", objectKey,
                                                     rc.ToString());
     }
+    RecordOutOfMemory(rc, "MigrateData.SaveData", static_cast<memory::CacheType>((*entry)->modeInfo.GetCacheType()));
     return rc;
 }
 
 Status WorkerOcServiceMigrateImpl::BatchAllocateObjectGroupBySlot(
-    const MigrateDataReqPb &req, std::unordered_map<std::string, std::shared_ptr<ShmUnit>> &units)
+    const MigrateDataReqPb &req, std::unordered_map<std::string, std::shared_ptr<ShmUnit>> &units,
+    memory::CacheType &failedCacheType)
 {
     for (const auto &info : req.objects()) {
         const auto &objectKey = info.object_key();
@@ -1113,9 +1157,10 @@ Status WorkerOcServiceMigrateImpl::BatchAllocateObjectGroupBySlot(
         auto metaSize = GetMetadataSize();
         auto needSize = info.data_size() + metaSize;
         auto tenantId = TenantAuthManager::ExtractTenantId(objectKey);
-        auto status = shmUnit->AllocateMemory(tenantId, needSize, false, ServiceType::OBJECT,
-                                              static_cast<memory::CacheType>(info.cache_type()));
+        auto status =
+            AllocateSlotObject(tenantId, needSize, static_cast<memory::CacheType>(info.cache_type()), shmUnit);
         if (IsNoSpace(status)) {
+            failedCacheType = static_cast<memory::CacheType>(info.cache_type());
             LOG(ERROR) << FormatString("[Migrate Data] %s allocate memory failed, size: %ld", objectKey, needSize);
             return status;
         }
@@ -1123,6 +1168,13 @@ Status WorkerOcServiceMigrateImpl::BatchAllocateObjectGroupBySlot(
         units[objectKey] = shmUnit;
     }
     return Status::OK();
+}
+
+Status WorkerOcServiceMigrateImpl::AllocateSlotObject(const std::string &tenantId, uint64_t needSize,
+                                                      memory::CacheType cacheType,
+                                                      const std::shared_ptr<ShmUnit> &shmUnit)
+{
+    return shmUnit->AllocateMemory(tenantId, needSize, false, ServiceType::OBJECT, cacheType);
 }
 
 Status WorkerOcServiceMigrateImpl::AllocateAndAssignData(
@@ -1390,6 +1442,23 @@ bool WorkerOcServiceMigrateImpl::IsResourceAvailable(const MigrateType &type, Ca
 bool WorkerOcServiceMigrateImpl::IsNoSpace(const Status &status) const
 {
     return status.GetCode() == StatusCode::K_NO_SPACE || status.GetCode() == StatusCode::K_OUT_OF_MEMORY;
+}
+
+void WorkerOcServiceMigrateImpl::RecordOutOfMemory(const Status &status, const std::string &operation,
+                                                   memory::CacheType cacheType) const
+{
+    if (status.GetCode() == StatusCode::K_OUT_OF_MEMORY && outOfMemoryHandler_) {
+        pendingOutOfMemory_->push_back(PendingOutOfMemory{ status, operation, cacheType });
+    }
+}
+
+void WorkerOcServiceMigrateImpl::FlushPendingOutOfMemory() const
+{
+    auto pending = std::move(*pendingOutOfMemory_);
+    pendingOutOfMemory_->clear();
+    for (const auto &notification : pending) {
+        outOfMemoryHandler_(notification.status, notification.operation, notification.cacheType);
+    }
 }
 }  // namespace object_cache
 }  // namespace datasystem

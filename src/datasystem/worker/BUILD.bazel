@@ -84,6 +84,7 @@ ds_cc_library(
         "//src/datasystem/common/util:status_helper",
         "//src/datasystem/common/util:uri",
         "//src/datasystem/common/util:validator",
+        "//src/datasystem/worker/runtime:worker_runtime_types",
     ],
 )
 
@@ -133,6 +134,7 @@ ds_cc_library(
         "//src/datasystem/worker:authenticate",
         "//src/datasystem/worker/client_manager",
         "//src/datasystem/worker:worker_health_check",
+        "//src/datasystem/worker/runtime:worker_runtime_core",
     ],
 )
 
@@ -169,14 +171,25 @@ ds_cc_library(
 )
 
 ds_cc_library(
+    name = "worker_coordination_backend_factory",
+    srcs = [
+        "worker_coordination_backend_factory.cpp",
+    ],
+    hdrs = [
+        "worker_coordination_backend_factory.h",
+    ],
+    deps = [
+        "//src/datasystem/cluster/coordination_backend:coordination_backend",
+    ],
+)
+
+ds_cc_library(
     name = "worker_oc_server",
     srcs = [
         "worker_oc_server.cpp",
-        "worker_topology_phase_callbacks.cpp",
     ],
     hdrs = [
         "worker_oc_server.h",
-        "worker_topology_phase_callbacks.h",
     ],
     deps = [
         "//include/datasystem/utils:utils_headers",
@@ -196,6 +209,10 @@ ds_cc_library(
         "//src/datasystem/worker:worker_flags",
         "//src/datasystem/worker:metadata_route_resolver",
         "//src/datasystem/worker:rebalance_executor",
+        "//src/datasystem/worker:worker_coordination_backend_factory",
+        "//src/datasystem/worker/runtime:worker_control_backend_probe",
+        "//src/datasystem/worker/runtime:worker_runtime_core",
+        "//src/datasystem/worker/runtime:worker_topology_phase_callbacks",
         "//src/datasystem/common/log:common_log",
         "//src/datasystem/common/metrics:common_metrics",
         "//src/datasystem/common/object_cache:object_base",
@@ -237,9 +254,15 @@ ds_cc_library(
         "//src/datasystem/worker/coordinator:coordinator_watch_service_impl",
         "//src/datasystem/cluster/coordination_backend:topology_recovery_reporter",
         "//src/datasystem/worker/object_cache/data_migrator/strategy:node_selector",
+        "//src/datasystem/worker/object_cache:central_metadata_address_resolver",
         "//src/datasystem/worker/object_cache:master_worker_oc_service_impl",
+        "//src/datasystem/worker/object_cache:object_cache_recovery_dependencies",
         "//src/datasystem/worker/object_cache:object_endpoint_policy",
         "//src/datasystem/worker/object_cache:object_kv",
+        "//src/datasystem/worker/object_cache:object_metadata_coordination_reader",
+        "//src/datasystem/worker/object_cache/slot_recovery:slot_recovery_store",
+        "//src/datasystem/worker/object_cache:worker_topology_metadata_actions",
+        "//src/datasystem/worker/object_cache:worker_topology_object_cache_actions",
         "//src/datasystem/worker/object_cache:worker_oc_service_impl",
         "//src/datasystem/worker/object_cache:worker_worker_oc_service_impl",
         "//src/datasystem/worker/object_cache:worker_worker_peer_state_codec",

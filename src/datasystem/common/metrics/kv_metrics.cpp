@@ -141,6 +141,14 @@ constexpr MetricDesc KV_METRIC_DESCS[] = {
     { 112, "client_shm_zero_copy_set_total", MetricType::COUNTER, "count" },
     { 113, "client_shm_payload_fallback_set_total", MetricType::COUNTER, "count" },
     { 114, "client_shm_get_degrade_to_transport_total", MetricType::COUNTER, "count" },
+    { 115, "worker_service_mode", MetricType::GAUGE, "" },
+    { 116, "worker_service_reason", MetricType::GAUGE, "" },
+    { 117, "worker_recovery_phase", MetricType::GAUGE, "" },
+    { 118, "worker_recovery_evidence_mask", MetricType::GAUGE, "" },
+    { 119, "worker_admission_reject_total", MetricType::COUNTER, "count" },
+    { 120, "worker_control_backend_scope_local_total", MetricType::COUNTER, "count" },
+    { 121, "worker_control_backend_scope_global_total", MetricType::COUNTER, "count" },
+    { 122, "worker_control_backend_scope_inconclusive_total", MetricType::COUNTER, "count" },
 };
 static_assert(sizeof(KV_METRIC_DESCS) / sizeof(KV_METRIC_DESCS[0]) == static_cast<size_t>(KvMetricId::KV_METRIC_END));
 

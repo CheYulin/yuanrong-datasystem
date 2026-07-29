@@ -40,6 +40,7 @@
 #include "datasystem/master/object_cache/master_oc_service_impl.h"
 #include "datasystem/master/metadata_manager_holder.h"
 
+#include "datasystem/cluster/coordination_backend/coordination_backend.h"
 #include "datasystem/master/stream_cache/master_sc_service_impl.h"
 #include "datasystem/server/common_server.h"
 #include "datasystem/cluster/runtime/topology_engine.h"
@@ -56,6 +57,7 @@
 #include "datasystem/worker/stream_cache/master_worker_sc_service_impl.h"
 #include "datasystem/worker/stream_cache/worker_worker_sc_service_impl.h"
 #include "datasystem/worker/worker_liveness_check.h"
+#include "datasystem/worker/runtime/worker_runtime_facade.h"
 #include "datasystem/protos/object_posix.brpc.pb.h"
 #include "datasystem/protos/master_heartbeat.brpc.pb.h"
 #include "datasystem/protos/share_memory.brpc.pb.h"
@@ -82,9 +84,18 @@
 #include "datasystem/worker/perf_service/perf_service_impl.h"
 #endif
 
+namespace datasystem::ut {
+class WorkerOCServerRecoveryEvidenceTest;
+}
+
 namespace datasystem::worker {
 
+class WorkerIsolationCoordinator;
+class WorkerTopologyRuntimeAdapter;
+
 class WorkerOCServer : public CommonServer {
+    friend class ::datasystem::ut::WorkerOCServerRecoveryEvidenceTest;
+
 public:
     /**
      * @brief Create a new WorkerServer object.
@@ -359,16 +370,15 @@ private:
      * @param[in] objectTable Worker object table shared by the services.
      * @param[in] evictionManager Worker eviction manager shared by the services.
      */
-    void CreateObjectCacheWorkerServices(
-        const std::shared_ptr<SafeTable<ImmutableString, ObjectInterface>> &objectTable,
-        const std::shared_ptr<object_cache::WorkerOcEvictionManager> &evictionManager);
+    void CreateObjectCacheWorkerServices(const std::shared_ptr<object_cache::ObjectTable> &objectTable,
+                                         const std::shared_ptr<object_cache::WorkerOcEvictionManager> &evictionManager);
 
     /**
      * @brief Create rebalance executor and register rebalance task handler.
      * @param[in] objectTable Worker object table used by rebalance tasks.
      * @param[in] evictionManager Worker eviction manager used by rebalance tasks.
      */
-    void CreateRebalanceExecutor(const std::shared_ptr<SafeTable<ImmutableString, ObjectInterface>> &objectTable,
+    void CreateRebalanceExecutor(const std::shared_ptr<object_cache::ObjectTable> &objectTable,
                                  const std::shared_ptr<object_cache::WorkerOcEvictionManager> &evictionManager);
 
     /**
@@ -574,6 +584,8 @@ private:
      * @return Status of this call.
      */
     Status InitCoordinationBackend();
+    Status InitDataSystemCoordinationBackend();
+    Status InitEtcdCoordinationBackend();
 
     /**
      * @brief Construct worker-owned topology runtime components.
@@ -597,12 +609,40 @@ private:
     cluster::CoordinatorWatchIngress BuildCoordinatorWatchIngress();
 
     /**
+     * @brief Configure topology engine builder with worker callbacks and common options.
+     * @param[in,out] builder Topology engine builder.
+     */
+    void ConfigureTopologyBuilder(cluster::TopologyEngine::Builder &builder);
+
+    /**
+     * @brief Re-evaluate serving admission from the current topology and object-cache recovery evidence.
+     * @param[in] level Current topology availability level.
+     */
+    using ObjectCacheRecoveryDispatch = std::function<Status()>;
+    void RefreshTopologyServingAdmission(cluster::TopologyAvailabilityLevel level);
+    Status RefreshTopologyServingAdmission(const worker::WorkerRuntimeFacade::TopologyAdmissionToken &token,
+                                           const worker::WorkerRecoveryEvidenceReport &recoveryReport,
+                                           const ObjectCacheRecoveryDispatch &dispatch);
+    void RequestObjectCacheRecoveryEvidenceIfNeeded(cluster::TopologyAvailabilityLevel level,
+                                                    const worker::WorkerRecoveryEvidenceReport &recoveryReport);
+    Status RequestObjectCacheRecoveryEvidenceIfNeeded(cluster::TopologyAvailabilityLevel level,
+                                                      const worker::WorkerRecoveryEvidenceReport &recoveryReport,
+                                                      const ObjectCacheRecoveryDispatch &dispatch);
+    Status HandleObjectCacheRecoveryEvidenceReady(worker::WorkerRecoveryGeneration generation,
+                                                  cluster::TopologyAvailabilityLevel level,
+                                                  const worker::WorkerRecoveryEvidenceReport &recoveryReport,
+                                                  const ObjectCacheRecoveryDispatch &dispatch);
+    void RegisterObjectCacheResourceRecoveryHandler();
+
+    /**
      * @brief Deliver one deduplicated membership generation restart to local business owners.
      * @param[in] address Canonical address of the restarted member.
      * @param[in] timestamp Monotonic membership generation timestamp used by reconciliation.
      * @return K_OK after Stream cleanup and asynchronous object recovery are accepted.
      */
     Status HandleMembershipRestart(const std::string &address, int64_t timestamp);
+
+    Status HandleMembershipRecovery(const std::string &address, int64_t timestamp);
 
     /**
      * @brief Resolve the metadata endpoint used by worker-local master services before service construction.
@@ -640,6 +680,16 @@ private:
      * @return K_OK after normal or legal last-good admission; K_NOT_READY when process termination interrupts wait.
      */
     Status WaitForTopologyReady();
+
+    /**
+     * @brief Re-evaluate the external admission gate after object-cache recovery evidence becomes available.
+     */
+    void RefreshTopologyAdmissionFromObjectCacheRecovery();
+
+    /**
+     * @brief Open runtime/admission after topology is ready when object-cache service is disabled.
+     */
+    void MarkRunningWithoutObjectCacheRecovery();
 
     /**
      * @brief Stop topology ingress and runtime components without destroying dependencies after a drain timeout.
@@ -719,16 +769,22 @@ private:
     std::shared_ptr<ICoordinatorDiscovery> coordinatorDiscovery_;
     std::string etcdOrMetastoreAddress_;
     std::unique_ptr<EtcdStore> etcdStore_;
+    WorkerRuntimeFacade workerRuntime_;
+    std::unique_ptr<WorkerIsolationCoordinator> workerIsolationCoordinator_{ nullptr };
     std::unique_ptr<ICoordinatorServiceProxy> coordinatorServiceProxy_;
+    std::unique_ptr<cluster::ICoordinationBackend> metadataCoordinationBackend_{ nullptr };
     std::unique_ptr<cluster::ITopologyPhaseCallbacks> topologyTaskCallbacks_{ nullptr };
     // Declared before topologyEngine_ so the Engine drains ingress before the service is destroyed.
     std::unique_ptr<coordinator::CoordinatorWatchServiceImpl> coordinatorWatchSvc_{ nullptr };
     // ResourceManager's rebalance scheduler borrows MembershipEndpointView from this engine. The destructor must reset
     // resourceManager_ before resetting topologyEngine_; declaration order provides the same fallback ordering.
     std::unique_ptr<cluster::TopologyEngine> topologyEngine_{ nullptr };
+    std::unique_ptr<WorkerTopologyRuntimeAdapter> workerTopologyRuntime_{ nullptr };
     std::unique_ptr<MetadataRouteResolver> metadataRouteResolver_{ nullptr };
     std::unique_ptr<object_cache::ObjectEndpointPolicy> objectEndpointPolicy_{ nullptr };
     std::atomic<bool> topologyExitRequested_{ false };
+    std::atomic<bool> objectCacheRecoveryRequestInFlight_{ false };
+    Status serviceCreationStatus_{ Status::OK() };
     std::shared_ptr<AkSkManager> akSkManager_{ nullptr };
     HostPort masterAddr_;
     std::unique_ptr<datasystem::MetadataManagerHolder> metadataManagerHolder_{ nullptr };

@@ -10,6 +10,10 @@ set(WORKER_OC_SRCS
         worker_worker_oc_service_impl.cpp
         worker_worker_transport_service_impl.cpp
         master_worker_oc_service_impl.cpp
+        central_metadata_address_resolver.cpp
+        object_metadata_coordination_reader.cpp
+        worker_topology_object_cache_actions.cpp
+        worker_topology_metadata_actions.cpp
         worker_oc_eviction_manager.cpp
         worker_oc_spill.cpp
         obj_cache_hashmap.cpp
@@ -17,9 +21,14 @@ set(WORKER_OC_SRCS
         async_send_manager.cpp
         async_update_location_manager.cpp
         metadata_recovery_manager.cpp
+        recovery/object_cache_ownership_reconciliation.cpp
+        recovery/object_cache_recovery_state.cpp
+        recovery/object_cache_recovery_evidence.cpp
+        recovery/object_cache_recovery_startup.cpp
         metadata_recovery_selector.cpp
         rebalance_candidate_provider.cpp
         slot_recovery_orchestrator.cpp
+        object_table.cpp
         object_kv.cpp
         eviction_list.cpp
         cache_hit_info.cpp
@@ -98,6 +107,7 @@ set(WORKER_OBJECT_CACHE_DEPEND_LIBS
         nlohmann_json::nlohmann_json
         ${BRPC_LIBRARIES}
         ${ZeroMQ_LIBRARY}
+        worker_runtime_core
         )
 
 list(APPEND WORKER_OBJECT_CACHE_DEPEND_LIBS common_rdma)

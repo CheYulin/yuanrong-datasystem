@@ -18,6 +18,11 @@ add_library(metadata_route_resolver STATIC metadata_route_resolver.cpp)
 target_include_directories(metadata_route_resolver PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(metadata_route_resolver PUBLIC cluster_topology common_util)
 
+add_library(worker_coordination_backend_factory STATIC worker_coordination_backend_factory.cpp)
+target_include_directories(worker_coordination_backend_factory PUBLIC ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(worker_coordination_backend_factory PUBLIC cluster_coordination_backend)
+
+add_subdirectory(runtime)
 add_subdirectory(object_cache)
 add_subdirectory(stream_cache)
 add_subdirectory(client_manager)
@@ -30,7 +35,6 @@ set(WORKER_SRCS
         worker_service_impl.cpp
         worker_service_accessor.cpp
         worker_oc_server.cpp
-        worker_topology_phase_callbacks.cpp
         worker_liveness_check.cpp
         worker_cli.cpp
         worker_flags.cpp
@@ -72,7 +76,11 @@ set(WORKER_DEPEND_LIBS
         worker_client_manager
         worker_update_flag_check
         worker_health_check
+        worker_coordination_backend_factory
         metadata_route_resolver
+        worker_control_backend_probe
+        worker_runtime_core
+        worker_topology_phase_callbacks
         coordinator_watch_service_impl
         topology_recovery_reporter
         )
